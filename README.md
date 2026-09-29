@@ -6,6 +6,8 @@ A warm fire for the token-poor.
 
 - [목표](docs/goals.md)
 - [설계](docs/design.md)
+- [로드맵](docs/roadmap.md)
+- [엔진 설계](docs/engine.md)
 - [조사 자료](docs/research/README.md)
 
 상태: 설계 단계 (2026-09-29).
