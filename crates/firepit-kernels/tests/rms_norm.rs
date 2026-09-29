@@ -18,10 +18,16 @@ fn learned_scale_matches_cpu_for_each_row() {
         .sync()
         .unwrap();
     let mut output = api::zeros::<f32>(&[2, H]).sync().unwrap();
-    rms_norm((&mut output).partition([1, H]), &x, &gamma, 1.0 / H as f32)
-        .generics(vec![H.to_string()])
-        .sync()
-        .unwrap();
+    rms_norm(
+        (&mut output).partition([1, H]),
+        &x,
+        &gamma,
+        1.0 / H as f32,
+        1e-5,
+    )
+    .generics(vec![H.to_string()])
+    .sync()
+    .unwrap();
 
     let actual: Vec<f32> = output.dup().to_host_vec().sync().unwrap();
     for row in 0..2 {

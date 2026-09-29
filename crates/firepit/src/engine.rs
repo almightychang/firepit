@@ -113,6 +113,7 @@ fn run(
                         activation,
                         model.norm(norm),
                         1.0 / h as f32,
+                        1e-5,
                     )
                     .generics(vec![h.to_string()]),
                 )?;

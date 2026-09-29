@@ -57,7 +57,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 | 덩이 | 배우는 것 | 끝났다는 기준 | 상태 |
 |---|---|---|---|
 | 2.0 정답 기준 만들기 | config 읽기, 가중치 이름과 모양, forward에서 흐르는 값 | HF로 layer별 중간값 덤프, Rust가 실제 가중치 일부 로드 | ✔ |
-| 2.1 입구와 출구 | token → embedding, 마지막 norm → LM head → logits | layer 0개 모델의 logits가 HF와 일치 | ○ |
+| 2.1 입구와 출구 | token → embedding, 마지막 norm → LM head → logits | layer 0개 모델의 logits가 HF와 일치 | ✔ |
 | 2.2 RMSNorm | 정규화하는 이유, Qwen의 weight 형태 | 실제 가중치로 일치 | ◐ (scale 경로 있음) |
 | 2.3 SwiGLU MLP | FFN의 gate · up · down | shared expert 하나가 일치 | ○ |
 | 2.4 Attention ① | Q · K · V, RoPE, q/k norm | 한 token의 q, k가 일치 | ○ |
@@ -79,9 +79,10 @@ cd ../..
 scripts/dev.sh test -p firepit --test reference -- --ignored
 ```
 
-- 정답지는 앞쪽 N개 layer만 가진 모델을 token 하나씩 decode하며, 각 layer로 들어가는 residual stream(`step{t}/residual{i}`, i = 0..N)을 기록한다. `residual0`은 embedding, `residualN`은 마지막 layer의 출력이다. 앞쪽 N층만으로는 최종 norm과 logits가 실제 모델 출력이 아니라서 기록하지 않는다.
+- 정답지는 앞쪽 N개 layer만 가진 모델을 token 하나씩 decode하며, 각 layer로 들어가는 residual stream(`step{t}/residual{i}`, i = 0..N)을 기록한다. `residual0`은 embedding, `residualN`은 마지막 layer의 출력이다. `step{t}/exit_norm`과 `step{t}/logits`는 원래 HF norm과 LM head를 `residual0`에 적용한 0층 모델의 출구값이다.
 - 중간값은 transformers 자체 기능(`output_hidden_states`)으로 얻는다. MoE router logits도 같은 방식으로 얻을 수 있다.
 - Rust는 공식 `safetensors` crate의 header 타입으로 파일을 해석하고 필요한 바이트 범위만 읽는다(mmap을 쓰지 않아 unsafe가 없다).
+- 2.1 비교(5 step): exit_norm 최대 절대 오차 `3.81469727e-6`, logits `5.00679016e-6`; top-1 5개 모두 일치. 잘못된 scale(`w`)을 쓰면 exit_norm 최대 절대 오차 `2.56955013e1`.
 
 ## 확인할 것
 

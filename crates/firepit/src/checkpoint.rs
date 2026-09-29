@@ -12,6 +12,11 @@ pub struct HostTensor {
     pub data: Vec<f32>,
 }
 
+pub struct HostBf16Tensor {
+    pub shape: Vec<usize>,
+    pub data: Vec<bf16>,
+}
+
 pub struct SafetensorsFile {
     file: File,
     data_start: u64,
@@ -34,7 +39,11 @@ impl SafetensorsFile {
     }
 
     pub fn metadata(&self, key: &str) -> Option<&str> {
-        self.header.metadata().as_ref()?.get(key).map(String::as_str)
+        self.header
+            .metadata()
+            .as_ref()?
+            .get(key)
+            .map(String::as_str)
     }
 
     pub fn tensor(&self, name: &str) -> Result<HostTensor> {
@@ -46,9 +55,29 @@ impl SafetensorsFile {
         })
     }
 
+    pub fn tensor_bf16(&self, name: &str) -> Result<HostBf16Tensor> {
+        let info = self.info(name)?;
+        if info.dtype != Dtype::BF16 {
+            return Err(format!("{name}: expected BF16, got {:?}", info.dtype).into());
+        }
+        let mut bytes = vec![0u8; info.data_offsets.1 - info.data_offsets.0];
+        self.file
+            .read_exact_at(&mut bytes, self.data_start + info.data_offsets.0 as u64)?;
+        Ok(HostBf16Tensor {
+            shape: info.shape.clone(),
+            data: bytes
+                .chunks_exact(2)
+                .map(|b| bf16::from_le_bytes([b[0], b[1]]))
+                .collect(),
+        })
+    }
+
     pub fn row(&self, name: &str, row: usize) -> Result<HostTensor> {
         let info = self.info(name)?;
-        let (&rows, row_shape) = info.shape.split_first().ok_or("scalar tensor has no rows")?;
+        let (&rows, row_shape) = info
+            .shape
+            .split_first()
+            .ok_or("scalar tensor has no rows")?;
         if row >= rows {
             return Err(format!("{name}: row {row} out of {rows}").into());
         }
@@ -112,6 +141,10 @@ impl Checkpoint {
 
     pub fn tensor(&self, name: &str) -> Result<HostTensor> {
         self.shard(name)?.tensor(name)
+    }
+
+    pub fn tensor_bf16(&self, name: &str) -> Result<HostBf16Tensor> {
+        self.shard(name)?.tensor_bf16(name)
     }
 
     pub fn row(&self, name: &str, row: usize) -> Result<HostTensor> {

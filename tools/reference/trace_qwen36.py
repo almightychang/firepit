@@ -21,6 +21,8 @@ def prefix_config(model_dir: Path, layers: int) -> Qwen3_5MoeTextConfig:
 
 def prefix_weights(model_dir: Path, layers: int) -> dict[str, torch.Tensor]:
     def local_name(name: str) -> str | None:
+        if name == "lm_head.weight":
+            return name
         if not name.startswith(CHECKPOINT_PREFIX):
             return None
         local = name.removeprefix(CHECKPOINT_PREFIX)
@@ -41,13 +43,14 @@ def load_prefix(model_dir: Path, layers: int) -> Qwen3_5MoeForCausalLM:
     with torch.device("meta"):
         model = Qwen3_5MoeForCausalLM(prefix_config(model_dir, layers))
     missing, unexpected = model.load_state_dict(prefix_weights(model_dir, layers), strict=False, assign=True)
-    if unexpected or set(missing) != {"lm_head.weight"}:
+    if unexpected or missing:
         raise SystemExit(f"missing={missing} unexpected={unexpected}")
+    norm = model.model.norm
     model.model.norm = torch.nn.Identity()
-    return model.eval()
+    return model.eval(), norm.eval()
 
 
-def trace(model, tokens: list[int]) -> dict[str, torch.Tensor]:
+def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
     records, cache = {}, None
     with torch.no_grad():
         for step, token in enumerate(tokens):
@@ -55,6 +58,9 @@ def trace(model, tokens: list[int]) -> dict[str, torch.Tensor]:
             cache = out.past_key_values
             for layer, residual in enumerate(out.hidden_states):
                 records[f"step{step}/residual{layer}"] = residual[0, 0].clone()
+            exit_norm = norm(out.hidden_states[0])
+            records[f"step{step}/exit_norm"] = exit_norm[0, 0].clone()
+            records[f"step{step}/logits"] = model.lm_head(exit_norm)[0, 0].clone()
     return records
 
 
@@ -67,7 +73,8 @@ def main():
     args = parser.parse_args()
 
     tokens = AutoTokenizer.from_pretrained(args.model)(args.prompt)["input_ids"]
-    records = trace(load_prefix(args.model, args.layers), tokens)
+    model, norm = load_prefix(args.model, args.layers)
+    records = trace(model, norm, tokens)
     metadata = {"model": MODEL_ID, "layers": str(args.layers), "prompt": args.prompt, "tokens": json.dumps(tokens)}
     args.out.parent.mkdir(parents=True, exist_ok=True)
     save_file(records, args.out, metadata=metadata)
