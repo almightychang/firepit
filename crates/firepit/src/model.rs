@@ -11,6 +11,9 @@ use std::sync::Arc;
 
 pub type Stream = Arc<cuda_core::Stream>;
 
+#[derive(Clone, Copy)]
+pub(crate) struct RowTile(pub usize);
+
 pub struct ModelConfig {
     pub gdn_layers: usize,
     pub attention_layers: usize,
@@ -81,6 +84,18 @@ impl ModelDims {
     }
     pub(crate) fn layers(&self) -> &[LayerDef] {
         &self.layers
+    }
+    pub(crate) fn session_output_shape(&self, batch: usize) -> Vec<usize> {
+        vec![batch * self.heads, self.head_dim]
+    }
+    pub(crate) fn session_output_tile(&self, row: RowTile) -> [usize; 2] {
+        [1, row.0]
+    }
+    pub(crate) fn recurrent_tile(&self, row: RowTile) -> [usize; 3] {
+        [1, row.0, self.head_dim]
+    }
+    pub(crate) fn cache_tile(&self, row: RowTile) -> [usize; 3] {
+        [self.max_seq, 1, row.0]
     }
 }
 

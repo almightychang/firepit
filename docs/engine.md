@@ -105,7 +105,7 @@ impl Engine {
 
 - `Batch`가 `&mut Session`을 들고 있으니 같은 세션을 두 번 넣거나 step 중에 다른 곳에서 세션을 만지는 코드는 컴파일되지 않는다.
 - `Session`은 `Model`을 참조하지 않는다. state 모양은 `Model::new_session()`이 config로 만든다.
-- 현재 Q8 커널이 처리하는 배치 크기는 1, 2, 4다. `Engine::batch`가 그 밖의 크기를 거부한다. 캐시는 크기별 한 조합만 보관하고, 조합이 바뀌면 graph를 다시 캡처한다. `Engine::close_session`은 종료한 세션이 들어 있는 항목을 제거한다.
+- `Engine::batch`는 세션 1~4개를 받는다. 3개는 내부에서 4행으로 채우며 빈 행의 세션 연산은 실행하지 않고 logits도 반환하지 않는다. 캐시는 채운 크기별 한 조합만 보관하고, 조합이 바뀌면 graph를 다시 캡처한다. `Engine::close_session`은 종료한 세션이 들어 있는 항목을 제거한다.
 
 ## 6. step plan: 연산 목록 하나
 

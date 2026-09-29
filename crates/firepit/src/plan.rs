@@ -1,4 +1,4 @@
-use crate::model::{NormRef, Stream, WeightRef};
+use crate::model::{NormRef, RowTile, Stream, WeightRef};
 use crate::{Model, Result};
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::DeviceOp;
@@ -44,9 +44,9 @@ impl Slot {
         Self::ALL.iter().position(|&slot| slot == self).unwrap()
     }
 
-    fn shape(self, model: &Model, grid: &SessionGrid, batch: usize) -> Vec<usize> {
+    fn shape(self, model: &Model, batch: usize) -> Vec<usize> {
         match self {
-            Self::SessionOut => grid.output_shape(batch),
+            Self::SessionOut => model.dims().session_output_shape(batch),
             Self::Logits => vec![batch, model.dims().vocab()],
             _ => vec![batch, model.dims().hidden()],
         }
@@ -79,46 +79,19 @@ pub(crate) enum Op {
     },
 }
 
-pub(crate) struct SessionGrid {
-    pub row: usize,
-    pub heads: usize,
-    pub head_dim: usize,
-    pub max_seq: usize,
-}
-
-impl SessionGrid {
-    pub fn output_shape(&self, batch: usize) -> Vec<usize> {
-        vec![batch * self.heads, self.head_dim]
-    }
-    pub fn output_tile(&self) -> [usize; 2] {
-        [1, self.row]
-    }
-    pub fn recurrent_tile(&self) -> [usize; 3] {
-        [1, self.row, self.head_dim]
-    }
-    pub fn cache_tile(&self) -> [usize; 3] {
-        [self.max_seq, 1, self.row]
-    }
-}
-
 pub(crate) struct StepPlan {
     pub ops: Vec<Op>,
+    pub(crate) batch: usize,
     pub(crate) buffers: Vec<Tensor<f32>>,
     pub(crate) tokens: Tensor<i32>,
     pub(crate) positions: Vec<Tensor<i32>>,
     pub(crate) graph: Option<CudaGraph<()>>,
-    pub(crate) grid: SessionGrid,
+    pub(crate) row: RowTile,
 }
 
 impl StepPlan {
-    pub(crate) fn new(model: &Model, batch: usize, row: usize, stream: &Stream) -> Result<Self> {
+    pub(crate) fn new(model: &Model, batch: usize, row: RowTile, stream: &Stream) -> Result<Self> {
         let c = &model.dims();
-        let grid = SessionGrid {
-            row,
-            heads: c.heads(),
-            head_dim: c.head_dim(),
-            max_seq: c.max_seq(),
-        };
         let mut ops = vec![Op::Embed {
             out: Slot::Residual(Parity::Even),
         }];
@@ -163,7 +136,7 @@ impl StepPlan {
         });
         let buffers = Slot::ALL
             .iter()
-            .map(|slot| api::zeros::<f32>(&slot.shape(model, &grid, batch)).sync_on(stream))
+            .map(|slot| api::zeros::<f32>(&slot.shape(model, batch)).sync_on(stream))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let tokens = api::zeros::<i32>(&[batch]).sync_on(stream)?;
         let positions = (0..batch)
@@ -171,11 +144,12 @@ impl StepPlan {
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
             ops,
+            batch,
             buffers,
             tokens,
             positions,
             graph: None,
-            grid,
+            row,
         })
     }
 

@@ -1,4 +1,4 @@
-use crate::model::Stream;
+use crate::model::{RowTile, Stream};
 use crate::plan::{Op, Slot, StepPlan};
 use crate::session::LayerState;
 use crate::{Batch, Model, Result, Session, SessionId};
@@ -22,8 +22,6 @@ static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EngineId(u64);
-
-struct RowTile(usize);
 
 enum Sink<'a> {
     Eager(&'a Stream),
@@ -86,7 +84,7 @@ fn run(
     sessions: &mut [&mut Session],
     sink: &Sink<'_>,
 ) -> Result<()> {
-    let batch = sessions.len();
+    let batch = plan.batch;
     let c = &model.dims();
     let (h, heads, d, max_seq) = (c.hidden(), c.heads(), c.head_dim(), c.max_seq());
     for op in &plan.ops {
@@ -162,12 +160,12 @@ fn run(
                     let row_output = out.slice_mut(&[b * heads..(b + 1) * heads, 0..d])?;
                     match &mut session.state[layer] {
                         LayerState::Gdn { recurrent } => {
-                            let r = plan.grid.row;
+                            let r = plan.row.0;
                             submit(
                                 sink,
                                 hybrid::gdn_step(
-                                    row_output.partition(plan.grid.output_tile()),
-                                    recurrent.partition(plan.grid.recurrent_tile()),
+                                    row_output.partition(c.session_output_tile(plan.row)),
+                                    recurrent.partition(c.recurrent_tile(plan.row)),
                                     &row_input,
                                     1.0 / d as f32,
                                 )
@@ -181,8 +179,8 @@ fn run(
                             submit(
                                 sink,
                                 hybrid::kv_append(
-                                    k.partition(plan.grid.cache_tile()),
-                                    v.partition(plan.grid.cache_tile()),
+                                    k.partition(c.cache_tile(plan.row)),
+                                    v.partition(c.cache_tile(plan.row)),
                                     &row_input,
                                     &plan.positions[b],
                                 )
@@ -190,7 +188,7 @@ fn run(
                                     max_seq.to_string(),
                                     heads.to_string(),
                                     d.to_string(),
-                                    plan.grid.row.to_string(),
+                                    plan.row.0.to_string(),
                                 ])
                                 .compile_options(
                                     CompileOptions::default().occupancy(TARGET_BLOCKS_PER_SM),
@@ -199,7 +197,7 @@ fn run(
                             submit(
                                 sink,
                                 hybrid::attn_step(
-                                    row_output.partition(plan.grid.output_tile()),
+                                    row_output.partition(c.session_output_tile(plan.row)),
                                     &*k,
                                     &*v,
                                     &row_input,
@@ -209,7 +207,7 @@ fn run(
                                 .generics(vec![
                                     heads.to_string(),
                                     d.to_string(),
-                                    plan.grid.row.to_string(),
+                                    plan.row.0.to_string(),
                                 ])
                                 .compile_options(
                                     CompileOptions::default().occupancy(TARGET_BLOCKS_PER_SM),
@@ -224,10 +222,6 @@ fn run(
     Ok(())
 }
 
-enum Execution {
-    Eager,
-    Graph,
-}
 pub struct Engine {
     model: Arc<Model>,
     id: EngineId,
@@ -291,11 +285,8 @@ impl Engine {
         entries: impl IntoIterator<Item = (&'s mut Session, u32)>,
     ) -> Result<Batch<'s>> {
         let entries: Vec<_> = entries.into_iter().collect();
-        if entries.is_empty()
-            || entries.len() > MAX_BATCH_SESSIONS
-            || !entries.len().is_power_of_two()
-        {
-            return Err(format!("batch must have 1, 2, or {MAX_BATCH_SESSIONS} sessions").into());
+        if entries.is_empty() || entries.len() > MAX_BATCH_SESSIONS {
+            return Err(format!("batch must have 1..={MAX_BATCH_SESSIONS} sessions").into());
         }
         let mut ids = HashSet::new();
         for (session, token) in &entries {
@@ -318,16 +309,33 @@ impl Engine {
         Ok(Batch::from_checked(self.id, entries))
     }
     pub fn step(&mut self, batch: Batch<'_>) -> Result<Vec<f32>> {
-        self.step_with(batch, Execution::Graph)
+        self.step_with(batch, |model, plan, sessions, stream| {
+            if plan.graph.is_none() {
+                let graph = CudaGraph::scope(stream, |scope| {
+                    run(model, plan, sessions, &Sink::Graph(scope))
+                        .map_err(|e| cuda_async::error::DeviceError::Internal(e.to_string()))
+                })?;
+                plan.graph = Some(graph);
+            }
+            plan.graph.as_ref().unwrap().launch().sync_on(stream)?;
+            Ok(())
+        })
     }
     pub fn step_eager(&mut self, batch: Batch<'_>) -> Result<Vec<f32>> {
-        self.step_with(batch, Execution::Eager)
+        self.step_with(batch, |model, plan, sessions, stream| {
+            run(model, plan, sessions, &Sink::Eager(stream))
+        })
     }
-    fn step_with(&mut self, mut batch: Batch<'_>, execution: Execution) -> Result<Vec<f32>> {
+    fn step_with(
+        &mut self,
+        mut batch: Batch<'_>,
+        execute: impl FnOnce(&Model, &mut StepPlan, &mut [&mut Session], &Stream) -> Result<()>,
+    ) -> Result<Vec<f32>> {
         if batch.engine != self.id {
             return Err("batch belongs to another engine".into());
         }
-        let size = batch.sessions.len();
+        let actual = batch.sessions.len();
+        let size = actual.next_power_of_two();
         let instances: Vec<crate::session::SessionInstance> = batch
             .sessions
             .iter()
@@ -338,12 +346,13 @@ impl Engine {
             .get(&size)
             .is_none_or(|entry| entry.instances != instances)
         {
-            let plan = StepPlan::new(&self.model, size, self.row.0, &self.stream)?;
+            let plan = StepPlan::new(&self.model, size, self.row, &self.stream)?;
             self.synchronize_stream()?;
             self.plans.insert(size, CachedPlan { instances, plan });
         }
         let plan = &mut self.plans.get_mut(&size).unwrap().plan;
-        let tokens: Vec<i32> = batch.tokens.iter().map(|&x| x as i32).collect();
+        let mut tokens: Vec<i32> = batch.tokens.iter().map(|&x| x as i32).collect();
+        tokens.resize(size, 0);
         let result = (|| -> Result<Vec<f32>> {
             let source = api::copy_host_vec_to_device(&Arc::new(tokens)).sync_on(&self.stream)?;
             api::memcpy(&mut plan.tokens, &source).sync_on(&self.stream)?;
@@ -352,30 +361,7 @@ impl Engine {
                     .sync_on(&self.stream)?;
                 api::memcpy(slot, &source).sync_on(&self.stream)?;
             }
-            match execution {
-                Execution::Eager => run(
-                    &self.model,
-                    plan,
-                    &mut batch.sessions,
-                    &Sink::Eager(&self.stream),
-                )?,
-                Execution::Graph => {
-                    if plan.graph.is_none() {
-                        let graph = CudaGraph::scope(&self.stream, |scope| {
-                            run(&self.model, plan, &mut batch.sessions, &Sink::Graph(scope))
-                                .map_err(|e| {
-                                    cuda_async::error::DeviceError::Internal(e.to_string())
-                                })
-                        })?;
-                        plan.graph = Some(graph);
-                    }
-                    plan.graph
-                        .as_ref()
-                        .unwrap()
-                        .launch()
-                        .sync_on(&self.stream)?;
-                }
-            }
+            execute(&self.model, plan, &mut batch.sessions, &self.stream)?;
             #[cfg(test)]
             if self.fail_after_gpu_work {
                 return Err("injected failure after GPU work".into());
@@ -395,7 +381,7 @@ impl Engine {
             session.position += 1;
         }
         let vocab = self.model.dims().vocab();
-        let mut logits = vec![0.0f32; canonical_logits.len()];
+        let mut logits = vec![0.0f32; actual * vocab];
         for (canonical, original) in batch.original_rows.into_iter().enumerate() {
             logits[original * vocab..(original + 1) * vocab]
                 .copy_from_slice(&canonical_logits[canonical * vocab..(canonical + 1) * vocab]);
@@ -419,7 +405,7 @@ mod tests {
         let mut session = engine.new_session(SessionId(1))?;
         engine.fail_after_gpu_work = true;
         let batch = engine.batch([(&mut session, 1)])?;
-        assert!(engine.step_with(batch, Execution::Eager).is_err());
+        assert!(engine.step_eager(batch).is_err());
         assert_eq!(session.position(), 0);
         assert!(engine.batch([(&mut session, 1)]).is_err());
         Ok(())
@@ -436,11 +422,15 @@ mod tests {
             .map(|id| engine.new_session(SessionId(id)))
             .collect::<Result<Vec<_>>>()?;
 
-        for size in [1, 2, MAX_BATCH_SESSIONS] {
+        for size in 1..=MAX_BATCH_SESSIONS {
             let batch = engine.batch(sessions[..size].iter_mut().map(|session| (session, 1)))?;
             engine.step(batch)?;
+            if size == 3 {
+                assert_eq!(engine.plans.get(&4).unwrap().instances.len(), 3);
+            }
         }
         assert_eq!(engine.plans.len(), 3);
+        assert_eq!(engine.plans.get(&4).unwrap().instances.len(), 4);
 
         let original = engine.plans.get(&1).unwrap().instances[0];
         let batch = engine.batch([(&mut sessions[4], 1)])?;

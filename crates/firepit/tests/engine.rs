@@ -47,7 +47,7 @@ fn batched(
 #[test]
 fn batch_matches_individual_steps() -> TestResult {
     let (model, device) = setup()?;
-    for b in [1, 2, 4] {
+    for b in [1, 2, 3, 4] {
         let mut together = Engine::new(model.clone(), &device)?;
         let mut sessions = make_sessions(&together, b)?;
         let mut singles: Vec<_> = (0..b)
@@ -100,7 +100,7 @@ fn one_session_input_does_not_change_other_output() -> TestResult {
 #[test]
 fn graph_replay_matches_eager() -> TestResult {
     let (model, device) = setup()?;
-    for b in [1, 2, 4] {
+    for b in [1, 2, 3, 4] {
         let mut eager = Engine::new(model.clone(), &device)?;
         let mut graph = Engine::new(model.clone(), &device)?;
         let mut se = make_sessions(&eager, b)?;
@@ -116,6 +116,24 @@ fn graph_replay_matches_eager() -> TestResult {
         }
         println!("graph B={b} N=4 max_abs_error={worst:.6e}");
         assert!(worst <= 1e-4);
+    }
+    Ok(())
+}
+
+#[test]
+fn graph_recaptures_when_three_and_four_sessions_share_a_plan_size() -> TestResult {
+    let (model, device) = setup()?;
+    let mut eager = Engine::new(model.clone(), &device)?;
+    let mut graph = Engine::new(model, &device)?;
+    let mut se = make_sessions(&eager, 4)?;
+    let mut sg = make_sessions(&graph, 4)?;
+
+    for width in [3, 4, 3] {
+        let tokens = [3, 7, 11, 13];
+        let a = batched(&mut eager, &mut se[..width], &tokens[..width], true)?;
+        let g = batched(&mut graph, &mut sg[..width], &tokens[..width], false)?;
+        assert_eq!(g.len(), width * VOCAB);
+        assert!(compare(&a, &g) <= 1e-4);
     }
     Ok(())
 }
@@ -211,7 +229,7 @@ fn batch_rejects_invalid_inputs_and_cross_engine_use() -> TestResult {
     assert!(
         engine
             .batch([(&mut a, 0), (&mut c, 0), (&mut d, 0)])
-            .is_err()
+            .is_ok()
     );
     let batch = engine.batch([(&mut a, 0)])?;
     assert!(other.step(batch).is_err());
