@@ -1,4 +1,4 @@
-use crate::model::{RowTile, Stream};
+use crate::model::{RowTile, Stream, Weight};
 use crate::plan::{Op, Slot, StepPlan};
 use crate::session::LayerState;
 use crate::{Batch, Model, Result, Session, SessionId};
@@ -8,6 +8,7 @@ use cuda_core::Device;
 use cutile::api;
 use cutile::tensor::{IntoPartition, PartitionMut, Tensor};
 use cutile::tile_kernel::{CompileOptions, TileKernel};
+use firepit_kernels::dense::dense_gemv;
 use firepit_kernels::hybrid;
 use firepit_kernels::q8::{DEFAULT_GEMV_TILE, Q8_BLOCK, q8_gemv};
 use firepit_kernels::tile::{MIN_ROW_TILE, row_tile};
@@ -140,15 +141,26 @@ fn run(
                 let activation = input_tensor.view(&[batch, h])?;
                 let x = activation.view(&[batch, h / Q8_BLOCK, Q8_BLOCK])?;
                 let w = model.weights.get(weight);
-                submit(
-                    sink,
-                    q8_gemv(
-                        w,
-                        &x,
-                        out.partition([batch, DEFAULT_GEMV_TILE.rows]),
-                        DEFAULT_GEMV_TILE,
-                    ),
-                )?;
+                match w {
+                    Weight::Bf16(w) => submit(
+                        sink,
+                        dense_gemv(
+                            w,
+                            &x,
+                            out.partition([batch, DEFAULT_GEMV_TILE.rows]),
+                            DEFAULT_GEMV_TILE,
+                        ),
+                    )?,
+                    Weight::Q8(w) => submit(
+                        sink,
+                        q8_gemv(
+                            w,
+                            &x,
+                            out.partition([batch, DEFAULT_GEMV_TILE.rows]),
+                            DEFAULT_GEMV_TILE,
+                        ),
+                    )?,
+                }
             }
             Op::Session {
                 layer,

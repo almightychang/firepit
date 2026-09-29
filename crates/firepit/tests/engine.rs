@@ -1,5 +1,5 @@
 use cuda_core::Device;
-use firepit::{Engine, Model, ModelConfig, ModelDims, Session, SessionId};
+use firepit::{Engine, Model, ModelConfig, ModelDims, Session, SessionId, SyntheticWeightFormat};
 use std::sync::Arc;
 
 const VOCAB: usize = 512;
@@ -7,11 +7,18 @@ const VOCAB: usize = 512;
 type TestResult = Result<(), Box<dyn std::error::Error>>;
 
 fn setup() -> Result<(Arc<Model>, Arc<cuda_core::Device>), Box<dyn std::error::Error>> {
+    setup_with_format(SyntheticWeightFormat::Q8)
+}
+
+fn setup_with_format(
+    format: SyntheticWeightFormat,
+) -> Result<(Arc<Model>, Arc<cuda_core::Device>), Box<dyn std::error::Error>> {
     let device = Device::new(0)?;
     let stream = device.new_stream()?;
-    let model = Arc::new(Model::synthetic(
+    let model = Arc::new(Model::synthetic_with_format(
         ModelDims::try_from(ModelConfig::default())?,
         &stream,
+        format,
     )?);
     Ok((model, device))
 }
@@ -46,7 +53,14 @@ fn batched(
 
 #[test]
 fn batch_matches_individual_steps() -> TestResult {
-    let (model, device) = setup()?;
+    for format in [SyntheticWeightFormat::Q8, SyntheticWeightFormat::Bf16] {
+        batch_matches_individual_steps_for(format)?;
+    }
+    Ok(())
+}
+
+fn batch_matches_individual_steps_for(format: SyntheticWeightFormat) -> TestResult {
+    let (model, device) = setup_with_format(format)?;
     for b in [1, 2, 3, 4] {
         let mut together = Engine::new(model.clone(), &device)?;
         let mut sessions = make_sessions(&together, b)?;
@@ -70,7 +84,7 @@ fn batch_matches_individual_steps() -> TestResult {
                 worst = worst.max(compare(&actual[i * VOCAB..(i + 1) * VOCAB], &expected));
             }
         }
-        println!("batch B={b} N=4 max_abs_error={worst:.6e}");
+        println!("{format:?} batch B={b} N=4 max_abs_error={worst:.6e}");
         assert!(worst <= 1e-4);
     }
     Ok(())
@@ -78,7 +92,14 @@ fn batch_matches_individual_steps() -> TestResult {
 
 #[test]
 fn one_session_input_does_not_change_other_output() -> TestResult {
-    let (model, device) = setup()?;
+    for format in [SyntheticWeightFormat::Q8, SyntheticWeightFormat::Bf16] {
+        one_session_input_does_not_change_other_output_for(format)?;
+    }
+    Ok(())
+}
+
+fn one_session_input_does_not_change_other_output_for(format: SyntheticWeightFormat) -> TestResult {
+    let (model, device) = setup_with_format(format)?;
     let mut a = Engine::new(model.clone(), &device)?;
     let mut b = Engine::new(model.clone(), &device)?;
     let mut sa = make_sessions(&a, 2)?;
@@ -91,7 +112,7 @@ fn one_session_input_does_not_change_other_output() -> TestResult {
         worst = worst.max(compare(&out_a[VOCAB..], &out_b[VOCAB..]));
         changed = changed.max(compare(&out_a[..VOCAB], &out_b[..VOCAB]));
     }
-    println!("isolation other_max_abs={worst:.6e} changed_max_abs={changed:.6e}");
+    println!("{format:?} isolation other_max_abs={worst:.6e} changed_max_abs={changed:.6e}");
     assert_eq!(worst, 0.0);
     assert!(changed > 1e-4);
     Ok(())
@@ -99,7 +120,14 @@ fn one_session_input_does_not_change_other_output() -> TestResult {
 
 #[test]
 fn graph_replay_matches_eager() -> TestResult {
-    let (model, device) = setup()?;
+    for format in [SyntheticWeightFormat::Q8, SyntheticWeightFormat::Bf16] {
+        graph_replay_matches_eager_for(format)?;
+    }
+    Ok(())
+}
+
+fn graph_replay_matches_eager_for(format: SyntheticWeightFormat) -> TestResult {
+    let (model, device) = setup_with_format(format)?;
     for b in [1, 2, 3, 4] {
         let mut eager = Engine::new(model.clone(), &device)?;
         let mut graph = Engine::new(model.clone(), &device)?;
@@ -114,15 +142,59 @@ fn graph_replay_matches_eager() -> TestResult {
             let g = batched(&mut graph, &mut sg, &tokens, false)?;
             worst = worst.max(compare(&a, &g));
         }
-        println!("graph B={b} N=4 max_abs_error={worst:.6e}");
+        println!("{format:?} graph B={b} N=4 max_abs_error={worst:.6e}");
         assert!(worst <= 1e-4);
     }
     Ok(())
 }
 
 #[test]
+fn bf16_and_q8_synthetic_results_match() -> TestResult {
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let dims = ModelDims::try_from(ModelConfig::default())?;
+    let bf16 = Arc::new(Model::synthetic_with_format(
+        dims.clone(),
+        &stream,
+        SyntheticWeightFormat::Bf16,
+    )?);
+    let q8 = Arc::new(Model::synthetic_with_format(
+        dims,
+        &stream,
+        SyntheticWeightFormat::Q8,
+    )?);
+    let mut worst = 0.0f32;
+    for batch in 1..=4 {
+        let mut dense_engine = Engine::new(bf16.clone(), &device)?;
+        let mut quant_engine = Engine::new(q8.clone(), &device)?;
+        let mut dense_sessions = make_sessions(&dense_engine, batch)?;
+        let mut quant_sessions = make_sessions(&quant_engine, batch)?;
+        for step in 0..4 {
+            let tokens: Vec<u32> = (0..batch)
+                .map(|i| ((i * 19 + step * 11 + 2) % VOCAB) as u32)
+                .collect();
+            let dense = batched(&mut dense_engine, &mut dense_sessions, &tokens, false)?;
+            let quant = batched(&mut quant_engine, &mut quant_sessions, &tokens, false)?;
+            worst = worst.max(compare(&dense, &quant));
+        }
+    }
+    println!("bf16 vs Q8 max_abs_error={worst:.6e}");
+    assert!(worst <= 1e-4);
+    Ok(())
+}
+
+#[test]
 fn graph_recaptures_when_three_and_four_sessions_share_a_plan_size() -> TestResult {
-    let (model, device) = setup()?;
+    for format in [SyntheticWeightFormat::Q8, SyntheticWeightFormat::Bf16] {
+        graph_recaptures_when_three_and_four_sessions_share_a_plan_size_for(format)?;
+    }
+    Ok(())
+}
+
+fn graph_recaptures_when_three_and_four_sessions_share_a_plan_size_for(
+    format: SyntheticWeightFormat,
+) -> TestResult {
+    let (model, device) = setup_with_format(format)?;
     let mut eager = Engine::new(model.clone(), &device)?;
     let mut graph = Engine::new(model, &device)?;
     let mut se = make_sessions(&eager, 4)?;
@@ -140,7 +212,16 @@ fn graph_recaptures_when_three_and_four_sessions_share_a_plan_size() -> TestResu
 
 #[test]
 fn graph_handles_reordered_batch_and_replaced_session() -> TestResult {
-    let (model, device) = setup()?;
+    for format in [SyntheticWeightFormat::Q8, SyntheticWeightFormat::Bf16] {
+        graph_handles_reordered_batch_and_replaced_session_for(format)?;
+    }
+    Ok(())
+}
+
+fn graph_handles_reordered_batch_and_replaced_session_for(
+    format: SyntheticWeightFormat,
+) -> TestResult {
+    let (model, device) = setup_with_format(format)?;
     let mut eager = Engine::new(model.clone(), &device)?;
     let mut graph = Engine::new(model.clone(), &device)?;
     let mut se = make_sessions(&eager, 2)?;
@@ -169,7 +250,7 @@ fn graph_handles_reordered_batch_and_replaced_session() -> TestResult {
     let e = eager.step_eager(eager.batch([(&mut fresh_e, 19), (&mut se[1], 21)])?)?;
     let g = graph.step(graph.batch([(&mut fresh_g, 19), (&mut sg[1], 21)])?)?;
     let error = compare(&e, &g);
-    println!("reordered/replaced graph max_abs_error={error:.6e}");
+    println!("{format:?} reordered/replaced graph max_abs_error={error:.6e}");
     assert!(error <= 1e-4);
     Ok(())
 }

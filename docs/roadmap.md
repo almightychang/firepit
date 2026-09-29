@@ -83,6 +83,7 @@ scripts/dev.sh test -p firepit --test reference -- --ignored
 - 중간값은 transformers 자체 기능(`output_hidden_states`)으로 얻는다. MoE router logits도 같은 방식으로 얻을 수 있다.
 - Rust는 공식 `safetensors` crate의 header 타입으로 파일을 해석하고 필요한 바이트 범위만 읽는다(mmap을 쓰지 않아 unsafe가 없다).
 - 2.1 비교(5 step): exit_norm 최대 절대 오차 `3.81469727e-6`, logits `5.00679016e-6`; top-1 5개 모두 일치. 잘못된 scale(`w`)을 쓰면 exit_norm 최대 절대 오차 `2.56955013e1`.
+- 2.1b: 합성 모델의 bf16/Q8 가중치 dispatch를 같은 op 목록에 연결했다. batch 1~4, eager/graph, 세션 교체 비교 통과; 두 형식 출력의 최대 절대 차이는 `2.384186e-7`.
 
 ## 확인할 것
 

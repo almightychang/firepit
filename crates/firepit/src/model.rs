@@ -4,9 +4,10 @@ use crate::{Result, Session, SessionId};
 use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::Tensor;
+use firepit_kernels::dense::DenseMatrix;
 use firepit_kernels::q8::{DEFAULT_GEMV_TILE, HostQ8Matrix, Q8_BLOCK, Q8Matrix};
 use firepit_kernels::tile::splits_into_row_tiles;
-use half::f16;
+use half::{bf16, f16};
 use std::sync::Arc;
 
 pub type Stream = Arc<cuda_core::Stream>;
@@ -146,13 +147,24 @@ impl TryFrom<ModelConfig> for ModelDims {
 }
 
 pub(crate) struct LayerWeights {
-    pub input: Q8Matrix,
-    pub output: Q8Matrix,
+    pub input: Weight,
+    pub output: Weight,
 }
 
 pub(crate) struct ModelWeights {
     pub layers: Vec<LayerWeights>,
-    pub output_head: Q8Matrix,
+    pub output_head: Weight,
+}
+
+pub(crate) enum Weight {
+    Bf16(DenseMatrix<bf16>),
+    Q8(Q8Matrix),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SyntheticWeightFormat {
+    Bf16,
+    Q8,
 }
 
 #[derive(Clone, Copy)]
@@ -169,7 +181,7 @@ pub(crate) enum NormRef {
 }
 
 impl ModelWeights {
-    pub(crate) fn get(&self, weight: WeightRef) -> &Q8Matrix {
+    pub(crate) fn get(&self, weight: WeightRef) -> &Weight {
         match weight {
             WeightRef::LayerInput(layer) => &self.layers[layer].input,
             WeightRef::LayerOutput(layer) => &self.layers[layer].output,
@@ -188,6 +200,14 @@ pub struct Model {
 
 impl Model {
     pub fn synthetic(dims: ModelDims, stream: &Stream) -> Result<Self> {
+        Self::synthetic_with_format(dims, stream, SyntheticWeightFormat::Q8)
+    }
+
+    pub fn synthetic_with_format(
+        dims: ModelDims,
+        stream: &Stream,
+        format: SyntheticWeightFormat,
+    ) -> Result<Self> {
         let config = &dims;
         let h = config.hidden;
         let table: Vec<f32> = (0..config.vocab * h)
@@ -199,13 +219,13 @@ impl Model {
         let mut seed = 0;
         let mut layers = Vec::with_capacity(config.layers.len());
         for _ in config.layers() {
-            let input = synthetic_q8(h, h, seed).upload(stream)?;
+            let input = synthetic_weight(h, h, seed, format, stream)?;
             seed += 1;
-            let output = synthetic_q8(h, h, seed).upload(stream)?;
+            let output = synthetic_weight(h, h, seed, format, stream)?;
             seed += 1;
             layers.push(LayerWeights { input, output });
         }
-        let output_head = synthetic_q8(config.vocab, h, seed).upload(stream)?;
+        let output_head = synthetic_weight(config.vocab, h, seed, format, stream)?;
         let unit_norm = Arc::new(vec![1.0f32; h]);
         let layer_norms = (0..config.layers.len())
             .map(|_| api::copy_host_vec_to_device(&unit_norm).sync_on(stream))
@@ -267,14 +287,34 @@ impl Model {
     }
 }
 
-fn synthetic_q8(rows: usize, cols: usize, seed: usize) -> HostQ8Matrix {
-    HostQ8Matrix::from_parts(
-        (0..rows * cols)
-            .map(|i| ((i * 13 + seed * 7) % 17) as i8 - 8)
-            .collect(),
-        vec![f16::from_f32(1.0 / 256.0); rows * cols / Q8_BLOCK],
-        rows,
-        cols,
-    )
-    .expect("validated model dimensions")
+fn synthetic_weight(
+    rows: usize,
+    cols: usize,
+    seed: usize,
+    format: SyntheticWeightFormat,
+    stream: &Stream,
+) -> Result<Weight> {
+    let values: Vec<i8> = (0..rows * cols)
+        .map(|i| ((i * 13 + seed * 7) % 17) as i8 - 8)
+        .collect();
+    Ok(match format {
+        SyntheticWeightFormat::Bf16 => Weight::Bf16(DenseMatrix::upload(
+            values
+                .into_iter()
+                .map(|x| bf16::from_f32(x as f32 / 256.0))
+                .collect(),
+            rows,
+            cols,
+            stream,
+        )?),
+        SyntheticWeightFormat::Q8 => Weight::Q8(
+            HostQ8Matrix::from_parts(
+                values,
+                vec![f16::from_f32(1.0 / 256.0); rows * cols / Q8_BLOCK],
+                rows,
+                cols,
+            )?
+            .upload(stream)?,
+        ),
+    })
 }
