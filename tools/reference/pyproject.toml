@@ -1,0 +1,17 @@
+[project]
+name = "firepit-reference"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "transformers==5.17.0",
+    "torch",
+    "safetensors",
+]
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

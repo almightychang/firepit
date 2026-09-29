@@ -2,3 +2,5 @@
 /target-c13/
 /target-candle/
 /vendor/
+/refs/
+/tools/reference/.venv/

@@ -9,5 +9,6 @@ container() {
     -e "PATH=$HOME/.cargo/bin:/usr/local/cuda/bin:/usr/sbin:/usr/bin:/bin" \
     -e CUDA_HOME=/usr/local/cuda -e CUDA_TOOLKIT_PATH=/usr/local/cuda \
     -v "$HOME/.cargo:$HOME/.cargo" -v "$HOME/.rustup:$HOME/.rustup" \
+    -v "$HOME/Models:$HOME/Models:ro" \
     -v "$root:/work" "$@"
 }

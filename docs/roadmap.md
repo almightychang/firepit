@@ -56,7 +56,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 
 | 덩이 | 배우는 것 | 끝났다는 기준 | 상태 |
 |---|---|---|---|
-| 2.0 정답 기준 만들기 | config 읽기, 가중치 이름과 모양, forward에서 흐르는 값 | HF로 layer별 중간값 덤프, Rust가 실제 가중치 일부 로드 | ○ |
+| 2.0 정답 기준 만들기 | config 읽기, 가중치 이름과 모양, forward에서 흐르는 값 | HF로 layer별 중간값 덤프, Rust가 실제 가중치 일부 로드 | ✔ |
 | 2.1 입구와 출구 | token → embedding, 마지막 norm → LM head → logits | layer 0개 모델의 logits가 HF와 일치 | ○ |
 | 2.2 RMSNorm | 정규화하는 이유, Qwen의 weight 형태 | 실제 가중치로 일치 | ◐ (scale 경로 있음) |
 | 2.3 SwiGLU MLP | FFN의 gate · up · down | shared expert 하나가 일치 | ○ |
@@ -68,6 +68,20 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 | 2.9 전부 쌓기 | layer stack, tokenizer, greedy decode | 실제 문장 생성 | ○ |
 
 순서는 쉬운 개념부터 쌓는다. 각 개념이 다음 개념의 전제가 된다. cuTile 표현력의 한계는 2.6(MoE, 간접 읽기)과 2.8(GDN)에서 만난다.
+
+## 정답지 만들기 (2.0)
+
+```bash
+# 앞쪽 4개 layer에 필요한 shard 4개 (약 10.9 GB)만 ~/Models/qwen3.6-35b-a3b 에 받는다
+cd tools/reference
+uv run python trace_qwen36.py --model ~/Models/qwen3.6-35b-a3b --out ../../refs/qwen36-prefix4.safetensors
+cd ../..
+scripts/dev.sh test -p firepit --test reference -- --ignored
+```
+
+- 정답지는 앞쪽 N개 layer만 가진 모델을 token 하나씩 decode하며, 각 layer로 들어가는 residual stream(`step{t}/residual{i}`, i = 0..N)을 기록한다. `residual0`은 embedding, `residualN`은 마지막 layer의 출력이다. 앞쪽 N층만으로는 최종 norm과 logits가 실제 모델 출력이 아니라서 기록하지 않는다.
+- 중간값은 transformers 자체 기능(`output_hidden_states`)으로 얻는다. MoE router logits도 같은 방식으로 얻을 수 있다.
+- Rust는 공식 `safetensors` crate의 header 타입으로 파일을 해석하고 필요한 바이트 범위만 읽는다(mmap을 쓰지 않아 unsafe가 없다).
 
 ## 확인할 것
 
