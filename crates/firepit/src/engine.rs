@@ -267,16 +267,8 @@ impl Engine {
         if session.engine != self.id {
             return Err("session belongs to another engine".into());
         }
-        self.synchronize_stream()?;
         self.plans
             .retain(|_, entry| !entry.instances.contains(&session.instance));
-        Ok(())
-    }
-
-    fn synchronize_stream(&self) -> Result<()> {
-        self.stream.device().bind_to_thread()?;
-        // SAFETY: the stream's parent device context is current on this thread.
-        unsafe { self.stream.synchronize()? };
         Ok(())
     }
 
@@ -347,7 +339,6 @@ impl Engine {
             .is_none_or(|entry| entry.instances != instances)
         {
             let plan = StepPlan::new(&self.model, size, self.row, &self.stream)?;
-            self.synchronize_stream()?;
             self.plans.insert(size, CachedPlan { instances, plan });
         }
         let plan = &mut self.plans.get_mut(&size).unwrap().plan;
