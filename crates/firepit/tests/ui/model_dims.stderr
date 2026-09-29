@@ -1,0 +1,5 @@
+error[E0616]: field `dims` of struct `Model` is private
+ --> tests/ui/model_dims.rs:2:38
+  |
+2 | fn mutate(model: &mut Model) { model.dims.vocab = 1; }
+  |                                      ^^^^ private field

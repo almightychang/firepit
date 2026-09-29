@@ -1,5 +1,5 @@
 use cuda_core::Device;
-use firepit::{Batch, Engine, Execution, Model, ModelConfig};
+use firepit::{Engine, Model, ModelConfig, ModelDims, SessionId};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,42 +14,36 @@ fn step_times() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!cfg!(debug_assertions), "timing needs --release");
     let device = Device::new(0)?;
     let stream = device.new_stream()?;
-    let model = Arc::new(Model::synthetic(ModelConfig::default(), &stream)?);
+    let model = Arc::new(Model::synthetic(
+        ModelDims::try_from(ModelConfig::default())?,
+        &stream,
+    )?);
     let sm = cuda_core::simt::CudaContext::new(device.ordinal())?.multiprocessor_count()?;
     println!("device={} sm_count={sm}", device.name()?);
     for batch in [1usize, 2, 4] {
-        for mode in [Execution::Eager, Execution::Graph] {
+        for eager in [true, false] {
             let mut engine = Engine::new(model.clone(), &device)?;
-            if batch == 1 && matches!(mode, Execution::Eager) {
-                println!("row_tile={}", engine.row_tile());
-            }
             let mut sessions: Vec<_> = (0..batch)
-                .map(|i| model.new_session(i as u64 + 1, engine.stream()))
+                .map(|i| engine.new_session(SessionId(i as u64 + 1)))
                 .collect::<Result<_, _>>()?;
             let mut samples = Vec::new();
             for step in 0..25 {
                 let tokens: Vec<u32> = (0..batch)
                     .map(|i| ((step * 7 + i * 19 + 3) % 256) as u32)
                     .collect();
-                let refs = sessions.iter_mut().collect();
                 let started = Instant::now();
-                let logits = engine.step_with(
-                    Batch::new(refs, tokens)?,
-                    match mode {
-                        Execution::Eager => Execution::Eager,
-                        Execution::Graph => Execution::Graph,
-                    },
-                )?;
+                let batch = engine.batch(sessions.iter_mut().zip(tokens))?;
+                let logits = if eager {
+                    engine.step_eager(batch)?
+                } else {
+                    engine.step(batch)?
+                };
                 assert!(logits.iter().all(|x| x.is_finite()));
                 if step >= 5 {
                     samples.push(started.elapsed().as_secs_f64() * 1000.0);
                 }
             }
-            let label = if matches!(mode, Execution::Eager) {
-                "eager"
-            } else {
-                "graph"
-            };
+            let label = if eager { "eager" } else { "graph" };
             println!(
                 "B={batch} {label} median_step_ms={:.4} samples={}",
                 median(samples),

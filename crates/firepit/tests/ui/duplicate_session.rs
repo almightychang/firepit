@@ -1,7 +1,6 @@
-use firepit::{Batch, Session};
+use firepit::{Engine, Session};
 
-fn duplicate(session: &mut Session) {
-    let _batch = Batch::new(vec![&mut *session, &mut *session], vec![1, 2]);
+fn duplicate(engine: &Engine, session: &mut Session) {
+    let _batch = engine.batch([(&mut *session, 1), (&mut *session, 2)]);
 }
-
 fn main() {}

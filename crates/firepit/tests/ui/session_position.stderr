@@ -1,0 +1,5 @@
+error[E0616]: field `position` of struct `Session` is private
+ --> tests/ui/session_position.rs:2:44
+  |
+2 | fn mutate(session: &mut Session) { session.position = 1; }
+  |                                            ^^^^^^^^ private field

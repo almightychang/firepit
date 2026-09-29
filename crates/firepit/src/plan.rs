@@ -7,13 +7,13 @@ use cutile::tensor::Tensor;
 use cutile::tile_kernel::ToHostVecOp;
 
 #[derive(Clone, Copy)]
-pub enum SessionKind {
+pub(crate) enum SessionKind {
     Gdn,
     Attention,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Parity {
+pub(crate) enum Parity {
     Even,
     Odd,
 }
@@ -28,7 +28,7 @@ impl Parity {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Slot {
+pub(crate) enum Slot {
     Residual(Parity),
     Normed,
     SessionOut,
@@ -53,13 +53,13 @@ impl Slot {
     fn shape(self, model: &Model, grid: &SessionGrid, batch: usize) -> Vec<usize> {
         match self {
             Self::SessionOut => grid.output_shape(batch),
-            Self::Logits => vec![batch, model.config.vocab],
-            _ => vec![batch, model.config.hidden],
+            Self::Logits => vec![batch, model.dims().vocab()],
+            _ => vec![batch, model.dims().hidden()],
         }
     }
 }
 
-pub enum Op {
+pub(crate) enum Op {
     Embed {
         out: Slot,
     },
@@ -107,30 +107,30 @@ impl SessionGrid {
     }
 }
 
-pub struct StepPlan {
+pub(crate) struct StepPlan {
     pub ops: Vec<Op>,
     pub(crate) buffers: Vec<Tensor<f32>>,
     pub(crate) tokens: Tensor<i32>,
     pub(crate) positions: Vec<Tensor<i32>>,
     pub(crate) graph: Option<CudaGraph<()>>,
     pub(crate) grid: SessionGrid,
-    pub(crate) instances: Vec<u64>,
+    pub(crate) instances: Vec<crate::session::SessionInstance>,
 }
 
 impl StepPlan {
     pub(crate) fn new(model: &Model, batch: usize, row: usize, stream: &Stream) -> Result<Self> {
-        let c = &model.config;
+        let c = &model.dims();
         let grid = SessionGrid {
             row,
-            heads: c.heads,
-            head_dim: c.head_dim,
-            max_seq: c.max_seq,
+            heads: c.heads(),
+            head_dim: c.head_dim(),
+            max_seq: c.max_seq(),
         };
         let mut ops = vec![Op::Embed {
             out: Slot::Residual(Parity::Even),
         }];
         let mut main = Parity::Even;
-        for layer in 0..(c.gdn_layers + c.attention_layers) {
+        for layer in 0..(c.gdn_layers() + c.attention_layers()) {
             ops.push(Op::RmsNorm {
                 input: Slot::Residual(main),
                 out: Slot::Normed,
@@ -140,7 +140,7 @@ impl StepPlan {
                 input: Slot::Normed,
                 out: Slot::Projected,
             });
-            let kind = if layer < c.gdn_layers {
+            let kind = if layer < c.gdn_layers() {
                 SessionKind::Gdn
             } else {
                 SessionKind::Attention

@@ -39,4 +39,4 @@ mod kernels {
     }
 }
 
-pub use kernels::q8_gemv_kernel;
+pub(super) use kernels::q8_gemv_kernel;

@@ -1,9 +1,9 @@
 error[E0499]: cannot borrow `*session` as mutable more than once at a time
- --> tests/ui/duplicate_session.rs:4:49
+ --> tests/ui/duplicate_session.rs:4:53
   |
-4 |     let _batch = Batch::new(vec![&mut *session, &mut *session], vec![1, 2]);
-  |                             --------------------^^^^^^^^^^^^^-
-  |                             |    |              |
-  |                             |    |              second mutable borrow occurs here
-  |                             |    first mutable borrow occurs here
-  |                             first borrow later used here
+4 |     let _batch = engine.batch([(&mut *session, 1), (&mut *session, 2)]);
+  |                               ----------------------^^^^^^^^^^^^^-----
+  |                               | |                   |
+  |                               | |                   second mutable borrow occurs here
+  |                               | first mutable borrow occurs here
+  |                               first borrow later used here

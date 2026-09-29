@@ -4,7 +4,6 @@ pub fn splits_into_row_tiles(v: usize) -> bool {
     v.is_power_of_two() && v >= MIN_ROW_TILE
 }
 
-/// Largest power-of-two row tile that exposes enough independent blocks.
 pub fn row_tile(
     v: usize,
     heads: usize,
@@ -12,9 +11,6 @@ pub fn row_tile(
     blocks_per_sm: usize,
     min_tile: usize,
 ) -> usize {
-    assert!(v.is_power_of_two() && min_tile.is_power_of_two());
-    assert!(heads > 0 && sm_count > 0 && blocks_per_sm > 0);
-    assert!(min_tile <= v);
     let target = sm_count.saturating_mul(blocks_per_sm);
     let mut tile = v;
     while tile > min_tile && heads * (v / tile) < target {

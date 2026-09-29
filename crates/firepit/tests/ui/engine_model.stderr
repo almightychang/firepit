@@ -1,0 +1,5 @@
+error[E0616]: field `model` of struct `Engine` is private
+ --> tests/ui/engine_model.rs:3:60
+  |
+3 | fn mutate(engine: &mut Engine, model: Arc<Model>) { engine.model = model; }
+  |                                                            ^^^^^ private field

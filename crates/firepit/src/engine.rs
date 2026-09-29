@@ -12,9 +12,18 @@ use firepit_kernels::hybrid;
 use firepit_kernels::q8::{DEFAULT_GEMV_TILE, q8_gemv};
 use firepit_kernels::tile::{MIN_ROW_TILE, row_tile};
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const TARGET_BLOCKS_PER_SM: i32 = 1;
+const MAX_BATCH_SESSIONS: usize = 4;
+static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct EngineId(u64);
+
+struct RowTile(usize);
 
 enum Sink<'a> {
     Eager(&'a Stream),
@@ -78,8 +87,8 @@ fn run(
     sink: &Sink<'_>,
 ) -> Result<()> {
     let batch = sessions.len();
-    let c = &model.config;
-    let (h, heads, d, max_seq) = (c.hidden, c.heads, c.head_dim, c.max_seq);
+    let c = &model.dims();
+    let (h, heads, d, max_seq) = (c.hidden(), c.heads(), c.head_dim(), c.max_seq());
     for op in &plan.ops {
         match *op {
             Op::Embed { out: output } => {
@@ -208,15 +217,18 @@ fn run(
     Ok(())
 }
 
-pub enum Execution {
+enum Execution {
     Eager,
     Graph,
 }
 pub struct Engine {
-    pub model: Arc<Model>,
+    model: Arc<Model>,
+    id: EngineId,
     stream: Stream,
-    row: usize,
-    plans: HashMap<(u8, Vec<SessionId>), StepPlan>,
+    row: RowTile,
+    plans: HashMap<Vec<SessionId>, StepPlan>,
+    #[cfg(test)]
+    fail_after_gpu_work: bool,
 }
 
 impl Engine {
@@ -224,42 +236,67 @@ impl Engine {
         let stream = device.new_stream()?;
         let sm =
             cuda_core::simt::CudaContext::new(device.ordinal())?.multiprocessor_count()? as usize;
-        let row = row_tile(
-            model.config.head_dim,
-            model.config.heads,
+        let row = RowTile(row_tile(
+            model.dims().head_dim(),
+            model.dims().heads(),
             sm,
             TARGET_BLOCKS_PER_SM as usize,
             MIN_ROW_TILE,
-        );
+        ));
         Ok(Self {
             model,
+            id: EngineId(NEXT_ENGINE_ID.fetch_add(1, Ordering::Relaxed)),
             stream,
             row,
             plans: HashMap::new(),
+            #[cfg(test)]
+            fail_after_gpu_work: false,
         })
     }
-    pub fn stream(&self) -> &Stream {
-        &self.stream
+    pub fn new_session(&self, id: SessionId) -> Result<Session> {
+        self.model.new_session(id, &self.stream)
     }
-    pub fn row_tile(&self) -> usize {
-        self.row
+
+    pub fn batch<'s>(
+        &self,
+        entries: impl IntoIterator<Item = (&'s mut Session, u32)>,
+    ) -> Result<Batch<'s>> {
+        let entries: Vec<_> = entries.into_iter().collect();
+        if entries.is_empty() || entries.len() > MAX_BATCH_SESSIONS {
+            return Err(format!("batch must have 1..={MAX_BATCH_SESSIONS} sessions").into());
+        }
+        let mut ids = HashSet::new();
+        for (session, token) in &entries {
+            if !ids.insert(session.id) {
+                return Err("duplicate session id".into());
+            }
+            if session.model != self.model.id {
+                return Err("session belongs to another model".into());
+            }
+            if *token as usize >= self.model.dims().vocab() {
+                return Err("token outside vocabulary".into());
+            }
+            if session.position >= self.model.dims().max_seq() {
+                return Err("session reached max_seq".into());
+            }
+            if session.poisoned {
+                return Err("session is poisoned".into());
+            }
+        }
+        Ok(Batch::from_checked(self.id, entries))
     }
     pub fn step(&mut self, batch: Batch<'_>) -> Result<Vec<f32>> {
         self.step_with(batch, Execution::Graph)
     }
-    pub fn step_with(&mut self, mut batch: Batch<'_>, execution: Execution) -> Result<Vec<f32>> {
-        if batch.sessions.iter().any(|s| s.model != self.model.id) {
-            return Err("session belongs to another model".into());
+    pub fn step_eager(&mut self, batch: Batch<'_>) -> Result<Vec<f32>> {
+        self.step_with(batch, Execution::Eager)
+    }
+    fn step_with(&mut self, mut batch: Batch<'_>, execution: Execution) -> Result<Vec<f32>> {
+        if batch.engine != self.id {
+            return Err("batch belongs to another engine".into());
         }
-        if batch
-            .sessions
-            .iter()
-            .any(|s| s.position >= self.model.config.max_seq)
-        {
-            return Err("session reached max_seq".into());
-        }
-        let key = (0u8, batch.sessions.iter().map(|s| s.id).collect::<Vec<_>>());
-        let instances: Vec<u64> = batch
+        let key: Vec<SessionId> = batch.sessions.iter().map(|s| s.id).collect();
+        let instances: Vec<crate::session::SessionInstance> = batch
             .sessions
             .iter()
             .map(|session| session.instance)
@@ -270,60 +307,90 @@ impl Engine {
             .is_none_or(|plan| plan.instances != instances)
         {
             let mut plan =
-                StepPlan::new(&self.model, batch.sessions.len(), self.row, &self.stream)?;
+                StepPlan::new(&self.model, batch.sessions.len(), self.row.0, &self.stream)?;
             plan.instances = instances;
             self.plans.insert(key.clone(), plan);
         }
         let plan = self.plans.get_mut(&key).unwrap();
         let tokens: Vec<i32> = batch.tokens.iter().map(|&x| x as i32).collect();
-        if batch
-            .tokens
-            .iter()
-            .any(|&x| x as usize >= self.model.config.vocab)
-        {
-            return Err("token outside vocabulary".into());
-        }
-        let source = api::copy_host_vec_to_device(&Arc::new(tokens)).sync_on(&self.stream)?;
-        api::memcpy(&mut plan.tokens, &source).sync_on(&self.stream)?;
-        for (slot, session) in plan.positions.iter_mut().zip(&batch.sessions) {
-            let source = api::copy_host_vec_to_device(&Arc::new(vec![session.position as i32]))
-                .sync_on(&self.stream)?;
-            api::memcpy(slot, &source).sync_on(&self.stream)?;
-        }
-        match execution {
-            Execution::Eager => run(
-                &self.model,
-                plan,
-                &mut batch.sessions,
-                &Sink::Eager(&self.stream),
-            )?,
-            Execution::Graph => {
-                if plan.graph.is_none() {
-                    let graph = CudaGraph::scope(&self.stream, |scope| {
-                        run(&self.model, plan, &mut batch.sessions, &Sink::Graph(scope))
-                            .map_err(|e| cuda_async::error::DeviceError::Internal(e.to_string()))
-                    })?;
-                    plan.graph = Some(graph);
-                }
-                plan.graph
-                    .as_ref()
-                    .unwrap()
-                    .launch()
+        let result = (|| -> Result<Vec<f32>> {
+            let source = api::copy_host_vec_to_device(&Arc::new(tokens)).sync_on(&self.stream)?;
+            api::memcpy(&mut plan.tokens, &source).sync_on(&self.stream)?;
+            for (slot, session) in plan.positions.iter_mut().zip(&batch.sessions) {
+                let source = api::copy_host_vec_to_device(&Arc::new(vec![session.position as i32]))
                     .sync_on(&self.stream)?;
+                api::memcpy(slot, &source).sync_on(&self.stream)?;
             }
-        }
-        let canonical_logits = plan.logits(&self.stream)?;
+            match execution {
+                Execution::Eager => run(
+                    &self.model,
+                    plan,
+                    &mut batch.sessions,
+                    &Sink::Eager(&self.stream),
+                )?,
+                Execution::Graph => {
+                    if plan.graph.is_none() {
+                        let graph = CudaGraph::scope(&self.stream, |scope| {
+                            run(&self.model, plan, &mut batch.sessions, &Sink::Graph(scope))
+                                .map_err(|e| {
+                                    cuda_async::error::DeviceError::Internal(e.to_string())
+                                })
+                        })?;
+                        plan.graph = Some(graph);
+                    }
+                    plan.graph
+                        .as_ref()
+                        .unwrap()
+                        .launch()
+                        .sync_on(&self.stream)?;
+                }
+            }
+            #[cfg(test)]
+            if self.fail_after_gpu_work {
+                return Err("injected failure after GPU work".into());
+            }
+            plan.logits(&self.stream)
+        })();
+        let canonical_logits = match result {
+            Ok(logits) => logits,
+            Err(error) => {
+                for session in &mut batch.sessions {
+                    session.poisoned = true;
+                }
+                return Err(error);
+            }
+        };
         for session in batch.sessions {
             session.position += 1;
         }
+        let vocab = self.model.dims().vocab();
         let mut logits = vec![0.0f32; canonical_logits.len()];
         for (canonical, original) in batch.original_rows.into_iter().enumerate() {
-            logits[original * self.model.config.vocab..(original + 1) * self.model.config.vocab]
-                .copy_from_slice(
-                    &canonical_logits[canonical * self.model.config.vocab
-                        ..(canonical + 1) * self.model.config.vocab],
-                );
+            logits[original * vocab..(original + 1) * vocab]
+                .copy_from_slice(&canonical_logits[canonical * vocab..(canonical + 1) * vocab]);
         }
         Ok(logits)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ModelConfig, ModelDims};
+
+    #[test]
+    fn gpu_failure_poisons_batch_sessions() -> Result<()> {
+        let device = Device::new(0)?;
+        let stream = device.new_stream()?;
+        let dims = ModelDims::try_from(ModelConfig::default())?;
+        let model = Arc::new(Model::synthetic(dims, &stream)?);
+        let mut engine = Engine::new(model, &device)?;
+        let mut session = engine.new_session(SessionId(1))?;
+        engine.fail_after_gpu_work = true;
+        let batch = engine.batch([(&mut session, 1)])?;
+        assert!(engine.step_with(batch, Execution::Eager).is_err());
+        assert_eq!(session.position(), 0);
+        assert!(engine.batch([(&mut session, 1)]).is_err());
+        Ok(())
     }
 }

@@ -1,46 +1,56 @@
-use crate::Result;
+use crate::engine::EngineId;
+use crate::model::ModelId;
 use cutile::tensor::Tensor;
 use half::f16;
-use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-pub type SessionId = u64;
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionId(pub u64);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SessionInstance(u64);
 static NEXT_SESSION_INSTANCE: AtomicU64 = AtomicU64::new(1);
-pub(crate) fn next_session_instance() -> u64 {
-    NEXT_SESSION_INSTANCE.fetch_add(1, Ordering::Relaxed)
+pub(crate) fn next_session_instance() -> SessionInstance {
+    SessionInstance(NEXT_SESSION_INSTANCE.fetch_add(1, Ordering::Relaxed))
 }
 
 pub struct Session {
-    pub id: SessionId,
-    pub(crate) model: u64,
-    pub(crate) instance: u64,
-    pub position: usize,
+    pub(crate) id: SessionId,
+    pub(crate) model: ModelId,
+    pub(crate) instance: SessionInstance,
+    pub(crate) position: usize,
     pub(crate) state: Vec<LayerState>,
+    pub(crate) poisoned: bool,
 }
 
-pub enum LayerState {
+impl Session {
+    pub fn id(&self) -> SessionId {
+        self.id
+    }
+    pub fn position(&self) -> usize {
+        self.position
+    }
+}
+
+pub(crate) enum LayerState {
     Gdn { recurrent: Tensor<f32> },
     Attention { k: Tensor<f16>, v: Tensor<f16> },
 }
 
 pub struct Batch<'s> {
+    pub(crate) engine: EngineId,
     pub(crate) sessions: Vec<&'s mut Session>,
     pub(crate) tokens: Vec<u32>,
     pub(crate) original_rows: Vec<usize>,
 }
 
 impl<'s> Batch<'s> {
-    pub fn new(sessions: Vec<&'s mut Session>, tokens: Vec<u32>) -> Result<Self> {
-        if sessions.is_empty() || sessions.len() != tokens.len() || sessions.len() > 4 {
-            return Err("batch must have 1..=4 sessions and one token per session".into());
-        }
-        let ids: HashSet<_> = sessions.iter().map(|s| s.id).collect();
-        if ids.len() != sessions.len() {
-            return Err("duplicate session id".into());
-        }
-        let mut entries: Vec<_> = sessions
+    pub(crate) fn from_checked(
+        engine: EngineId,
+        entries: impl IntoIterator<Item = (&'s mut Session, u32)>,
+    ) -> Self {
+        let mut entries: Vec<_> = entries
             .into_iter()
-            .zip(tokens)
             .enumerate()
             .map(|(original, (session, token))| (session, token, original))
             .collect();
@@ -49,11 +59,12 @@ impl<'s> Batch<'s> {
             .into_iter()
             .map(|(session, token, original)| (session, (token, original)))
             .unzip();
-        let (tokens, original_rows): (Vec<_>, Vec<_>) = rest.into_iter().unzip();
-        Ok(Self {
+        let (tokens, original_rows) = rest.into_iter().unzip();
+        Self {
+            engine,
             sessions,
             tokens,
             original_rows,
-        })
+        }
     }
 }

@@ -1,0 +1,5 @@
+error[E0599]: no function or associated item named `new` found for struct `Batch<'s>` in the current scope
+ --> tests/ui/batch_new.rs:2:49
+  |
+2 | fn make(session: &mut Session) { let _ = Batch::new(vec![session], vec![1]); }
+  |                                                 ^^^ function or associated item not found in `Batch<'_>`

@@ -10,10 +10,10 @@ use half::f16;
 use std::sync::Arc;
 
 pub struct Q8Matrix {
-    pub qs: Arc<Tensor<i8>>,
-    pub scales: Arc<Tensor<f16>>,
+    qs: Arc<Tensor<i8>>,
+    scales: Arc<Tensor<f16>>,
     pub rows: usize,
-    pub cols: usize,
+    cols: usize,
 }
 
 impl HostQ8Matrix {

@@ -16,13 +16,43 @@ impl std::fmt::Display for FormatError {
 impl std::error::Error for FormatError {}
 
 pub struct HostQ8Matrix {
-    pub qs: Vec<i8>,
-    pub scales: Vec<f16>,
-    pub rows: usize,
-    pub cols: usize,
+    pub(crate) qs: Vec<i8>,
+    pub(crate) scales: Vec<f16>,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
 }
 
 impl HostQ8Matrix {
+    pub fn from_parts(
+        qs: Vec<i8>,
+        scales: Vec<f16>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<Self, FormatError> {
+        if rows == 0 || cols == 0 || cols % 32 != 0 {
+            return Err(FormatError::InvalidShape);
+        }
+        let elements = rows.checked_mul(cols).ok_or(FormatError::InvalidShape)?;
+        let blocks = elements / 32;
+        if qs.len() != elements {
+            return Err(FormatError::InvalidLength {
+                expected: elements,
+                actual: qs.len(),
+            });
+        }
+        if scales.len() != blocks {
+            return Err(FormatError::InvalidLength {
+                expected: blocks,
+                actual: scales.len(),
+            });
+        }
+        Ok(Self {
+            qs,
+            scales,
+            rows,
+            cols,
+        })
+    }
     pub fn from_gguf_q8_0(blocks: &[u8], rows: usize, cols: usize) -> Result<Self, FormatError> {
         if rows == 0 || cols == 0 || cols % 32 != 0 {
             return Err(FormatError::InvalidShape);
@@ -89,6 +119,24 @@ mod tests {
         assert_eq!(w.qs[0], -16);
         assert_eq!(w.qs[63], 15);
         assert_eq!(w.gemv_reference(&vec![1.0; 128]).unwrap(), vec![-4.0, -4.0]);
+    }
+
+    #[test]
+    fn rejects_bad_parts() {
+        assert!(matches!(
+            HostQ8Matrix::from_parts(vec![0; 31], vec![f16::from_f32(1.0)], 1, 32),
+            Err(FormatError::InvalidLength {
+                expected: 32,
+                actual: 31
+            })
+        ));
+        assert!(matches!(
+            HostQ8Matrix::from_parts(vec![0; 32], vec![], 1, 32),
+            Err(FormatError::InvalidLength {
+                expected: 1,
+                actual: 0
+            })
+        ));
     }
 
     #[test]

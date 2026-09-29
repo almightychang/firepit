@@ -1,5 +1,5 @@
 #[test]
-fn same_session_cannot_appear_twice() {
+fn public_invariants_cannot_be_bypassed() {
     let tests = trybuild::TestCases::new();
-    tests.compile_fail("tests/ui/duplicate_session.rs");
+    tests.compile_fail("tests/ui/*.rs");
 }
