@@ -8,3 +8,6 @@ cutile.workspace = true
 cuda-async.workspace = true
 cuda-core.workspace = true
 half.workspace = true
+
+[dev-dependencies]
+proptest = { version = "1", default-features = false, features = ["std"] }

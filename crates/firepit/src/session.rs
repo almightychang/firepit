@@ -67,3 +67,61 @@ impl<'s> Batch<'s> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Engine, Model, ModelConfig, ModelDims, Result};
+    use cuda_core::Device;
+    use std::sync::Arc;
+
+    fn permutations(items: &mut [usize], at: usize, visit: &mut impl FnMut(&[usize])) {
+        if at == items.len() {
+            visit(items);
+            return;
+        }
+        for next in at..items.len() {
+            items.swap(at, next);
+            permutations(items, at + 1, visit);
+            items.swap(at, next);
+        }
+    }
+
+    #[test]
+    fn batch_order_restores_every_permutation_up_to_four_sessions() -> Result<()> {
+        let device = Device::new(0)?;
+        let stream = device.new_stream()?;
+        let dims = ModelDims::try_from(ModelConfig::default())?;
+        let model = Arc::new(Model::synthetic(dims, &stream)?);
+        let engine = Engine::new(model, &device)?;
+        let ids = [SessionId(9), SessionId(2), SessionId(7), SessionId(4)];
+        let mut sessions = ids
+            .iter()
+            .map(|&id| engine.new_session(id))
+            .collect::<Result<Vec<_>>>()?;
+
+        for size in 1..=4 {
+            let mut order: Vec<usize> = (0..size).collect();
+            permutations(&mut order, 0, &mut |order| {
+                let mut entries: Vec<_> = sessions[..size].iter_mut().enumerate().collect();
+                entries.sort_by_key(|(index, _)| order.iter().position(|item| item == index));
+                let batch = engine
+                    .batch(
+                        entries
+                            .into_iter()
+                            .map(|(index, session)| (session, 10 + index as u32)),
+                    )
+                    .unwrap();
+
+                let mut expected: Vec<_> = order.iter().copied().enumerate().collect();
+                expected.sort_by_key(|&(_, index)| ids[index]);
+                for (canonical, (original, index)) in expected.into_iter().enumerate() {
+                    assert_eq!(batch.sessions[canonical].id(), ids[index]);
+                    assert_eq!(batch.tokens[canonical], 10 + index as u32);
+                    assert_eq!(batch.original_rows[canonical], original);
+                }
+            });
+        }
+        Ok(())
+    }
+}
