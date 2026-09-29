@@ -1,3 +1,9 @@
+pub const MIN_ROW_TILE: usize = 4;
+
+pub fn splits_into_row_tiles(v: usize) -> bool {
+    v.is_power_of_two() && v >= MIN_ROW_TILE
+}
+
 /// Largest power-of-two row tile that exposes enough independent blocks.
 pub fn row_tile(
     v: usize,

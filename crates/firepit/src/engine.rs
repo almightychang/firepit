@@ -10,7 +10,7 @@ use cutile::tensor::{IntoPartition, PartitionMut, Tensor};
 use cutile::tile_kernel::{CompileOptions, TileKernel};
 use firepit_kernels::hybrid;
 use firepit_kernels::q8::{DEFAULT_GEMV_TILE, q8_gemv};
-use firepit_kernels::tile::row_tile;
+use firepit_kernels::tile::{MIN_ROW_TILE, row_tile};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -144,7 +144,7 @@ fn run(
                     let row_input = input_tensor.slice(&[b..b + 1, 0..h])?;
                     let row_output = out.slice_mut(&[b * heads..(b + 1) * heads, 0..d])?;
                     match (&mut session.state[layer], kind) {
-                        (LayerState::Gdn { recurrent, .. }, SessionKind::Gdn) => {
+                        (LayerState::Gdn { recurrent }, SessionKind::Gdn) => {
                             let r = plan.grid.row;
                             submit(
                                 sink,
@@ -229,7 +229,7 @@ impl Engine {
             model.config.heads,
             sm,
             TARGET_BLOCKS_PER_SM as usize,
-            4,
+            MIN_ROW_TILE,
         );
         Ok(Self {
             model,
@@ -248,6 +248,9 @@ impl Engine {
         self.step_with(batch, Execution::Graph)
     }
     pub fn step_with(&mut self, mut batch: Batch<'_>, execution: Execution) -> Result<Vec<f32>> {
+        if batch.sessions.iter().any(|s| s.model != self.model.id) {
+            return Err("session belongs to another model".into());
+        }
         if batch
             .sessions
             .iter()

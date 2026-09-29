@@ -3,9 +3,11 @@ use crate::{Result, Session, SessionId};
 use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::Tensor;
-use firepit_kernels::q8::{HostQ8Matrix, Q8Matrix};
+use firepit_kernels::q8::{DEFAULT_GEMV_TILE, HostQ8Matrix, Q8Matrix};
+use firepit_kernels::tile::splits_into_row_tiles;
 use half::f16;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type Stream = Arc<cuda_core::Stream>;
 
@@ -33,7 +35,22 @@ impl Default for ModelConfig {
     }
 }
 
+impl ModelConfig {
+    fn fits_kernels(&self) -> bool {
+        self.heads > 0
+            && self.vocab > 0
+            && self.max_seq > 0
+            && self.heads * self.head_dim == self.hidden
+            && splits_into_row_tiles(self.head_dim)
+            && DEFAULT_GEMV_TILE.fits(self.hidden, self.hidden)
+            && DEFAULT_GEMV_TILE.fits(self.vocab, self.hidden)
+    }
+}
+
+static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct Model {
+    pub(crate) id: u64,
     pub config: ModelConfig,
     pub(crate) embedding: Tensor<f32>,
     pub(crate) weights: Vec<Q8Matrix>,
@@ -41,13 +58,8 @@ pub struct Model {
 
 impl Model {
     pub fn synthetic(config: ModelConfig, stream: &Stream) -> Result<Self> {
-        if config.hidden == 0
-            || config.heads.checked_mul(config.head_dim) != Some(config.hidden)
-            || config.hidden % 32 != 0
-            || config.vocab == 0
-            || config.max_seq == 0
-        {
-            return Err("invalid model dimensions".into());
+        if !config.fits_kernels() {
+            return Err("model dimensions do not fit the kernels".into());
         }
         let h = config.hidden;
         let table: Vec<f32> = (0..config.vocab * h)
@@ -63,6 +75,7 @@ impl Model {
             .map(|(n, rows)| synthetic_q8(rows, h, n).upload(stream))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(Self {
+            id: NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed),
             config,
             embedding,
             weights,
@@ -76,7 +89,6 @@ impl Model {
             state.push(LayerState::Gdn {
                 recurrent: api::zeros::<f32>(&[config.heads, config.head_dim, config.head_dim])
                     .sync_on(stream)?,
-                conv: api::zeros::<f32>(&[config.heads, config.head_dim]).sync_on(stream)?,
             });
         }
         for _ in 0..self.config.attention_layers {
@@ -89,6 +101,7 @@ impl Model {
         }
         Ok(Session {
             id,
+            model: self.id,
             instance: next_session_instance(),
             position: 0,
             state,

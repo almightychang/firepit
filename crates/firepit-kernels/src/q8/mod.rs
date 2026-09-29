@@ -47,6 +47,12 @@ pub const DEFAULT_GEMV_TILE: GemvTile = GemvTile {
     blocks: 4,
 };
 
+impl GemvTile {
+    pub fn fits(self, rows: usize, cols: usize) -> bool {
+        rows % self.rows == 0 && cols % 32 == 0 && (cols / 32) % self.blocks == 0
+    }
+}
+
 pub fn q8_gemv<'a>(
     w: &Q8Matrix,
     x: &'a TensorView<'a, f32>,
@@ -65,8 +71,7 @@ pub fn q8_gemv<'a>(
     let batch = x.shape()[0] as usize;
     assert!(batch > 0 && tile.rows > 0 && tile.blocks > 0);
     assert_eq!(x.shape(), &[batch as i32, (w.cols / 32) as i32, 32]);
-    assert_eq!((w.cols / 32) % tile.blocks, 0);
-    assert_eq!(w.rows % tile.rows, 0);
+    assert!(tile.fits(w.rows, w.cols));
     kernel::q8_gemv_kernel(y, w.qs.clone(), w.scales.clone(), x, (w.cols / 32) as i32).generics(
         vec![
             batch.to_string(),

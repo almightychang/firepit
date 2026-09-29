@@ -170,3 +170,41 @@ fn graph_handles_reordered_batch_and_replaced_session() -> TestResult {
     assert!(error <= 1e-4);
     Ok(())
 }
+
+#[test]
+fn rejects_dimensions_the_kernels_cannot_run() -> TestResult {
+    let stream = Device::new(0)?.new_stream()?;
+    for config in [
+        ModelConfig {
+            vocab: 33,
+            ..ModelConfig::default()
+        },
+        ModelConfig {
+            hidden: 64,
+            heads: 2,
+            ..ModelConfig::default()
+        },
+        ModelConfig {
+            head_dim: 24,
+            hidden: 192,
+            ..ModelConfig::default()
+        },
+    ] {
+        assert!(Model::synthetic(config, &stream).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn rejects_session_from_another_model() -> TestResult {
+    let (model, device) = setup()?;
+    let other = Model::synthetic(ModelConfig::default(), &device.new_stream()?)?;
+    let mut engine = Engine::new(model, &device)?;
+    let mut stranger = other.new_session(1, engine.stream())?;
+    assert!(
+        engine
+            .step(Batch::new(vec![&mut stranger], vec![0])?)
+            .is_err()
+    );
+    Ok(())
+}

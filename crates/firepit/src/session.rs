@@ -12,20 +12,15 @@ pub(crate) fn next_session_instance() -> u64 {
 
 pub struct Session {
     pub id: SessionId,
+    pub(crate) model: u64,
     pub(crate) instance: u64,
     pub position: usize,
     pub(crate) state: Vec<LayerState>,
 }
 
 pub enum LayerState {
-    Gdn {
-        recurrent: Tensor<f32>,
-        conv: Tensor<f32>,
-    },
-    Attention {
-        k: Tensor<f16>,
-        v: Tensor<f16>,
-    },
+    Gdn { recurrent: Tensor<f32> },
+    Attention { k: Tensor<f16>, v: Tensor<f16> },
 }
 
 pub struct Batch<'s> {
