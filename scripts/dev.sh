@@ -5,7 +5,8 @@ case "${1:-}" in
   check) shift; args=(check "$@") ;;
   test) shift; args=(test "$@") ;;
   bench) shift; args=(bench --bench q8_gemv "$@") ;;
-  *) echo 'usage: scripts/dev.sh {check|test|bench} [cargo args...]' >&2; exit 2 ;;
+  session-bench) shift; args=(bench --bench session_ops "$@") ;;
+  *) echo 'usage: scripts/dev.sh {check|test|bench|session-bench} [cargo args...]' >&2; exit 2 ;;
 esac
 library_path=/usr/local/cuda/lib64
 [[ ${FIREPIT_CUDA_COMPAT:-0} == 1 ]] && library_path=/usr/local/cuda/compat:$library_path

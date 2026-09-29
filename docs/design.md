@@ -54,6 +54,8 @@ Grout의 `StepGraph`는 fork하지 않고 참고한다. Grout decode는 `StepGra
 
 세션 수가 적다는 점을 생각하면 C가 가장 단순할 수 있다. 셋 다 프로토타입으로 재 보고 정한다. 어느 쪽이든 막힌 지점은 cuTile 공백 보고의 재료다.
 
+**2026-09-29 결정:** A/B/C 대신 D(세션이 state를 소유하고 세션 op을 세션마다 launch)를 채택했다. tile 규칙을 지키면 쌓기 방식보다 5~10% 느릴 뿐이고 unsafe와 cutile-rs 변경이 필요 없다. [engine.md](engine.md) 2~3절, [측정](research/measurements/session-ops-5080.md).
+
 ## 5. 커널
 
 ### 1단계: Qwen3.6-35B-A3B
@@ -103,7 +105,7 @@ HC mixer(F16), QSA(indexer와 block-sparse attention), n-gram PLE(SSD에서 행 
 
 ## 9. 열린 질문
 
-1. 세션 state 간접 매핑은 A, B, C 중 무엇으로 할까 (4절)
+1. ~~세션 state 간접 매핑은 A, B, C 중 무엇으로 할까~~ D로 결정 ([engine.md](engine.md))
 2. dense 가중치 양자화 포맷 (5절)
 3. ~~Grout `StepGraph`가 hybrid 모델과 batch를 담을 수 있는가~~ 답: 담을 수 없다. 참고만 한다
 4. cuTile로 짠 양자화 GEMV가 GB10 floor의 몇 %까지 가는가. RTX 5080에서는 safe v1이 B = 1에서 candle과 동급(peak 89%)이다([측정](research/measurements/q8-gemv-5080.md)). GB10은 미측정

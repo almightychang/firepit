@@ -12,3 +12,7 @@ half.workspace = true
 [[bench]]
 name = "q8_gemv"
 harness = false
+
+[[bench]]
+name = "session_ops"
+harness = false
