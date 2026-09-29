@@ -11,6 +11,7 @@ fn median(mut times: Vec<f64>) -> f64 {
 #[test]
 #[ignore = "GPU timing run"]
 fn step_times() -> Result<(), Box<dyn std::error::Error>> {
+    assert!(!cfg!(debug_assertions), "timing needs --release");
     let device = Device::new(0)?;
     let stream = device.new_stream()?;
     let model = Arc::new(Model::synthetic(ModelConfig::default(), &stream)?);
