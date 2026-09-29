@@ -1,10 +1,20 @@
 [workspace]
 members = ["crates/firepit-kernels"]
 resolver = "2"
-exclude = ["tools/candle-q8bench"]
+exclude = ["tools/candle-q8bench", "vendor/cutile-rs"]
 
 [workspace.dependencies]
 cutile = "=0.4.0"
 cuda-async = "=0.4.0"
 cuda-core = "=0.4.0"
 half = "2"
+
+[patch.crates-io]
+cuda-bindings = { path = "vendor/cutile-rs/cuda-bindings" }
+cuda-core = { path = "vendor/cutile-rs/cuda-core" }
+cuda-core-derive = { path = "vendor/cutile-rs/cuda-core-derive" }
+cuda-async = { path = "vendor/cutile-rs/cuda-async" }
+cutile-ir = { path = "vendor/cutile-rs/cutile-ir" }
+cutile-compiler = { path = "vendor/cutile-rs/cutile-compiler" }
+cutile-macro = { path = "vendor/cutile-rs/cutile-macro" }
+cutile = { path = "vendor/cutile-rs/cutile" }
