@@ -206,6 +206,13 @@ fn batch_rejects_invalid_inputs_and_cross_engine_use() -> TestResult {
             .is_err()
     );
     assert!(engine.batch([(&mut a, VOCAB as u32)]).is_err());
+    let mut c = engine.new_session(SessionId(2))?;
+    let mut d = engine.new_session(SessionId(3))?;
+    assert!(
+        engine
+            .batch([(&mut a, 0), (&mut c, 0), (&mut d, 0)])
+            .is_err()
+    );
     let batch = engine.batch([(&mut a, 0)])?;
     assert!(other.step(batch).is_err());
     let short_dims = ModelDims::try_from(ModelConfig {

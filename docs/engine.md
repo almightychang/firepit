@@ -95,7 +95,7 @@ pub struct Batch<'s> {                    // 한 step 동안만 산다
 
 pub struct Engine {
     model: Arc<Model>,
-    plans: PlanCache,                     // (phase, 세션 id 집합) → StepPlan (+ CUDA Graph)
+    plans: HashMap<usize, CachedPlan>,    // 배치 크기별 한 세션 인스턴스 조합
 }
 
 impl Engine {
@@ -105,6 +105,7 @@ impl Engine {
 
 - `Batch`가 `&mut Session`을 들고 있으니 같은 세션을 두 번 넣거나 step 중에 다른 곳에서 세션을 만지는 코드는 컴파일되지 않는다.
 - `Session`은 `Model`을 참조하지 않는다. state 모양은 `Model::new_session()`이 config로 만든다.
+- 현재 Q8 커널이 처리하는 배치 크기는 1, 2, 4다. `Engine::batch`가 그 밖의 크기를 거부한다. 캐시는 크기별 한 조합만 보관하고, 조합이 바뀌면 graph를 다시 캡처한다. `Engine::close_session`은 종료한 세션이 들어 있는 항목을 제거한다.
 
 ## 6. step plan: 연산 목록 하나
 

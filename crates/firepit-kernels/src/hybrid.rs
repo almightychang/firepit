@@ -19,6 +19,7 @@ mod kernels {
     pub fn rms_norm<const H: i32>(
         out: &mut Tensor<f32, { [1, H] }>,
         input: &Tensor<f32, { [-1, H] }>,
+        weight: &Tensor<f32, { [H] }>,
         inv_h: f32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
@@ -29,7 +30,9 @@ mod kernels {
             squares * inv_h.broadcast(shape![1, 1]) + constant(1e-5f32, shape![1, 1]),
             ftz::Disabled,
         );
-        out.store(x * scale.broadcast(shape![1, H]));
+        let gamma: Tile<f32, { [H] }> = weight.partition(shape![H]).load([0]);
+        let gamma: Tile<f32, { [1, H] }> = gamma.reshape(shape![1, H]);
+        out.store(x * scale.broadcast(shape![1, H]) * gamma);
     }
 
     #[cutile::entry()]

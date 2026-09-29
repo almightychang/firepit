@@ -1,5 +1,16 @@
 use half::f16;
 
+pub const Q8_BLOCK: usize = 32;
+const GGUF_Q8_0_BLOCK_BYTES: usize = std::mem::size_of::<u16>() + Q8_BLOCK;
+
+fn shape(rows: usize, cols: usize) -> Result<(usize, usize), FormatError> {
+    if rows == 0 || cols == 0 || cols % Q8_BLOCK != 0 {
+        return Err(FormatError::InvalidShape);
+    }
+    let elements = rows.checked_mul(cols).ok_or(FormatError::InvalidShape)?;
+    Ok((elements, elements / Q8_BLOCK))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatError {
     InvalidShape,
@@ -29,11 +40,7 @@ impl HostQ8Matrix {
         rows: usize,
         cols: usize,
     ) -> Result<Self, FormatError> {
-        if rows == 0 || cols == 0 || cols % 32 != 0 {
-            return Err(FormatError::InvalidShape);
-        }
-        let elements = rows.checked_mul(cols).ok_or(FormatError::InvalidShape)?;
-        let blocks = elements / 32;
+        let (elements, blocks) = shape(rows, cols)?;
         if qs.len() != elements {
             return Err(FormatError::InvalidLength {
                 expected: elements,
@@ -54,31 +61,23 @@ impl HostQ8Matrix {
         })
     }
     pub fn from_gguf_q8_0(blocks: &[u8], rows: usize, cols: usize) -> Result<Self, FormatError> {
-        if rows == 0 || cols == 0 || cols % 32 != 0 {
-            return Err(FormatError::InvalidShape);
-        }
-        let count = rows
-            .checked_mul(cols / 32)
+        let (elements, count) = shape(rows, cols)?;
+        let expected = count
+            .checked_mul(GGUF_Q8_0_BLOCK_BYTES)
             .ok_or(FormatError::InvalidShape)?;
-        let expected = count.checked_mul(34).ok_or(FormatError::InvalidShape)?;
         if blocks.len() != expected {
             return Err(FormatError::InvalidLength {
                 expected,
                 actual: blocks.len(),
             });
         }
-        let mut qs = Vec::with_capacity(rows * cols);
+        let mut qs = Vec::with_capacity(elements);
         let mut scales = Vec::with_capacity(count);
-        for block in blocks.chunks_exact(34) {
+        for block in blocks.chunks_exact(GGUF_Q8_0_BLOCK_BYTES) {
             scales.push(f16::from_bits(u16::from_le_bytes([block[0], block[1]])));
-            qs.extend(block[2..].iter().map(|&q| q as i8));
+            qs.extend(block[std::mem::size_of::<u16>()..].iter().map(|&q| q as i8));
         }
-        Ok(Self {
-            qs,
-            scales,
-            rows,
-            cols,
-        })
+        Self::from_parts(qs, scales, rows, cols)
     }
 
     pub fn gemv_reference(&self, x: &[f32]) -> Result<Vec<f64>, FormatError> {
@@ -94,7 +93,8 @@ impl HostQ8Matrix {
             for n in 0..self.rows {
                 let mut sum = 0.0f64;
                 for k in 0..self.cols {
-                    let scale = self.scales[n * (self.cols / 32) + k / 32].to_f32() as f64;
+                    let scale =
+                        self.scales[n * (self.cols / Q8_BLOCK) + k / Q8_BLOCK].to_f32() as f64;
                     sum += self.qs[n * self.cols + k] as f64 * scale * x[b * self.cols + k] as f64;
                 }
                 y[b * self.rows + n] = sum;

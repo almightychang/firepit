@@ -1,16 +1,10 @@
-use crate::model::Stream;
+use crate::model::{NormRef, Stream, WeightRef};
 use crate::{Model, Result};
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::DeviceOp;
 use cutile::api;
 use cutile::tensor::Tensor;
 use cutile::tile_kernel::ToHostVecOp;
-
-#[derive(Clone, Copy)]
-pub(crate) enum SessionKind {
-    Gdn,
-    Attention,
-}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Parity {
@@ -64,6 +58,7 @@ pub(crate) enum Op {
         out: Slot,
     },
     RmsNorm {
+        norm: NormRef,
         input: Slot,
         out: Slot,
     },
@@ -73,13 +68,12 @@ pub(crate) enum Op {
         out: Slot,
     },
     Gemv {
-        weight: usize,
+        weight: WeightRef,
         input: Slot,
         out: Slot,
     },
     Session {
         layer: usize,
-        kind: SessionKind,
         input: Slot,
         out: Slot,
     },
@@ -114,7 +108,6 @@ pub(crate) struct StepPlan {
     pub(crate) positions: Vec<Tensor<i32>>,
     pub(crate) graph: Option<CudaGraph<()>>,
     pub(crate) grid: SessionGrid,
-    pub(crate) instances: Vec<crate::session::SessionInstance>,
 }
 
 impl StepPlan {
@@ -130,29 +123,24 @@ impl StepPlan {
             out: Slot::Residual(Parity::Even),
         }];
         let mut main = Parity::Even;
-        for layer in 0..(c.gdn_layers() + c.attention_layers()) {
+        for (layer, _) in c.layers().iter().enumerate() {
             ops.push(Op::RmsNorm {
+                norm: NormRef::Layer(layer),
                 input: Slot::Residual(main),
                 out: Slot::Normed,
             });
             ops.push(Op::Gemv {
-                weight: layer * 2,
+                weight: WeightRef::LayerInput(layer),
                 input: Slot::Normed,
                 out: Slot::Projected,
             });
-            let kind = if layer < c.gdn_layers() {
-                SessionKind::Gdn
-            } else {
-                SessionKind::Attention
-            };
             ops.push(Op::Session {
                 layer,
-                kind,
                 input: Slot::Projected,
                 out: Slot::SessionOut,
             });
             ops.push(Op::Gemv {
-                weight: layer * 2 + 1,
+                weight: WeightRef::LayerOutput(layer),
                 input: Slot::SessionOut,
                 out: Slot::Projected,
             });
@@ -164,11 +152,12 @@ impl StepPlan {
             main = main.flip();
         }
         ops.push(Op::RmsNorm {
+            norm: NormRef::Final,
             input: Slot::Residual(main),
             out: Slot::Normed,
         });
         ops.push(Op::Gemv {
-            weight: model.weights.len() - 1,
+            weight: WeightRef::OutputHead,
             input: Slot::Normed,
             out: Slot::Logits,
         });
@@ -187,7 +176,6 @@ impl StepPlan {
             positions,
             graph: None,
             grid,
-            instances: Vec::new(),
         })
     }
 

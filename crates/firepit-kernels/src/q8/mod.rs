@@ -5,7 +5,7 @@ use cuda_async::device_operation::{DeviceOp, GraphNode};
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{Partition, Tensor, TensorView};
 use cutile::tile_kernel::TileKernel;
-pub use format::{FormatError, HostQ8Matrix};
+pub use format::{FormatError, HostQ8Matrix, Q8_BLOCK};
 use half::f16;
 use std::sync::Arc;
 
@@ -22,10 +22,10 @@ impl HostQ8Matrix {
         stream: &Arc<cuda_core::Stream>,
     ) -> Result<Q8Matrix, cutile::error::Error> {
         let qs = api::copy_host_vec_to_device(&Arc::new(self.qs.clone()))
-            .reshape(&[self.rows, self.cols / 32, 32])
+            .reshape(&[self.rows, self.cols / Q8_BLOCK, Q8_BLOCK])
             .sync_on(stream)?;
         let scales = api::copy_host_vec_to_device(&Arc::new(self.scales.clone()))
-            .reshape(&[self.rows, self.cols / 32])
+            .reshape(&[self.rows, self.cols / Q8_BLOCK])
             .sync_on(stream)?;
         Ok(Q8Matrix {
             qs: Arc::new(qs),
@@ -49,7 +49,7 @@ pub const DEFAULT_GEMV_TILE: GemvTile = GemvTile {
 
 impl GemvTile {
     pub fn fits(self, rows: usize, cols: usize) -> bool {
-        rows % self.rows == 0 && cols % 32 == 0 && (cols / 32) % self.blocks == 0
+        rows % self.rows == 0 && cols % Q8_BLOCK == 0 && (cols / Q8_BLOCK) % self.blocks == 0
     }
 }
 
@@ -70,13 +70,21 @@ pub fn q8_gemv<'a>(
 + 'a {
     let batch = x.shape()[0] as usize;
     assert!(batch > 0 && tile.rows > 0 && tile.blocks > 0);
-    assert_eq!(x.shape(), &[batch as i32, (w.cols / 32) as i32, 32]);
+    assert_eq!(
+        x.shape(),
+        &[batch as i32, (w.cols / Q8_BLOCK) as i32, Q8_BLOCK as i32]
+    );
     assert!(tile.fits(w.rows, w.cols));
-    kernel::q8_gemv_kernel(y, w.qs.clone(), w.scales.clone(), x, (w.cols / 32) as i32).generics(
-        vec![
-            batch.to_string(),
-            tile.rows.to_string(),
-            tile.blocks.to_string(),
-        ],
+    kernel::q8_gemv_kernel(
+        y,
+        w.qs.clone(),
+        w.scales.clone(),
+        x,
+        (w.cols / Q8_BLOCK) as i32,
     )
+    .generics(vec![
+        batch.to_string(),
+        tile.rows.to_string(),
+        tile.blocks.to_string(),
+    ])
 }

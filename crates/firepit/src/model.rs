@@ -1,13 +1,13 @@
+use crate::engine::EngineId;
 use crate::session::{LayerState, next_session_instance};
 use crate::{Result, Session, SessionId};
 use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::Tensor;
-use firepit_kernels::q8::{DEFAULT_GEMV_TILE, HostQ8Matrix, Q8Matrix};
+use firepit_kernels::q8::{DEFAULT_GEMV_TILE, HostQ8Matrix, Q8_BLOCK, Q8Matrix};
 use firepit_kernels::tile::splits_into_row_tiles;
 use half::f16;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub type Stream = Arc<cuda_core::Stream>;
 
@@ -36,9 +36,14 @@ impl Default for ModelConfig {
 }
 
 #[derive(Clone, Copy)]
+pub(crate) enum LayerDef {
+    Gdn,
+    Attention,
+}
+
+#[derive(Clone)]
 pub struct ModelDims {
-    gdn_layers: usize,
-    attention_layers: usize,
+    layers: Vec<LayerDef>,
     hidden: usize,
     heads: usize,
     head_dim: usize,
@@ -48,10 +53,16 @@ pub struct ModelDims {
 
 impl ModelDims {
     pub fn gdn_layers(&self) -> usize {
-        self.gdn_layers
+        self.layers
+            .iter()
+            .filter(|l| matches!(l, LayerDef::Gdn))
+            .count()
     }
     pub fn attention_layers(&self) -> usize {
-        self.attention_layers
+        self.layers
+            .iter()
+            .filter(|l| matches!(l, LayerDef::Attention))
+            .count()
     }
     pub fn hidden(&self) -> usize {
         self.hidden
@@ -67,6 +78,9 @@ impl ModelDims {
     }
     pub fn max_seq(&self) -> usize {
         self.max_seq
+    }
+    pub(crate) fn layers(&self) -> &[LayerDef] {
+        &self.layers
     }
 }
 
@@ -101,8 +115,12 @@ impl TryFrom<ModelConfig> for ModelDims {
             return Err(DimensionError);
         }
         Ok(Self {
-            gdn_layers: config.gdn_layers,
-            attention_layers: config.attention_layers,
+            layers: std::iter::repeat_n(LayerDef::Gdn, config.gdn_layers)
+                .chain(std::iter::repeat_n(
+                    LayerDef::Attention,
+                    config.attention_layers,
+                ))
+                .collect(),
             hidden: config.hidden,
             heads: config.heads,
             head_dim: config.head_dim,
@@ -112,21 +130,50 @@ impl TryFrom<ModelConfig> for ModelDims {
     }
 }
 
-static NEXT_MODEL_ID: AtomicU64 = AtomicU64::new(1);
+pub(crate) struct LayerWeights {
+    pub input: Q8Matrix,
+    pub output: Q8Matrix,
+}
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ModelId(u64);
+pub(crate) struct ModelWeights {
+    pub layers: Vec<LayerWeights>,
+    pub output_head: Q8Matrix,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WeightRef {
+    LayerInput(usize),
+    LayerOutput(usize),
+    OutputHead,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum NormRef {
+    Layer(usize),
+    Final,
+}
+
+impl ModelWeights {
+    pub(crate) fn get(&self, weight: WeightRef) -> &Q8Matrix {
+        match weight {
+            WeightRef::LayerInput(layer) => &self.layers[layer].input,
+            WeightRef::LayerOutput(layer) => &self.layers[layer].output,
+            WeightRef::OutputHead => &self.output_head,
+        }
+    }
+}
 
 pub struct Model {
-    pub(crate) id: ModelId,
     dims: ModelDims,
     pub(crate) embedding: Tensor<f32>,
-    pub(crate) weights: Vec<Q8Matrix>,
+    pub(crate) weights: ModelWeights,
+    layer_norms: Vec<Tensor<f32>>,
+    final_norm: Tensor<f32>,
 }
 
 impl Model {
     pub fn synthetic(dims: ModelDims, stream: &Stream) -> Result<Self> {
-        let config = dims;
+        let config = &dims;
         let h = config.hidden;
         let table: Vec<f32> = (0..config.vocab * h)
             .map(|i| ((i * 19 % 67) as f32 - 33.0) / 256.0)
@@ -134,17 +181,30 @@ impl Model {
         let embedding = api::copy_host_vec_to_device(&Arc::new(table))
             .reshape(&[config.vocab, h])
             .sync_on(stream)?;
-        let layer_rows = std::iter::repeat_n(h, (config.gdn_layers + config.attention_layers) * 2);
-        let weights = layer_rows
-            .chain([config.vocab])
-            .enumerate()
-            .map(|(n, rows)| synthetic_q8(rows, h, n).upload(stream))
+        let mut seed = 0;
+        let mut layers = Vec::with_capacity(config.layers.len());
+        for _ in config.layers() {
+            let input = synthetic_q8(h, h, seed).upload(stream)?;
+            seed += 1;
+            let output = synthetic_q8(h, h, seed).upload(stream)?;
+            seed += 1;
+            layers.push(LayerWeights { input, output });
+        }
+        let output_head = synthetic_q8(config.vocab, h, seed).upload(stream)?;
+        let unit_norm = Arc::new(vec![1.0f32; h]);
+        let layer_norms = (0..config.layers.len())
+            .map(|_| api::copy_host_vec_to_device(&unit_norm).sync_on(stream))
             .collect::<std::result::Result<Vec<_>, _>>()?;
+        let final_norm = api::copy_host_vec_to_device(&unit_norm).sync_on(stream)?;
         Ok(Self {
-            id: ModelId(NEXT_MODEL_ID.fetch_add(1, Ordering::Relaxed)),
             dims,
             embedding,
-            weights,
+            weights: ModelWeights {
+                layers,
+                output_head,
+            },
+            layer_norms,
+            final_norm,
         })
     }
 
@@ -152,26 +212,38 @@ impl Model {
         &self.dims
     }
 
-    pub(crate) fn new_session(&self, id: SessionId, stream: &Stream) -> Result<Session> {
+    pub(crate) fn norm(&self, norm: NormRef) -> &Tensor<f32> {
+        match norm {
+            NormRef::Layer(layer) => &self.layer_norms[layer],
+            NormRef::Final => &self.final_norm,
+        }
+    }
+
+    pub(crate) fn new_session(
+        &self,
+        id: SessionId,
+        engine: EngineId,
+        stream: &Stream,
+    ) -> Result<Session> {
         let config = &self.dims;
         let mut state = Vec::new();
-        for _ in 0..self.dims.gdn_layers {
-            state.push(LayerState::Gdn {
-                recurrent: api::zeros::<f32>(&[config.heads, config.head_dim, config.head_dim])
-                    .sync_on(stream)?,
-            });
-        }
-        for _ in 0..self.dims.attention_layers {
-            state.push(LayerState::Attention {
-                k: api::zeros::<f16>(&[config.max_seq, config.heads, config.head_dim])
-                    .sync_on(stream)?,
-                v: api::zeros::<f16>(&[config.max_seq, config.heads, config.head_dim])
-                    .sync_on(stream)?,
+        for layer in config.layers() {
+            state.push(match layer {
+                LayerDef::Gdn => LayerState::Gdn {
+                    recurrent: api::zeros::<f32>(&[config.heads, config.head_dim, config.head_dim])
+                        .sync_on(stream)?,
+                },
+                LayerDef::Attention => LayerState::Attention {
+                    k: api::zeros::<f16>(&[config.max_seq, config.heads, config.head_dim])
+                        .sync_on(stream)?,
+                    v: api::zeros::<f16>(&[config.max_seq, config.heads, config.head_dim])
+                        .sync_on(stream)?,
+                },
             });
         }
         Ok(Session {
             id,
-            model: self.id,
+            engine,
             instance: next_session_instance(),
             position: 0,
             state,
@@ -185,7 +257,7 @@ fn synthetic_q8(rows: usize, cols: usize, seed: usize) -> HostQ8Matrix {
         (0..rows * cols)
             .map(|i| ((i * 13 + seed * 7) % 17) as i8 - 8)
             .collect(),
-        vec![f16::from_f32(1.0 / 256.0); rows * cols / 32],
+        vec![f16::from_f32(1.0 / 256.0); rows * cols / Q8_BLOCK],
         rows,
         cols,
     )

@@ -1,5 +1,4 @@
 use crate::engine::EngineId;
-use crate::model::ModelId;
 use cutile::tensor::Tensor;
 use half::f16;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,7 +15,7 @@ pub(crate) fn next_session_instance() -> SessionInstance {
 
 pub struct Session {
     pub(crate) id: SessionId,
-    pub(crate) model: ModelId,
+    pub(crate) engine: EngineId,
     pub(crate) instance: SessionInstance,
     pub(crate) position: usize,
     pub(crate) state: Vec<LayerState>,

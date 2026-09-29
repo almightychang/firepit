@@ -1,3 +1,6 @@
+// cuTile shape syntax requires literals here; keep them tied to the host format.
+const _: [(); super::format::Q8_BLOCK] = [(); 32];
+
 #[cutile::module]
 mod kernels {
     use cutile::core::*;

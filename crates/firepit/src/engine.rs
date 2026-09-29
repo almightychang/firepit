@@ -1,5 +1,5 @@
 use crate::model::Stream;
-use crate::plan::{Op, SessionKind, Slot, StepPlan};
+use crate::plan::{Op, Slot, StepPlan};
 use crate::session::LayerState;
 use crate::{Batch, Model, Result, Session, SessionId};
 use cuda_async::cuda_graph::{CudaGraph, Scope};
@@ -9,7 +9,7 @@ use cutile::api;
 use cutile::tensor::{IntoPartition, PartitionMut, Tensor};
 use cutile::tile_kernel::{CompileOptions, TileKernel};
 use firepit_kernels::hybrid;
-use firepit_kernels::q8::{DEFAULT_GEMV_TILE, q8_gemv};
+use firepit_kernels::q8::{DEFAULT_GEMV_TILE, Q8_BLOCK, q8_gemv};
 use firepit_kernels::tile::{MIN_ROW_TILE, row_tile};
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -102,12 +102,21 @@ fn run(
                     .generics(vec![h.to_string()]),
                 )?;
             }
-            Op::RmsNorm { input, out: output } => {
+            Op::RmsNorm {
+                norm,
+                input,
+                out: output,
+            } => {
                 let (activation, out) = input_output(&mut plan.buffers, input, output);
                 submit(
                     sink,
-                    hybrid::rms_norm(out.partition([1, h]), activation, 1.0 / h as f32)
-                        .generics(vec![h.to_string()]),
+                    hybrid::rms_norm(
+                        out.partition([1, h]),
+                        activation,
+                        model.norm(norm),
+                        1.0 / h as f32,
+                    )
+                    .generics(vec![h.to_string()]),
                 )?;
             }
             Op::Add {
@@ -130,8 +139,8 @@ fn run(
             } => {
                 let (input_tensor, out) = input_output(&mut plan.buffers, input, output);
                 let activation = input_tensor.view(&[batch, h])?;
-                let x = activation.view(&[batch, h / 32, 32])?;
-                let w = &model.weights[weight];
+                let x = activation.view(&[batch, h / Q8_BLOCK, Q8_BLOCK])?;
+                let w = model.weights.get(weight);
                 submit(
                     sink,
                     q8_gemv(
@@ -144,7 +153,6 @@ fn run(
             }
             Op::Session {
                 layer,
-                kind,
                 input,
                 out: output,
             } => {
@@ -152,8 +160,8 @@ fn run(
                 for (b, session) in sessions.iter_mut().enumerate() {
                     let row_input = input_tensor.slice(&[b..b + 1, 0..h])?;
                     let row_output = out.slice_mut(&[b * heads..(b + 1) * heads, 0..d])?;
-                    match (&mut session.state[layer], kind) {
-                        (LayerState::Gdn { recurrent }, SessionKind::Gdn) => {
+                    match &mut session.state[layer] {
+                        LayerState::Gdn { recurrent } => {
                             let r = plan.grid.row;
                             submit(
                                 sink,
@@ -169,7 +177,7 @@ fn run(
                                 ),
                             )?;
                         }
-                        (LayerState::Attention { k, v }, SessionKind::Attention) => {
+                        LayerState::Attention { k, v } => {
                             submit(
                                 sink,
                                 hybrid::kv_append(
@@ -208,7 +216,6 @@ fn run(
                                 ),
                             )?;
                         }
-                        _ => return Err("session state does not match model layer".into()),
                     }
                 }
             }
@@ -226,9 +233,14 @@ pub struct Engine {
     id: EngineId,
     stream: Stream,
     row: RowTile,
-    plans: HashMap<Vec<SessionId>, StepPlan>,
+    plans: HashMap<usize, CachedPlan>,
     #[cfg(test)]
     fail_after_gpu_work: bool,
+}
+
+struct CachedPlan {
+    instances: Vec<crate::session::SessionInstance>,
+    plan: StepPlan,
 }
 
 impl Engine {
@@ -254,7 +266,24 @@ impl Engine {
         })
     }
     pub fn new_session(&self, id: SessionId) -> Result<Session> {
-        self.model.new_session(id, &self.stream)
+        self.model.new_session(id, self.id, &self.stream)
+    }
+
+    pub fn close_session(&mut self, session: Session) -> Result<()> {
+        if session.engine != self.id {
+            return Err("session belongs to another engine".into());
+        }
+        self.synchronize_stream()?;
+        self.plans
+            .retain(|_, entry| !entry.instances.contains(&session.instance));
+        Ok(())
+    }
+
+    fn synchronize_stream(&self) -> Result<()> {
+        self.stream.device().bind_to_thread()?;
+        // SAFETY: the stream's parent device context is current on this thread.
+        unsafe { self.stream.synchronize()? };
+        Ok(())
     }
 
     pub fn batch<'s>(
@@ -262,16 +291,19 @@ impl Engine {
         entries: impl IntoIterator<Item = (&'s mut Session, u32)>,
     ) -> Result<Batch<'s>> {
         let entries: Vec<_> = entries.into_iter().collect();
-        if entries.is_empty() || entries.len() > MAX_BATCH_SESSIONS {
-            return Err(format!("batch must have 1..={MAX_BATCH_SESSIONS} sessions").into());
+        if entries.is_empty()
+            || entries.len() > MAX_BATCH_SESSIONS
+            || !entries.len().is_power_of_two()
+        {
+            return Err(format!("batch must have 1, 2, or {MAX_BATCH_SESSIONS} sessions").into());
         }
         let mut ids = HashSet::new();
         for (session, token) in &entries {
             if !ids.insert(session.id) {
                 return Err("duplicate session id".into());
             }
-            if session.model != self.model.id {
-                return Err("session belongs to another model".into());
+            if session.engine != self.id {
+                return Err("session belongs to another engine".into());
             }
             if *token as usize >= self.model.dims().vocab() {
                 return Err("token outside vocabulary".into());
@@ -295,7 +327,7 @@ impl Engine {
         if batch.engine != self.id {
             return Err("batch belongs to another engine".into());
         }
-        let key: Vec<SessionId> = batch.sessions.iter().map(|s| s.id).collect();
+        let size = batch.sessions.len();
         let instances: Vec<crate::session::SessionInstance> = batch
             .sessions
             .iter()
@@ -303,15 +335,14 @@ impl Engine {
             .collect();
         if self
             .plans
-            .get(&key)
-            .is_none_or(|plan| plan.instances != instances)
+            .get(&size)
+            .is_none_or(|entry| entry.instances != instances)
         {
-            let mut plan =
-                StepPlan::new(&self.model, batch.sessions.len(), self.row.0, &self.stream)?;
-            plan.instances = instances;
-            self.plans.insert(key.clone(), plan);
+            let plan = StepPlan::new(&self.model, size, self.row.0, &self.stream)?;
+            self.synchronize_stream()?;
+            self.plans.insert(size, CachedPlan { instances, plan });
         }
-        let plan = self.plans.get_mut(&key).unwrap();
+        let plan = &mut self.plans.get_mut(&size).unwrap().plan;
         let tokens: Vec<i32> = batch.tokens.iter().map(|&x| x as i32).collect();
         let result = (|| -> Result<Vec<f32>> {
             let source = api::copy_host_vec_to_device(&Arc::new(tokens)).sync_on(&self.stream)?;
@@ -391,6 +422,35 @@ mod tests {
         assert!(engine.step_with(batch, Execution::Eager).is_err());
         assert_eq!(session.position(), 0);
         assert!(engine.batch([(&mut session, 1)]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn cache_is_bounded_and_close_removes_related_plans() -> Result<()> {
+        let device = Device::new(0)?;
+        let stream = device.new_stream()?;
+        let dims = ModelDims::try_from(ModelConfig::default())?;
+        let model = Arc::new(Model::synthetic(dims, &stream)?);
+        let mut engine = Engine::new(model.clone(), &device)?;
+        let mut sessions = (1..=5)
+            .map(|id| engine.new_session(SessionId(id)))
+            .collect::<Result<Vec<_>>>()?;
+
+        for size in [1, 2, MAX_BATCH_SESSIONS] {
+            let batch = engine.batch(sessions[..size].iter_mut().map(|session| (session, 1)))?;
+            engine.step(batch)?;
+        }
+        assert_eq!(engine.plans.len(), 3);
+
+        let original = engine.plans.get(&1).unwrap().instances[0];
+        let batch = engine.batch([(&mut sessions[4], 1)])?;
+        engine.step(batch)?;
+        assert!(engine.plans.get(&1).unwrap().instances[0] != original);
+        assert_eq!(engine.plans.len(), 3);
+
+        engine.close_session(sessions.remove(0))?;
+        assert_eq!(engine.plans.len(), 1);
+        assert!(engine.plans.contains_key(&1));
         Ok(())
     }
 }
