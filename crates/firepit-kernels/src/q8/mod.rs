@@ -1,12 +1,11 @@
 mod format;
 mod kernel;
-mod kernel_v2;
 
-use cuda_async::device_operation::DeviceOp;
+use cuda_async::device_operation::{DeviceOp, GraphNode};
 use cutile::api::{self, DeviceOpReshape};
-use cutile::tensor::{Partition, Tensor};
+use cutile::tensor::{Partition, Tensor, TensorView};
 use cutile::tile_kernel::TileKernel;
-pub use format::{FormatError, HostQ8Matrix, HostQuantizedX, quantize_x_cpu};
+pub use format::{FormatError, HostQ8Matrix};
 use half::f16;
 use std::sync::Arc;
 
@@ -37,91 +36,42 @@ impl HostQ8Matrix {
     }
 }
 
-pub fn q8_gemv<'a, const B: i32, const BN: i32, const NB: i32>(
-    w: &Q8Matrix,
-    x: &'a Tensor<f32>,
-    y: Partition<Tensor<f32>>,
-) -> impl DeviceOp<
-    Output = (
-        Partition<Tensor<f32>>,
-        Arc<Tensor<i8>>,
-        Arc<Tensor<f16>>,
-        &'a Tensor<f32>,
-        i32,
-    ),
-> + 'a {
-    assert!(B > 0 && BN > 0 && NB > 0);
-    assert_eq!(x.shape(), &[B, (w.cols / 32) as i32, 32]);
-    assert_eq!((w.cols / 32) % NB as usize, 0);
-    assert_eq!(w.rows % BN as usize, 0);
-    kernel::q8_gemv_kernel(y, w.qs.clone(), w.scales.clone(), x, (w.cols / 32) as i32)
-        .generics(vec![B.to_string(), BN.to_string(), NB.to_string()])
+#[derive(Clone, Copy)]
+pub struct GemvTile {
+    pub rows: usize,
+    pub blocks: usize,
 }
 
-pub fn quantize_x<'a>(
-    x: &'a Tensor<f32>,
-    xq: Partition<Tensor<i8>>,
-    dx: Partition<Tensor<f32>>,
-) -> impl DeviceOp<
-    Output = (
-        Partition<Tensor<i8>>,
-        Partition<Tensor<f32>>,
-        &'a Tensor<f32>,
-    ),
-> + 'a {
-    assert_eq!(x.shape().len(), 3);
-    assert_eq!(x.shape()[2], 32);
-    kernel_v2::quantize_x_kernel(xq, dx, x)
-}
+pub const DEFAULT_GEMV_TILE: GemvTile = GemvTile {
+    rows: 16,
+    blocks: 4,
+};
 
-pub fn q8_gemv_v1b<'a, const B: i32, const BN: i32, const NB: i32>(
+pub fn q8_gemv<'a>(
     w: &Q8Matrix,
-    x: &'a Tensor<f32>,
-    y: Partition<Tensor<f32>>,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<&'a mut Tensor<f32>>,
+    tile: GemvTile,
 ) -> impl DeviceOp<
     Output = (
-        Partition<Tensor<f32>>,
+        Partition<&'a mut Tensor<f32>>,
         Arc<Tensor<i8>>,
         Arc<Tensor<f16>>,
-        &'a Tensor<f32>,
+        &'a TensorView<'a, f32>,
         i32,
     ),
-> + 'a {
-    assert!(B > 0 && BN > 0 && NB > 0);
-    assert_eq!(x.shape(), &[B, (w.cols / 32) as i32, 32]);
-    assert_eq!((w.cols / 32) % NB as usize, 0);
-    assert_eq!(w.rows % BN as usize, 0);
-    kernel_v2::q8_gemv_v1b_kernel(y, w.qs.clone(), w.scales.clone(), x, (w.cols / 32) as i32)
-        .generics(vec![B.to_string(), BN.to_string(), NB.to_string()])
-}
-
-pub fn q8_gemv_v2<'a, const B: i32, const BN: i32, const NB: i32>(
-    w: &Q8Matrix,
-    xq: &'a Tensor<i8>,
-    dx: &'a Tensor<f32>,
-    y: Partition<Tensor<f32>>,
-) -> impl DeviceOp<
-    Output = (
-        Partition<Tensor<f32>>,
-        Arc<Tensor<i8>>,
-        Arc<Tensor<f16>>,
-        &'a Tensor<i8>,
-        &'a Tensor<f32>,
-        i32,
-    ),
-> + 'a {
-    assert!(B > 0 && BN > 0 && NB > 0);
-    assert_eq!(xq.shape(), &[B, (w.cols / 32) as i32, 32]);
-    assert_eq!(dx.shape(), &[B, (w.cols / 32) as i32]);
-    assert_eq!((w.cols / 32) % NB as usize, 0);
-    assert_eq!(w.rows % BN as usize, 0);
-    kernel_v2::q8_gemv_v2_kernel(
-        y,
-        w.qs.clone(),
-        w.scales.clone(),
-        xq,
-        dx,
-        (w.cols / 32) as i32,
+> + GraphNode
++ 'a {
+    let batch = x.shape()[0] as usize;
+    assert!(batch > 0 && tile.rows > 0 && tile.blocks > 0);
+    assert_eq!(x.shape(), &[batch as i32, (w.cols / 32) as i32, 32]);
+    assert_eq!((w.cols / 32) % tile.blocks, 0);
+    assert_eq!(w.rows % tile.rows, 0);
+    kernel::q8_gemv_kernel(y, w.qs.clone(), w.scales.clone(), x, (w.cols / 32) as i32).generics(
+        vec![
+            batch.to_string(),
+            tile.rows.to_string(),
+            tile.blocks.to_string(),
+        ],
     )
-    .generics(vec![B.to_string(), BN.to_string(), NB.to_string()])
 }

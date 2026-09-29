@@ -22,45 +22,6 @@ pub struct HostQ8Matrix {
     pub cols: usize,
 }
 
-pub struct HostQuantizedX {
-    pub xq: Vec<i8>,
-    pub dx: Vec<f32>,
-    pub batch: usize,
-    pub cols: usize,
-}
-
-pub fn quantize_x_cpu(x: &[f32], batch: usize, cols: usize) -> Result<HostQuantizedX, FormatError> {
-    if batch == 0 || cols == 0 || cols % 32 != 0 {
-        return Err(FormatError::InvalidShape);
-    }
-    let expected = batch.checked_mul(cols).ok_or(FormatError::InvalidShape)?;
-    if x.len() != expected {
-        return Err(FormatError::InvalidInputLength {
-            expected,
-            actual: x.len(),
-        });
-    }
-    let mut xq = Vec::with_capacity(expected);
-    let mut dx = Vec::with_capacity(expected / 32);
-    for block in x.chunks_exact(32) {
-        let max_abs = block.iter().fold(0.0f32, |m, &v| m.max(v.abs()));
-        let scale = max_abs / 127.0;
-        dx.push(scale);
-        let divisor = if scale == 0.0 { 1.0 } else { scale };
-        xq.extend(
-            block
-                .iter()
-                .map(|&v| (v / divisor).round().clamp(-127.0, 127.0) as i8),
-        );
-    }
-    Ok(HostQuantizedX {
-        xq,
-        dx,
-        batch,
-        cols,
-    })
-}
-
 impl HostQ8Matrix {
     pub fn from_gguf_q8_0(blocks: &[u8], rows: usize, cols: usize) -> Result<Self, FormatError> {
         if rows == 0 || cols == 0 || cols % 32 != 0 {
@@ -111,33 +72,6 @@ impl HostQ8Matrix {
         }
         Ok(y)
     }
-
-    pub fn gemv_quantized_reference(&self, x: &HostQuantizedX) -> Result<Vec<f64>, FormatError> {
-        if x.cols != self.cols {
-            return Err(FormatError::InvalidInputLength {
-                expected: self.cols,
-                actual: x.cols,
-            });
-        }
-        let blocks = self.cols / 32;
-        let mut y = vec![0.0f64; x.batch * self.rows];
-        for b in 0..x.batch {
-            for n in 0..self.rows {
-                let mut sum = 0.0f64;
-                for block in 0..blocks {
-                    let base_w = (n * blocks + block) * 32;
-                    let base_x = (b * blocks + block) * 32;
-                    let dot: i32 = (0..32)
-                        .map(|i| self.qs[base_w + i] as i32 * x.xq[base_x + i] as i32)
-                        .sum();
-                    let scale = self.scales[n * blocks + block].to_f32() as f64;
-                    sum += dot as f64 * scale * x.dx[b * blocks + block] as f64;
-                }
-                y[b * self.rows + n] = sum;
-            }
-        }
-        Ok(y)
-    }
 }
 
 #[cfg(test)]
@@ -170,19 +104,5 @@ mod tests {
                 actual: 0
             })
         );
-    }
-
-    #[test]
-    fn quantizes_each_block() {
-        let x = [
-            vec![0.0f32; 32],
-            (0..32).map(|i| (i as f32 - 16.0) / 4.0).collect(),
-        ]
-        .concat();
-        let q = quantize_x_cpu(&x, 1, 64).unwrap();
-        assert_eq!(&q.xq[..32], &[0; 32]);
-        assert_eq!(q.dx[0], 0.0);
-        assert_eq!(q.xq[32], -127);
-        assert_eq!(q.dx[1], 4.0 / 127.0);
     }
 }

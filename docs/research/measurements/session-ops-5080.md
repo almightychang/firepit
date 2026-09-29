@@ -63,8 +63,11 @@ RTX 5080, `firepit-dev:cuda13.3`, cutile 0.4.0. 커널은 `S ← 0.5·S + k vᵀ
 
 ## 재현
 
+측정 당시 코드는 커밋 `ae3c2c3`에 있다. 별도 작업 트리에서 해당 커밋을 checkout한 뒤 실행한다.
+
 ```bash
+git checkout ae3c2c3
 scripts/dev.sh session-bench
 ```
 
-`crates/firepit-kernels/benches/session_ops.rs`. V2의 multi-stream 캡처는 `CudaGraph::scope`가 단일 stream이라 bench 안에서만 `cuda_core::sys`와 명시적 `ExecutionContext`로 구현했다(host 코드 unsafe). 커널은 모두 safe cuTile이다.
+해당 커밋의 `crates/firepit-kernels/benches/session_ops.rs`에서 V2 multi-stream 캡처는 `CudaGraph::scope`가 단일 stream이라 `cuda_core::sys`와 명시적 `ExecutionContext`로 구현했다(host 코드 unsafe). 커널은 모두 safe cuTile이다.

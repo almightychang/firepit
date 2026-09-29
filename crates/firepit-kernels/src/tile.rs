@@ -1,5 +1,11 @@
 /// Largest power-of-two row tile that exposes enough independent blocks.
-pub fn row_tile(v: usize, heads: usize, sm_count: usize, blocks_per_sm: usize, min_tile: usize) -> usize {
+pub fn row_tile(
+    v: usize,
+    heads: usize,
+    sm_count: usize,
+    blocks_per_sm: usize,
+    min_tile: usize,
+) -> usize {
     assert!(v.is_power_of_two() && min_tile.is_power_of_two());
     assert!(heads > 0 && sm_count > 0 && blocks_per_sm > 0);
     assert!(min_tile <= v);

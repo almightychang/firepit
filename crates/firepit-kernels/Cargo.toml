@@ -8,11 +8,3 @@ cutile.workspace = true
 cuda-async.workspace = true
 cuda-core.workspace = true
 half.workspace = true
-
-[[bench]]
-name = "q8_gemv"
-harness = false
-
-[[bench]]
-name = "session_ops"
-harness = false

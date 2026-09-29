@@ -37,7 +37,7 @@ for kc in 0..(K/32)/NB:
 y.store(acc)
 ```
 
-`B`, `BN`, `NB`(chunk당 block 수)는 const generic이다. 값은 bench로 고른다.
+커널의 `B`, `BN`, `NB`(chunk당 block 수)는 컴파일 특수화 값이다. host API는 입력 view의 B와 tile 설정을 받아 전달한다. 기본 tile은 `DEFAULT_GEMV_TILE`(16, 4)이다.
 
 ## host API
 
@@ -48,7 +48,7 @@ impl HostQ8Matrix {
     pub fn from_gguf_q8_0(blocks: &[u8], rows: usize, cols: usize) -> Result<Self>;
 }
 
-pub fn q8_gemv(w: &Q8Matrix, x: &Tensor<f32>, y: Partition<Tensor<f32>>) -> impl DeviceOp;
+pub fn q8_gemv(w: &Q8Matrix, x: &TensorView<f32>, y: Partition<&mut Tensor<f32>>, tile: GemvTile) -> impl DeviceOp;
 ```
 
 가중치는 공유 참조, 출력은 소유권 이동이다. step graph와 CUDA Graph에 넣을 수 있도록 `DeviceOp`을 반환한다.
@@ -64,48 +64,9 @@ pub fn q8_gemv(w: &Q8Matrix, x: &Tensor<f32>, y: Partition<Tensor<f32>>) -> impl
 
 B = 1은 peak의 57~88%다. B = 8은 B = 1보다 1.5~1.8배 느리다. 가중치 read는 B와 무관하므로, 중간 tile `[B, BN, NB, 32]`가 B배로 커지는 것이 원인으로 추정된다.
 
-## 커널 v2
+## v2 탐색 결과 (채택 안 함)
 
-v1과의 차이는 두 가지다.
-
-1. 세션 루프: block 안에서 세션을 하나씩 돈다. 중간 tile이 `[BN, NB, 32]`로 B와 무관해진다. 가중치 tile은 루프 밖에서 한 번 load한다.
-2. int8 activation: x를 32개 단위로 int8 양자화한다(`xq`, `dx`). i8 → i32 확장 → 곱 → 합으로 적으면 tileiras가 `IDP.4A`(dp4a)로 내린다(5080에서 SASS로 확인). candle `fast_mmvq`, llama.cpp `mmvq`와 같은 방식이다.
-
-```
-quantize_x:  x [B, K] f32  →  xq [B, K/32, 32] i8,  dx [B, K/32] f32     (block마다 max|x| / 127)
-
-q8_gemv_v2:
-grid = N / BN, block j가 y[:, j·BN ..]를 소유 (partition [B, BN])
-y 안에서 행 단위 partition [1, BN]으로 세션 b의 결과를 쓴다 (v0.4.0 safe partition_mut)
-
-for b in 0..B:
-    acc[BN] = 0
-    for kc in 0..(K/32)/NB:
-        q    = qs[j·BN.., kc·NB.., :]   [BN, NB, 32] i8 → i32
-        s    = d [j·BN.., kc·NB..]      [BN, NB] f16 → f32
-        xb   = xq[b, kc·NB.., :]        [NB, 32] i8 → i32 → broadcast [BN, NB, 32]
-        dxb  = dx[b, kc·NB..]           [NB] → broadcast [BN, NB]
-        dot  = Σ_last(q · xb)           [BN, NB] i32        ← dp4a
-        acc += Σ_last(f32(dot) · s · dxb)  [BN]
-    y_rows[b].store(acc)
-```
-
-가중치 tile을 세션 루프 밖으로 빼는 것은 k 루프와 순서가 충돌한다. 먼저 위 순서(세션 바깥, k 안쪽)로 짜고, 같은 가중치를 B번 읽는 비용이 L2에서 흡수되는지 측정한다. 흡수되지 않으면 k 바깥, 세션 안쪽으로 바꾸고 acc를 세션별로 둔다.
-
-### 비교 변형
-
-추정을 가르기 위해 세 가지를 같은 bench로 잰다.
-
-| 변형 | 세션 루프 | activation | 검증하는 것 |
-|---|---|---|---|
-| v1 | 없음 (broadcast) | f32 | 기준 |
-| v1b | 있음 | f32 | 중간 tile 크기가 B 의존성의 원인인가 |
-| v2 | 있음 | int8 (dp4a) | dp4a가 추가로 얼마나 버는가 |
-
-### 정밀도
-
-- 정확성 테스트는 같은 양자화를 적용한 CPU reference와 비교한다. 정수 내적이므로 오차는 f32 누산 수준이어야 한다.
-- 양자화 자체의 오차는 f32 x 기준 CPU reference와 비교해 따로 보고한다.
+v1b는 세션을 커널 안에서 순회해 중간 tile을 줄였고, v2는 activation을 int8로 양자화해 dp4a를 사용했다. 둘 다 B가 커질 때 가중치를 세션마다 다시 읽어 v1보다 느렸다. 양자화 자체도 추가 비용과 오차를 냈다. 측정값과 당시 구현은 [RTX 5080 측정](../research/measurements/q8-gemv-5080.md), 커밋 `f611715`에 남아 있다.
 
 ## 다음 후보
 

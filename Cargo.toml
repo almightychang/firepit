@@ -1,7 +1,7 @@
 [workspace]
-members = ["crates/firepit-kernels"]
+members = ["crates/firepit-kernels", "crates/firepit"]
 resolver = "2"
-exclude = ["tools/candle-q8bench", "vendor/cutile-rs"]
+exclude = ["vendor/cutile-rs"]
 
 [workspace.dependencies]
 cutile = "=0.4.0"

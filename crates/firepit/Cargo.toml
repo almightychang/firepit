@@ -1,0 +1,14 @@
+[package]
+name = "firepit"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+firepit-kernels = { path = "../firepit-kernels" }
+cutile.workspace = true
+cuda-async.workspace = true
+cuda-core.workspace = true
+half.workspace = true
+
+[dev-dependencies]
+trybuild = "1"

@@ -44,6 +44,8 @@ cuTile에서 grid는 출력 partition 모양이 정한다. 컴파일러는 grid�
                  (최소 크기 아래로는 나누지 않는다)
 ```
 
+출력 grid 일치 원칙: 한 세션 커널의 출력들이 같은 grid를 만들도록 plan이 각 출력 view의 모양을 정한다. activation은 가중치·elementwise 연산에서는 `[B,H]`로 보고, 세션 연산에서는 같은 메모리를 `[B·heads,V]`로 본다(`H = heads·V`). 따라서 세션 b의 출력은 `[heads,V]` view이고 `[1,row_tile]`로 나누면 head와 행 조각마다 block 하나가 생긴다. KV append 출력도 `[max_seq,1,row_tile]`로 나눠 같은 head × 행 조각 grid를 만든다.
+
 - 값은 step plan을 만들 때 계산해 const generic으로 넘긴다. JIT가 값마다 한 번 특수화해 캐시한다.
 - 규칙으로 정하기 애매한 커널은 cutile-rs autotuner로 고르고 결과를 캐시한다.
 - 하드코딩하지 않는다. 같은 규칙이 5080(84 SM)과 GB10에서 다른 값을 낸다.
