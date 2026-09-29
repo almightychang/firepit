@@ -30,7 +30,7 @@ Batch    한 step 동안 여러 세션을 빌려 온다        → &mut Session 
 
 ## 3. step 실행
 
-Grout의 `StepGraph`(op 목록 + value 수명 분석 + `TensorPool` 계획)를 출발점으로 쓴다. [결정]
+Grout의 `StepGraph`는 fork하지 않고 참고한다. Grout decode는 `StepGraph`를 쓰지 않고 손으로 나열한 CUDA Graph scope이며, state op에 세션 개념이 없다([grout.md](research/grout.md)). `TensorPool`의 value 수명 분석은 가져온다. [결정, 2026-09-29 변경]
 
 한 step의 op는 두 종류로 나뉜다.
 
@@ -84,7 +84,7 @@ HC mixer(F16), QSA(indexer와 block-sparse attention), n-gram PLE(SSD에서 행 
 
 ## 7. 출발점: Grout fork
 
-Grout(`~/Repos/grout`, Apache-2.0)를 fork해서 시작한다. [결정, 단 아래 확인 후 최종 확정]
+~~Grout(`~/Repos/grout`, Apache-2.0)를 fork해서 시작한다.~~ fork하지 않는다. 참고와 부분 차용만 한다. [결정, 2026-09-29 변경]
 
 | 가져올 것 | 바꿀 것 |
 |---|---|
@@ -105,6 +105,6 @@ Grout(`~/Repos/grout`, Apache-2.0)를 fork해서 시작한다. [결정, 단 아�
 
 1. 세션 state 간접 매핑은 A, B, C 중 무엇으로 할까 (4절)
 2. dense 가중치 양자화 포맷 (5절)
-3. Grout `StepGraph`가 hybrid 모델과 batch를 담을 수 있는가 (7절)
-4. cuTile로 짠 양자화 GEMV가 GB10 floor의 몇 %까지 가는가. 아직 아무도 측정하지 않았다. Grout의 높은 대역폭 효율은 cuBLAS 덕분이다
+3. ~~Grout `StepGraph`가 hybrid 모델과 batch를 담을 수 있는가~~ 답: 담을 수 없다. 참고만 한다
+4. cuTile로 짠 양자화 GEMV가 GB10 floor의 몇 %까지 가는가. RTX 5080에서는 safe v1이 B = 1에서 candle과 동급(peak 89%)이다([측정](research/measurements/q8-gemv-5080.md)). GB10은 미측정
 5. MTP와 batching을 함께 쓸 때 세션별 accept 길이가 다르면 step을 어떻게 맞출까

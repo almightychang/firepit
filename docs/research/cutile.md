@@ -35,7 +35,7 @@ NVIDIA가 2026-09-08에 "CUDA Rust"로 공식 발표했다. 트랙은 두 개다
 
 ### Grout
 
-entry 39개 중 unsafe는 0개다. GEMM과 GEMV는 cuBLAS에 위임한다. 자세한 내용은 [grout.md](grout.md)에 있다. [확인]
+entry 39개 중 25개가 unsafe다(이전 기록 "0개"는 틀렸다). GEMM과 GEMV는 cuBLAS에 위임한다. 자세한 내용은 [grout.md](grout.md)에 있다. [확인]
 
 ### candle
 
@@ -66,9 +66,11 @@ axis, coeus-cuda, hanzo-ml(candle 계열), narsil-engine, onde-mistralrs-quant(m
 ## cuTile 공백 후보 (firepit에서 확인할 것)
 
 1. 간접 쓰기(scatter): 세션 pool slot 매핑, GDN pooled state
-2. 실행 시점에 정해지는 tile 개수(chunk 수)를 safe로 표현하기
+2. 실행 시점에 정해지는 tile 개수(chunk 수)를 safe로 표현하기. 단 실행 시점 index로 자기 partition 안에 쓰는 것은 v0.3.0부터 safe(`partition_mut` + bounds check)다
 3. 34-byte GGUF block(정렬이 어긋난 구조체 배열)을 tile load로 읽기
-4. int8 내적(dp4a 계열)을 Tile IR로 표현하기
+4. ~~int8 내적(dp4a 계열)을 Tile IR로 표현하기~~ 공백 아님. i8 → i32 확장·곱·합이 `IDP.4A`로 내려간다 ([측정](measurements/q8-gemv-5080.md))
+6. `reduce` 결과의 generic shape 불일치 — NVlabs/cutile-rs#184 (알려진 버그, P0, PR 없음)
+7. tile 타입 shape 안의 const 산술(`{ [BN, BK / 32] }`) 파싱 불가
 5. `pdl` 같은 기능이 Tile IR 13.4를 요구하는 문제(sm_121에서 13.3 기준 SKIP)
 
 ## 장단점 요약

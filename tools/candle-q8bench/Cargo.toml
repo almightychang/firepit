@@ -1,0 +1,10 @@
+[package]
+name = "candle-q8bench"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+
+[dependencies]
+candle-core = { path = "/home/sam/Repos/candle/candle-core", features = ["cuda"] }
+half = "2"

@@ -10,7 +10,8 @@
 - `src/` 약 11.5k줄. 주요 파일: `model.rs`, `kernels.rs`, `flash_decode.rs`, `cublas.rs`(667줄), `loader.rs`. [확인]
 - 모델: Qwen3 dense만(Qwen3-4B, Qwen3-32B). safetensors를 로드하고 fp16으로 계산한다. 양자화는 없다. [확인]
 - **GEMM과 GEMV는 cuBLAS**다(`src/kernels.rs:9`). cuTile로 짠 것은 attention, norm, RoPE, embedding, argmax 등이다. [확인]
-- cuTile entry 39개 중 unsafe 0개다. `&mut Tensor` partition을 44곳에서 쓴다. [확인]
+- cuTile entry 39개 중 25개가 `unsafe fn`이고 `unchecked_accesses = true`도 25곳이다. `pointer_to_tile` 등 raw pointer를 쓰는 entry가 8개다. 논문 버전 커밋(`5fb58a5`)에서 `unchecked_accesses`가 4곳 → 25곳으로 늘었다. [확인] (이전 기록 "unsafe 0개"는 틀렸다)
+- cutile 0.2.0에 고정되어 있다. 0.2.0에서는 `partition_mut`/`PartitionMut::store`가 unsafe였고, 0.3.0부터 safe(bounds check 삽입)다. Grout의 `partition_mut` unsafe 블록 상당수는 버전 차이다. [확인]
 
 ## 구조 (`src/model.rs`)
 
@@ -38,7 +39,13 @@
 | | 서버, API |
 
 - 설계상 가장 큰 변경은 `Layer`에서 state를 떼어 내는 것이다. 자세한 내용은 [design.md](../design.md) 1절에 있다.
-- 확인할 것: `StepGraph`가 layer 종류가 섞인 hybrid 모델과 batch 폭을 담을 수 있는가.
+## `StepGraph` 정독 결과 (2026-09-29)
+
+- decode는 `StepGraph`를 쓰지 않는다. `build_decode_graph_scope`(`model.rs:2248-3550`)가 `CudaGraph::scope` 안에서 커널을 직접 나열하고, prime pass와 capture pass가 같은 layer 루프를 두 번 적는다. README의 "StepGraph를 CUDA Graph로 캡처"는 주석으로 남은 옛 방식이다. [확인]
+- `GraphOp`과 `LayerWeightSlot`은 Qwen3 전용 closed enum이고, dtype은 f16 하나다. [확인]
+- state op는 `layer_idx`만 들고 실행기가 `self.layers[i].state`를 꺼낸다. position은 스칼라 하나다. 세션 개념이 없다. [확인]
+- `TensorPool`/pool plan은 모델과 무관해서 재사용할 만하다. [확인]
+- 결론: fork하지 않고 참고한다. firepit은 연산 목록 하나에서 prefill, prime, CUDA Graph 캡처를 모두 만들고, state op이 세션 state 핸들을 명시적으로 받게 한다. [결정]
 
 ## Spark 실측 (tutorial 재현)
 

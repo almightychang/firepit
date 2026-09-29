@@ -1,0 +1,14 @@
+[package]
+name = "firepit-kernels"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+cutile.workspace = true
+cuda-async.workspace = true
+cuda-core.workspace = true
+half.workspace = true
+
+[[bench]]
+name = "q8_gemv"
+harness = false
