@@ -11,9 +11,9 @@ use std::sync::Arc;
 use crate::q8::{GemvTile, Q8_BLOCK};
 
 pub struct DenseMatrix<T: DType> {
-    weights: Arc<Tensor<T>>,
+    pub(crate) weights: Arc<Tensor<T>>,
     pub rows: usize,
-    cols: usize,
+    pub(crate) cols: usize,
 }
 
 impl<T: DType> DenseMatrix<T> {

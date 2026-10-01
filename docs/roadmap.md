@@ -68,7 +68,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 | 2.3 SwiGLU MLP | FFN의 gate · up · down | shared expert 하나가 일치 | ✔ |
 | 2.4 Attention ① | Q · K · V, RoPE, q/k norm | 한 token의 q, k가 일치 | ✔ |
 | 2.5 Attention ② | KV cache, GQA, softmax, output gate | attention layer 하나가 여러 step에서 일치 | ✔ |
-| 2.6 MoE | router, top-8 선택, expert 가중합 | MoE 블록 하나가 일치 | ○ |
+| 2.6 MoE | router, top-8 선택, expert 가중합 | MoE 블록 하나가 일치 | ✔ |
 | 2.7 GDN ① | causal conv1d, conv state | conv 출력 일치 | ○ |
 | 2.8 GDN ② | gating(α, β), delta rule 상태 갱신, 출력 gate | GDN layer 하나가 여러 step에서 일치 | ○ |
 | 2.9 전부 쌓기 | layer stack, tokenizer, greedy decode | 실제 문장 생성 | ○ |
@@ -93,6 +93,7 @@ scripts/dev.sh test -p firepit --test reference -- --ignored
 - 2.3: 앞쪽 4개 layer의 shared expert 입력/출력을 HF hook으로 기록해 5 step × 4 layer를 비교했다. 최대 상대오차 `5.36579723e-6`, 실제 bf16 가중치와 Gaussian 입력의 f64 CPU 비교 `3.36419940e-7`. gate/up 순서를 뒤집으면 상대오차 `4.83147961e0`.
 - 2.4: layer 3 attention의 q/k/v/gate를 HF 5 step과 비교했다. 최대 상대오차는 각각 `4.68418046e-7`, `6.65132815e-7`, `3.92343450e-7`, `4.70510518e-7`. 텍스트의 세 위치 축이 같을 때 mRoPE 표는 1D 표와 일치했고, f32 host 표의 최대 절대오차는 `5.96046448e-8`이다. 인접 성분 회전과 전체 256차원 회전의 상대오차는 각각 `4.24366914e-1`, `5.18970913e-1`.
 - 2.5: f32 KV cache와 online softmax, GQA, output gate, o_proj를 layer 3 HF 5 step과 비교했다. `o_proj` 입력과 attention Δx의 최대 상대오차는 각각 `1.50475377e-7`, `3.44580795e-7`. scale 누락과 modulo GQA 매핑의 상대오차는 각각 `6.86910900e-1`, `1.48213966e0`. E1 합성 `kv_append`/`attn_step`은 유지하며 2.9 엔진 통합에서 실제 커널로 교체한다.
+- 2.6: router logits, top-k 번호·가중치, routed 합, MoE Δx를 layer 0~3의 5 step과 비교했다. 최대 상대오차는 logits `3.82721087e-7`, routed 합 `4.32246025e-7`, Δx `1.40249628e-6`; top-k 가중치 최대 절대오차 `1.49011612e-7`, 번호 불일치 0건. 재정규화 누락과 top-(k−1) 대조 상대오차는 `5.30466856e-1`, `7.22364042e-2`. `expert_gemv`는 기존 dense GEMV와 본문이 비슷하다. 이슈 002의 cuTile macro 문제 해결 후 중복 제거를 검토한다.
 
 ## 확인할 것
 

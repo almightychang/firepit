@@ -1,6 +1,7 @@
 pub mod attention;
 pub mod dense;
 pub mod hybrid;
+pub mod moe;
 pub mod q8;
 pub mod rope;
 pub mod swiglu;

@@ -61,6 +61,29 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
             records[f"step{step}/layer{layer}/shared_expert/out"] = output[0].clone()
         return record
 
+    def moe_input(layer):
+        def record(_module, args):
+            records[f"step{step}/layer{layer}/moe/in"] = args[0][0, 0].clone()
+        return record
+
+    def router_hook(layer):
+        def record(_module, _args, output):
+            prefix = f"step{step}/layer{layer}/moe"
+            records[f"{prefix}/logits"] = output[0][0].clone()
+            records[f"{prefix}/weights"] = output[1][0].clone()
+            records[f"{prefix}/indices"] = output[2][0].to(torch.float32).clone()
+        return record
+
+    def routed_hook(layer):
+        def record(_module, _args, output):
+            records[f"step{step}/layer{layer}/moe/routed"] = output[0].clone()
+        return record
+
+    def moe_output(layer):
+        def record(_module, _args, output):
+            records[f"step{step}/layer{layer}/moe/delta"] = output[0, 0].clone()
+        return record
+
     def attn_input(_module, _args, kwargs):
         records[f"step{step}/layer3/attn/in"] = kwargs["hidden_states"][0, 0].clone()
 
@@ -90,6 +113,13 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
 
     hooks = [block.mlp.shared_expert.register_forward_hook(expert_hook(layer))
              for layer, block in enumerate(model.model.layers)]
+    for layer, block in enumerate(model.model.layers):
+        hooks += [
+            block.mlp.register_forward_pre_hook(moe_input(layer)),
+            block.mlp.gate.register_forward_hook(router_hook(layer)),
+            block.mlp.experts.register_forward_hook(routed_hook(layer)),
+            block.mlp.register_forward_hook(moe_output(layer)),
+        ]
     if len(model.model.layers) > 3:
         attn = model.model.layers[3].self_attn
         hooks += [

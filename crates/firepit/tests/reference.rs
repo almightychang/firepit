@@ -1,18 +1,22 @@
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
 use cutile::api::{self, DeviceOpReshape};
-use cutile::tensor::{PartitionMut, ToHostVec};
+use cutile::tensor::{PartitionMut, Tensor, ToHostVec};
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit::{Checkpoint, SafetensorsFile};
 use firepit_kernels::attention::{AttentionDims, cache_append, online_attention, output_gate};
 use firepit_kernels::dense::{DenseMatrix, dense_gemv};
 use firepit_kernels::hybrid::rms_norm;
-use firepit_kernels::q8::DEFAULT_GEMV_TILE;
+use firepit_kernels::moe::{MoeDims, combine, expert_gemv, top_k};
+use firepit_kernels::q8::{DEFAULT_GEMV_TILE, GemvTile};
 use firepit_kernels::rope::{RopeDims, frequencies, generics as rope_generics, rope};
-use firepit_kernels::swiglu::swiglu;
 use half::bf16;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+#[allow(dead_code)]
+#[path = "../../firepit-kernels/tests/common/check.rs"]
+mod check;
 
 fn home(path: &str) -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap()).join(path)
@@ -135,100 +139,26 @@ fn argmax(values: &[f32]) -> usize {
         .0
 }
 
-const EXPERT_H: usize = 2048;
-const EXPERT_I: usize = 512;
+#[path = "common/expert.rs"]
+mod expert;
+use expert::{cpu_expert, gpu_expert, gpu_expert_tensor, load_expert};
 
-struct Expert {
-    gate_up: DenseMatrix<bf16>,
-    down: DenseMatrix<bf16>,
-    gate_up_host: Vec<bf16>,
-    down_host: Vec<bf16>,
-}
-
-fn load_expert(
-    checkpoint: &Checkpoint,
-    layer: usize,
-    stream: &Arc<cuda_core::Stream>,
-) -> Result<Expert, Box<dyn std::error::Error>> {
-    let name = |projection| {
-        format!("model.language_model.layers.{layer}.mlp.shared_expert.{projection}_proj.weight")
+fn moe_dims(
+    model_dir: &std::path::Path,
+) -> Result<firepit_kernels::moe::MoeDims, Box<dyn std::error::Error>> {
+    let config: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
+    let text = &config["text_config"];
+    let get = |name: &str| -> Result<usize, Box<dyn std::error::Error>> {
+        Ok(text[name].as_u64().ok_or(format!("missing {name}"))? as usize)
     };
-    let gate = checkpoint.tensor_bf16(&name("gate"))?;
-    let up = checkpoint.tensor_bf16(&name("up"))?;
-    let down = checkpoint.tensor_bf16(&name("down"))?;
-    assert_eq!(gate.shape, [EXPERT_I, EXPERT_H]);
-    assert_eq!(up.shape, [EXPERT_I, EXPERT_H]);
-    assert_eq!(down.shape, [EXPERT_H, EXPERT_I]);
-    let mut gate_up_host = gate.data;
-    gate_up_host.extend(up.data);
-    let gate_up = DenseMatrix::upload(gate_up_host.clone(), 2 * EXPERT_I, EXPERT_H, stream)?;
-    let down_matrix = DenseMatrix::upload(down.data.clone(), EXPERT_H, EXPERT_I, stream)?;
-    Ok(Expert {
-        gate_up,
-        down: down_matrix,
-        gate_up_host,
-        down_host: down.data,
-    })
-}
-
-fn gpu_expert(
-    stream: &Arc<cuda_core::Stream>,
-    gate_up: &DenseMatrix<bf16>,
-    down: &DenseMatrix<bf16>,
-    input: &[f32],
-) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-    let x = api::copy_host_vec_to_device(&Arc::new(input.to_vec()))
-        .reshape(&[1, EXPERT_H])
-        .sync_on(stream)?;
-    let mut projected = api::zeros::<f32>(&[1, 2 * EXPERT_I]).sync_on(stream)?;
-    dense_gemv(
-        gate_up,
-        &x.view(&[1, EXPERT_H / 32, 32])?,
-        (&mut projected).partition([1, DEFAULT_GEMV_TILE.rows]),
-        DEFAULT_GEMV_TILE,
-    )
-    .sync_on(stream)?;
-    let mut activated = api::zeros::<f32>(&[1, EXPERT_I]).sync_on(stream)?;
-    swiglu((&mut activated).partition([1, EXPERT_I]), &projected)
-        .generics(vec![EXPERT_I.to_string()])
-        .sync_on(stream)?;
-    let mut output = api::zeros::<f32>(&[1, EXPERT_H]).sync_on(stream)?;
-    dense_gemv(
-        down,
-        &activated.view(&[1, EXPERT_I / 32, 32])?,
-        (&mut output).partition([1, DEFAULT_GEMV_TILE.rows]),
-        DEFAULT_GEMV_TILE,
-    )
-    .sync_on(stream)?;
-    Ok(output.to_host_vec().sync_on(stream)?)
-}
-
-fn cpu_expert(input: &[f32], expert: &Expert) -> Vec<f64> {
-    let projected: Vec<f64> = expert
-        .gate_up_host
-        .chunks_exact(EXPERT_H)
-        .map(|row| {
-            row.iter()
-                .zip(input)
-                .map(|(&w, &x)| w.to_f32() as f64 * x as f64)
-                .sum()
-        })
-        .collect();
-    let activated: Vec<f64> = projected[..EXPERT_I]
-        .iter()
-        .zip(&projected[EXPERT_I..])
-        .map(|(&gate, &up)| gate / (1.0 + (-gate).exp()) * up)
-        .collect();
-    expert
-        .down_host
-        .chunks_exact(EXPERT_I)
-        .map(|row| {
-            row.iter()
-                .zip(&activated)
-                .map(|(&w, &x)| w.to_f32() as f64 * x)
-                .sum()
-        })
-        .collect()
+    Ok(firepit_kernels::moe::MoeDims::new(
+        get("hidden_size")?,
+        get("moe_intermediate_size")?,
+        get("shared_expert_intermediate_size")?,
+        get("num_experts")?,
+        get("num_experts_per_tok")?,
+    )?)
 }
 
 fn relative_max(actual: &[f32], expected: &[f64]) -> f64 {
@@ -245,7 +175,9 @@ fn relative_max(actual: &[f32], expected: &[f64]) -> f64 {
 #[test]
 #[ignore = "needs Qwen3.6 weights and regenerated reference trace"]
 fn shared_expert_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
-    let weights = Checkpoint::open(home("Models/qwen3.6-35b-a3b"))?;
+    let model_dir = home("Models/qwen3.6-35b-a3b");
+    let dims = moe_dims(&model_dir)?;
+    let weights = Checkpoint::open(model_dir)?;
     let refs = SafetensorsFile::open(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../refs/qwen36-prefix4.safetensors"),
     )?;
@@ -254,21 +186,29 @@ fn shared_expert_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
     let mut worst = 0.0f64;
     let mut wrong_order = 0.0f64;
     for layer in 0..4 {
-        let expert = load_expert(&weights, layer, &stream)?;
+        let expert = load_expert(&weights, layer, &stream, dims)?;
         for step in 0..5 {
             let key = format!("step{step}/layer{layer}/shared_expert");
             let input = refs.tensor(&format!("{key}/in"))?;
             let expected = refs.tensor(&format!("{key}/out"))?;
-            assert_eq!(input.shape, [EXPERT_H]);
-            assert_eq!(expected.shape, [EXPERT_H]);
-            let actual = gpu_expert(&stream, &expert.gate_up, &expert.down, &input.data)?;
+            assert_eq!(input.shape, [dims.hidden()]);
+            assert_eq!(expected.shape, [dims.hidden()]);
+            let actual = gpu_expert(&stream, &expert.gate_up, &expert.down, &input.data, dims)?;
             let expected_f64: Vec<f64> = expected.data.iter().map(|&x| x as f64).collect();
             worst = worst.max(relative_max(&actual, &expected_f64));
             if layer == 0 && step == 0 {
-                let mut swapped = expert.gate_up_host[EXPERT_I * EXPERT_H..].to_vec();
-                swapped.extend_from_slice(&expert.gate_up_host[..EXPERT_I * EXPERT_H]);
-                let swapped = DenseMatrix::upload(swapped, 2 * EXPERT_I, EXPERT_H, &stream)?;
-                let wrong = gpu_expert(&stream, &swapped, &expert.down, &input.data)?;
+                let mut swapped =
+                    expert.gate_up_host[dims.shared_intermediate() * dims.hidden()..].to_vec();
+                swapped.extend_from_slice(
+                    &expert.gate_up_host[..dims.shared_intermediate() * dims.hidden()],
+                );
+                let swapped = DenseMatrix::upload(
+                    swapped,
+                    2 * dims.shared_intermediate(),
+                    dims.hidden(),
+                    &stream,
+                )?;
+                let wrong = gpu_expert(&stream, &swapped, &expert.down, &input.data, dims)?;
                 wrong_order = relative_max(&wrong, &expected_f64);
             }
         }
@@ -282,10 +222,12 @@ fn shared_expert_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 #[ignore = "needs Qwen3.6 weights"]
 fn shared_expert_gaussian_matches_f64() -> Result<(), Box<dyn std::error::Error>> {
-    let weights = Checkpoint::open(home("Models/qwen3.6-35b-a3b"))?;
+    let model_dir = home("Models/qwen3.6-35b-a3b");
+    let dims = moe_dims(&model_dir)?;
+    let weights = Checkpoint::open(model_dir)?;
     let device = Device::new(0)?;
     let stream = device.new_stream()?;
-    let gaussian: Vec<f32> = (0..EXPERT_H)
+    let gaussian: Vec<f32> = (0..dims.hidden())
         .map(|i| {
             let u = ((i * 37 % 2047) + 1) as f64 / 2048.0;
             let v = ((i * 199 % 2047) + 1) as f64 / 2048.0;
@@ -294,9 +236,9 @@ fn shared_expert_gaussian_matches_f64() -> Result<(), Box<dyn std::error::Error>
         .collect();
     let mut worst = 0.0f64;
     for layer in 0..4 {
-        let expert = load_expert(&weights, layer, &stream)?;
-        let actual = gpu_expert(&stream, &expert.gate_up, &expert.down, &gaussian)?;
-        let expected = cpu_expert(&gaussian, &expert);
+        let expert = load_expert(&weights, layer, &stream, dims)?;
+        let actual = gpu_expert(&stream, &expert.gate_up, &expert.down, &gaussian, dims)?;
+        let expected = cpu_expert(&gaussian, &expert, dims);
         worst = worst.max(relative_max(&actual, &expected));
     }
     println!("shared_expert Gaussian f64 max_relative={worst:.8e}");
@@ -705,5 +647,299 @@ fn attention_decode_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert!(worst_input < 1e-5 && worst_delta < 1e-5);
     assert!(wrong_scale > 1e-5 && wrong_gqa > 1e-5);
+    Ok(())
+}
+
+fn expert_outputs(
+    stream: &Arc<cuda_core::Stream>,
+    dims: MoeDims,
+    gate_up: &DenseMatrix<bf16>,
+    down: &DenseMatrix<bf16>,
+    x: &Tensor<f32>,
+    ids: &Tensor<i32>,
+) -> Result<Tensor<f32>, Box<dyn std::error::Error>> {
+    let mut projected =
+        api::zeros::<f32>(&[dims.top_k(), 2 * dims.intermediate()]).sync_on(stream)?;
+    expert_gemv(
+        gate_up,
+        &x.view(&[1, dims.hidden() / 32, 32])?,
+        ids,
+        projected.partition([1, DEFAULT_GEMV_TILE.rows]),
+        dims.experts(),
+        2 * dims.intermediate(),
+        dims.top_k(),
+        0,
+        DEFAULT_GEMV_TILE,
+    )
+    .sync_on(stream)?;
+    let mut activated = api::zeros::<f32>(&[dims.top_k(), dims.intermediate()]).sync_on(stream)?;
+    firepit_kernels::swiglu::swiglu(activated.partition([1, dims.intermediate()]), &projected)
+        .generics(vec![dims.intermediate().to_string()])
+        .sync_on(stream)?;
+    let mut outputs = api::zeros::<f32>(&[dims.top_k(), dims.hidden()]).sync_on(stream)?;
+    expert_gemv(
+        down,
+        &activated.view(&[dims.top_k(), dims.intermediate() / 32, 32])?,
+        ids,
+        outputs.partition([1, DEFAULT_GEMV_TILE.rows]),
+        dims.experts(),
+        dims.hidden(),
+        dims.top_k(),
+        1,
+        DEFAULT_GEMV_TILE,
+    )
+    .sync_on(stream)?;
+    Ok(outputs)
+}
+
+#[test]
+#[ignore = "needs Qwen3.6 weights and regenerated MoE reference trace"]
+fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
+    let model_dir = home("Models/qwen3.6-35b-a3b");
+    let dims = moe_dims(&model_dir)?;
+    let checkpoint = Checkpoint::open(model_dir)?;
+    let refs = SafetensorsFile::open(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../refs/qwen36-prefix4.safetensors"),
+    )?;
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let mut worst = [0.0f64; 4];
+    let mut near_ties = 0usize;
+    let mut wrong_renorm = 0.0f64;
+    let mut wrong_k = 0.0f64;
+    for layer in 0..4 {
+        let prefix = format!("model.language_model.layers.{layer}.mlp");
+        let router = checkpoint.tensor_bf16(&format!("{prefix}.gate.weight"))?;
+        assert_eq!(router.shape, [dims.experts(), dims.hidden()]);
+        let router_host = router.data.clone();
+        let router = DenseMatrix::upload(router.data, dims.experts(), dims.hidden(), &stream)?;
+        let gate_up = checkpoint.tensor_bf16(&format!("{prefix}.experts.gate_up_proj"))?;
+        assert_eq!(
+            gate_up.shape,
+            [dims.experts(), 2 * dims.intermediate(), dims.hidden()]
+        );
+        let gate_up = DenseMatrix::upload(
+            gate_up.data,
+            dims.experts() * 2 * dims.intermediate(),
+            dims.hidden(),
+            &stream,
+        )?;
+        let down = checkpoint.tensor_bf16(&format!("{prefix}.experts.down_proj"))?;
+        assert_eq!(
+            down.shape,
+            [dims.experts(), dims.hidden(), dims.intermediate()]
+        );
+        let down = DenseMatrix::upload(
+            down.data,
+            dims.experts() * dims.hidden(),
+            dims.intermediate(),
+            &stream,
+        )?;
+        let shared = load_expert(&checkpoint, layer, &stream, dims)?;
+        let shared_gate = checkpoint.tensor_bf16(&format!("{prefix}.shared_expert_gate.weight"))?;
+        assert_eq!(shared_gate.shape, [1, dims.hidden()]);
+        let shared_gate = DenseMatrix::upload(shared_gate.data, 1, dims.hidden(), &stream)?;
+        for step in 0..5 {
+            let key = format!("step{step}/layer{layer}/moe");
+            let input = refs.tensor(&format!("{key}/in"))?;
+            assert_eq!(input.shape, [dims.hidden()]);
+            let x = api::copy_host_vec_to_device(&Arc::new(input.data.clone()))
+                .reshape(&[1, dims.hidden()])
+                .sync_on(&stream)?;
+            let mut logits = api::zeros::<f32>(&[1, dims.experts()]).sync_on(&stream)?;
+            dense_gemv(
+                &router,
+                &x.view(&[1, dims.hidden() / 32, 32])?,
+                logits.partition([1, DEFAULT_GEMV_TILE.rows]),
+                DEFAULT_GEMV_TILE,
+            )
+            .sync_on(&stream)?;
+            let got_logits: Vec<f32> = logits.dup().to_host_vec().sync_on(&stream)?;
+            let hf_logits = refs.tensor(&format!("{key}/logits"))?;
+            assert_eq!(hf_logits.shape, [dims.experts()]);
+            let mut exact = Vec::with_capacity(dims.experts());
+            let mut magnitude = Vec::with_capacity(dims.experts());
+            for row in router_host.chunks_exact(dims.hidden()) {
+                let terms = row
+                    .iter()
+                    .zip(&input.data)
+                    .map(|(&w, &x)| w.to_f32() as f64 * x as f64);
+                exact.push(terms.clone().sum());
+                magnitude.push(terms.map(f64::abs).sum());
+            }
+            assert!(
+                check::inner_product_excess(&got_logits, &exact, &magnitude, dims.hidden()) <= 1.0
+            );
+            let logits_error = relative_max(
+                &got_logits,
+                &hf_logits.data.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+            );
+            worst[0] = worst[0].max(logits_error);
+            assert!(logits_error < 1e-5, "{key} router logits {logits_error}");
+
+            let padded = dims.top_k().next_power_of_two();
+            let mut ids = api::zeros::<i32>(&[padded]).sync_on(&stream)?;
+            let mut weights = api::zeros::<f32>(&[padded]).sync_on(&stream)?;
+            top_k(
+                &logits.view(&[dims.experts()])?,
+                ids.partition([padded]),
+                weights.partition([padded]),
+                dims.experts() as i32,
+                dims.top_k() as i32,
+            )
+            .generics(dims.top_k_generics())
+            .sync_on(&stream)?;
+            let got_ids: Vec<i32> = ids.dup().to_host_vec().sync_on(&stream)?;
+            let got_weights: Vec<f32> = weights.dup().to_host_vec().sync_on(&stream)?;
+            let hf_ids = refs.tensor(&format!("{key}/indices"))?;
+            let hf_weights = refs.tensor(&format!("{key}/weights"))?;
+            assert_eq!(hf_ids.shape, [dims.top_k()]);
+            assert_eq!(hf_weights.shape, [dims.top_k()]);
+            let mut has_near_tie = false;
+            for rank in 0..dims.top_k() {
+                let expected_id = hf_ids.data[rank] as usize;
+                let actual_id = got_ids[rank] as usize;
+                if actual_id != expected_id {
+                    let gap =
+                        (hf_logits.data[actual_id] - hf_logits.data[expected_id]).abs() as f64;
+                    let bound = 2.0
+                        * check::gamma_tilde(dims.hidden())
+                        * (magnitude[actual_id] + magnitude[expected_id]);
+                    assert!(
+                        gap <= bound,
+                        "{key} rank {rank}: expert gap {gap} > {bound}"
+                    );
+                    near_ties += 1;
+                    has_near_tie = true;
+                }
+            }
+            let weight_error = max_error(&got_weights[..dims.top_k()], &hf_weights.data) as f64;
+            worst[1] = worst[1].max(weight_error);
+            if !has_near_tie {
+                assert!(weight_error < 1e-5, "{key} top-k weights {weight_error}");
+            }
+
+            let mut hf_ids_padded: Vec<i32> = hf_ids.data.iter().map(|&v| v as i32).collect();
+            hf_ids_padded.resize(padded, 0);
+            let mut hf_weights_padded = hf_weights.data;
+            hf_weights_padded.resize(padded, 0.0);
+            let hf_ids_gpu =
+                api::copy_host_vec_to_device(&Arc::new(hf_ids_padded)).sync_on(&stream)?;
+            let hf_weights_gpu =
+                api::copy_host_vec_to_device(&Arc::new(hf_weights_padded)).sync_on(&stream)?;
+            let hf_outputs = expert_outputs(&stream, dims, &gate_up, &down, &x, &hf_ids_gpu)?;
+            let zero_shared = api::zeros::<f32>(&[1, dims.hidden()]).sync_on(&stream)?;
+            let zero_gate = api::zeros::<f32>(&[1, 1]).sync_on(&stream)?;
+            let mut routed = api::zeros::<f32>(&[1, dims.hidden()]).sync_on(&stream)?;
+            combine(
+                routed.partition([1, dims.hidden()]),
+                &hf_outputs,
+                &hf_weights_gpu,
+                &zero_shared,
+                &zero_gate,
+                dims.top_k() as i32,
+            )
+            .generics(dims.combine_generics())
+            .sync_on(&stream)?;
+            let got_routed: Vec<f32> = routed.to_host_vec().sync_on(&stream)?;
+            let hf_routed = refs.tensor(&format!("{key}/routed"))?;
+            let routed_error = relative_max(
+                &got_routed,
+                &hf_routed.data.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+            );
+            worst[2] = worst[2].max(routed_error);
+            assert!(routed_error < 1e-5, "{key} routed {routed_error}");
+
+            if layer == 0 && step == 0 {
+                let maximum = hf_logits
+                    .data
+                    .iter()
+                    .copied()
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let denominator: f64 = hf_logits
+                    .data
+                    .iter()
+                    .map(|&v| ((v - maximum) as f64).exp())
+                    .sum();
+                let mut no_renorm: Vec<f32> = hf_ids
+                    .data
+                    .iter()
+                    .map(|&id| {
+                        (((hf_logits.data[id as usize] - maximum) as f64).exp() / denominator)
+                            as f32
+                    })
+                    .collect();
+                no_renorm.resize(padded, 0.0);
+                let mut top_k_minus_one = hf_weights_gpu.dup().to_host_vec().sync_on(&stream)?;
+                top_k_minus_one[dims.top_k() - 1] = 0.0;
+                let sum: f32 = top_k_minus_one[..dims.top_k() - 1].iter().sum();
+                for weight in &mut top_k_minus_one[..dims.top_k() - 1] {
+                    *weight /= sum;
+                }
+                let wrong_output =
+                    |scores: Vec<f32>| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+                        let scores =
+                            api::copy_host_vec_to_device(&Arc::new(scores)).sync_on(&stream)?;
+                        let mut out = api::zeros::<f32>(&[1, dims.hidden()]).sync_on(&stream)?;
+                        combine(
+                            out.partition([1, dims.hidden()]),
+                            &hf_outputs,
+                            &scores,
+                            &zero_shared,
+                            &zero_gate,
+                            dims.top_k() as i32,
+                        )
+                        .generics(dims.combine_generics())
+                        .sync_on(&stream)?;
+                        Ok(out.to_host_vec().sync_on(&stream)?)
+                    };
+                let target: Vec<f64> = hf_routed.data.iter().map(|&v| v as f64).collect();
+                wrong_renorm = relative_max(&wrong_output(no_renorm)?, &target);
+                wrong_k = relative_max(&wrong_output(top_k_minus_one)?, &target);
+                assert!(wrong_renorm > 1e-5 && wrong_k > 1e-5);
+            }
+
+            let own_outputs = expert_outputs(&stream, dims, &gate_up, &down, &x, &ids)?;
+            let shared_output =
+                gpu_expert_tensor(&stream, &shared.gate_up, &shared.down, &x, dims)?;
+            let mut gate = api::zeros::<f32>(&[1, 1]).sync_on(&stream)?;
+            dense_gemv(
+                &shared_gate,
+                &x.view(&[1, dims.hidden() / 32, 32])?,
+                gate.partition([1, 1]),
+                GemvTile {
+                    rows: 1,
+                    blocks: DEFAULT_GEMV_TILE.blocks,
+                },
+            )
+            .sync_on(&stream)?;
+            let mut delta = api::zeros::<f32>(&[1, dims.hidden()]).sync_on(&stream)?;
+            combine(
+                delta.partition([1, dims.hidden()]),
+                &own_outputs,
+                &weights,
+                &shared_output,
+                &gate,
+                dims.top_k() as i32,
+            )
+            .generics(dims.combine_generics())
+            .sync_on(&stream)?;
+            let got_delta: Vec<f32> = delta.to_host_vec().sync_on(&stream)?;
+            let hf_delta = refs.tensor(&format!("{key}/delta"))?;
+            let delta_error = relative_max(
+                &got_delta,
+                &hf_delta.data.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+            );
+            worst[3] = worst[3].max(delta_error);
+            assert!(delta_error < 1e-5, "{key} delta {delta_error}");
+            println!(
+                "layer{layer} step{step} logits={logits_error:.8e} top_weights={weight_error:.8e} routed={routed_error:.8e} delta={delta_error:.8e}"
+            );
+        }
+    }
+    println!(
+        "MoE HF 4x5 worst logits={:.8e} top_weights={:.8e} routed={:.8e} delta={:.8e} near_ties={near_ties} no_renorm={wrong_renorm:.8e} top_k_minus_one={wrong_k:.8e}",
+        worst[0], worst[1], worst[2], worst[3]
+    );
     Ok(())
 }
