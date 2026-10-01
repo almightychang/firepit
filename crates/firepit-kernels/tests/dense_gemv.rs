@@ -45,7 +45,7 @@ fn gpu<T: DType + ElementType>(
 #[test]
 fn dense_matches_f64_oracle() {
     let stream = common::stream();
-    common::runner(8, file!())
+    common::runner(64, file!())
         .run(&strategy::dense_case(), |case| {
             let f32_out = gpu(
                 &stream,
@@ -57,7 +57,11 @@ fn dense_matches_f64_oracle() {
             .map_err(|e| TestCaseError::fail(e.to_string()))?;
             prop_assert_eq!(f32_out.len(), case.batch * case.rows);
             let expected = oracle::dense(&case.weights, &case.input, case.rows, case.cols);
-            prop_assert!(check::max_relative(&f32_out, &expected) < 5e-4);
+            let magnitude =
+                oracle::dense_magnitude(&case.weights, &case.input, case.rows, case.cols);
+            prop_assert!(
+                check::inner_product_excess(&f32_out, &expected, &magnitude, case.cols) <= 1.0
+            );
 
             let bf16_weights: Vec<bf16> =
                 case.weights.iter().copied().map(bf16::from_f32).collect();
@@ -65,7 +69,10 @@ fn dense_matches_f64_oracle() {
             let bf16_out = gpu(&stream, bf16_weights, &case.input, case.rows, case.cols)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
             let expected = oracle::dense(&rounded, &case.input, case.rows, case.cols);
-            prop_assert!(check::max_relative(&bf16_out, &expected) < 5e-4);
+            let magnitude = oracle::dense_magnitude(&rounded, &case.input, case.rows, case.cols);
+            prop_assert!(
+                check::inner_product_excess(&bf16_out, &expected, &magnitude, case.cols) <= 1.0
+            );
             Ok(())
         })
         .unwrap();

@@ -38,7 +38,7 @@ fn gpu(
 #[test]
 fn rms_norm_matches_f64_oracle() {
     let stream = common::stream();
-    common::runner(8, file!())
+    common::runner(64, file!())
         .run(&strategy::norm_case(), |case| {
             let actual = gpu(&stream, &case.input, &case.gamma, case.eps)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;

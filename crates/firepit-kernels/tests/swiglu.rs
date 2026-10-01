@@ -29,7 +29,7 @@ fn gpu(
 #[test]
 fn swiglu_matches_f64_oracle() {
     let stream = common::stream();
-    common::runner(12, file!())
+    common::runner(64, file!())
         .run(&strategy::swiglu_case(), |case| {
             let actual = gpu(&stream, &case.gate_up, case.width)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;

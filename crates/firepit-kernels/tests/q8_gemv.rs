@@ -45,7 +45,7 @@ fn gpu(
 #[test]
 fn q8_matches_f64_oracle() {
     let stream = common::stream();
-    common::runner(8, file!())
+    common::runner(64, file!())
         .run(&strategy::q8_case(), |case| {
             let scales: Vec<f16> = case.scales.iter().copied().map(f16::from_f32).collect();
             let actual = gpu(
@@ -60,7 +60,15 @@ fn q8_matches_f64_oracle() {
             .map_err(|e| TestCaseError::fail(e.to_string()))?;
             prop_assert_eq!(actual.len(), case.batch * case.rows);
             let expected = oracle::q8(&case.qs, &scales, &case.input, case.rows, case.cols);
-            prop_assert!(check::max_relative(&actual, &expected) < 5e-4);
+            let magnitude = oracle::dense_magnitude(
+                &oracle::q8_weights(&case.qs, &scales),
+                &case.input,
+                case.rows,
+                case.cols,
+            );
+            prop_assert!(
+                check::inner_product_excess(&actual, &expected, &magnitude, case.cols + 2) <= 1.0
+            );
             Ok(())
         })
         .unwrap();
@@ -153,7 +161,9 @@ fn model_shapes() -> Result<(), Box<dyn std::error::Error>> {
         };
         let actual = gpu(&stream, &qs, &scales, &input, rows, cols, tile)?;
         let expected = oracle::q8(&qs, &scales, &input, rows, cols);
-        assert!(check::max_relative(&actual, &expected) < 2e-4);
+        let magnitude =
+            oracle::dense_magnitude(&oracle::q8_weights(&qs, &scales), &input, rows, cols);
+        assert!(check::inner_product_excess(&actual, &expected, &magnitude, cols + 2) <= 1.0);
     }
     Ok(())
 }

@@ -8,6 +8,6 @@ case "${1:-}" in
 esac
 library_path=/usr/local/cuda/lib64
 [[ ${FIREPIT_CUDA_COMPAT:-0} == 1 ]] && library_path=/usr/local/cuda/compat:$library_path
-container -e "LD_LIBRARY_PATH=$library_path" \
+container -e "LD_LIBRARY_PATH=$library_path" -e PROPTEST_CASES \
   -e CARGO_TARGET_DIR=/work/target-c13 -e XDG_CACHE_HOME=/work/target-c13/cache \
   -w /work "$image" cargo "${args[@]}"

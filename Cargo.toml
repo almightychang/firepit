@@ -18,3 +18,6 @@ cutile-ir = { path = "vendor/cutile-rs/cutile-ir" }
 cutile-compiler = { path = "vendor/cutile-rs/cutile-compiler" }
 cutile-macro = { path = "vendor/cutile-rs/cutile-macro" }
 cutile = { path = "vendor/cutile-rs/cutile" }
+
+[profile.test]
+opt-level = 2

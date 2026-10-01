@@ -12,15 +12,23 @@ pub fn dense(weights: &[f32], input: &[f32], rows: usize, cols: usize) -> Vec<f6
     output
 }
 
+pub fn dense_magnitude(weights: &[f32], input: &[f32], rows: usize, cols: usize) -> Vec<f64> {
+    let weights: Vec<f32> = weights.iter().map(|w| w.abs()).collect();
+    let input: Vec<f32> = input.iter().map(|x| x.abs()).collect();
+    dense(&weights, &input, rows, cols)
+}
+
+pub fn q8_weights(qs: &[i8], scales: &[f16]) -> Vec<f32> {
+    qs.iter()
+        .enumerate()
+        .map(|(i, &q)| q as f32 * scales[i / 32].to_f32())
+        .collect()
+}
+
 pub fn q8(qs: &[i8], scales: &[f16], input: &[f32], rows: usize, cols: usize) -> Vec<f64> {
     assert_eq!(qs.len(), rows * cols);
     assert_eq!(scales.len(), rows * cols / 32);
-    let weights: Vec<f32> = qs
-        .iter()
-        .enumerate()
-        .map(|(i, &q)| q as f32 * scales[i / 32].to_f32())
-        .collect();
-    dense(&weights, input, rows, cols)
+    dense(&q8_weights(qs, scales), input, rows, cols)
 }
 
 pub fn rms_norm(input: &[f32], gamma: &[f32], eps: f32) -> Vec<f64> {

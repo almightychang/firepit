@@ -1,4 +1,5 @@
 use proptest::prelude::*;
+use proptest::test_runner::TestRng;
 
 #[derive(Clone, Debug)]
 pub struct DenseCase {
@@ -35,27 +36,35 @@ pub struct SwigluCase {
     pub gate_up: Vec<f32>,
 }
 
-pub fn scalar() -> impl Strategy<Value = f32> {
-    prop_oneof![
-        5 => prop::collection::vec(-1.0f32..1.0, 6).prop_map(|v| v.into_iter().sum()),
-        2 => Just(0.0f32),
-        2 => -8.0f32..8.0,
-        1 => prop::sample::select(vec![-32.0f32, 32.0]),
-    ]
+fn unit(rng: &mut TestRng) -> f32 {
+    rng.random_range(-1.0f32..1.0)
+}
+
+fn scalar(rng: &mut TestRng) -> f32 {
+    match rng.random_range(0..10) {
+        0..5 => (0..6).map(|_| unit(rng)).sum(),
+        5..7 => 0.0,
+        7..9 => 8.0 * unit(rng),
+        _ => 32.0f32.copysign(unit(rng)),
+    }
+}
+
+pub fn values(len: usize) -> impl Strategy<Value = Vec<f32>> {
+    Just(len).prop_perturb(|len, mut rng| (0..len).map(|_| scalar(&mut rng)).collect())
 }
 
 pub fn dense_case() -> impl Strategy<Value = DenseCase> {
     (
-        1usize..=4,
-        1usize..=4,
+        1usize..=64,
+        1usize..=16,
         prop::sample::select(vec![1usize, 2, 3, 4]),
     )
         .prop_flat_map(|(row_tiles, col_tiles, batch)| {
             let (rows, cols) = (row_tiles * 16, col_tiles * 128);
             (
                 Just((rows, cols, batch)),
-                prop::collection::vec(scalar(), rows * cols),
-                prop::collection::vec(scalar(), batch * cols),
+                values(rows * cols),
+                values(batch * cols),
             )
         })
         .prop_map(|((rows, cols, batch), weights, input)| DenseCase {
@@ -69,8 +78,8 @@ pub fn dense_case() -> impl Strategy<Value = DenseCase> {
 
 pub fn q8_case() -> impl Strategy<Value = Q8Case> {
     (
-        1usize..=4,
-        1usize..=4,
+        1usize..=64,
+        1usize..=16,
         prop::sample::select(vec![1usize, 2, 3, 4]),
     )
         .prop_flat_map(|(row_tiles, col_tiles, batch)| {
@@ -79,7 +88,7 @@ pub fn q8_case() -> impl Strategy<Value = Q8Case> {
                 Just((rows, cols, batch)),
                 prop::collection::vec(-8i8..9, rows * cols),
                 prop::collection::vec(1u8..17, rows * cols / 32),
-                prop::collection::vec(scalar(), batch * cols),
+                values(batch * cols),
             )
         })
         .prop_map(|((rows, cols, batch), qs, scales, input)| Q8Case {
@@ -94,15 +103,15 @@ pub fn q8_case() -> impl Strategy<Value = Q8Case> {
 
 pub fn norm_case() -> impl Strategy<Value = NormCase> {
     (
-        prop::sample::select(vec![32usize, 64, 128]),
+        prop::sample::select(vec![32usize, 128, 2048]),
         prop::sample::select(vec![1usize, 2, 4]),
         prop::sample::select(vec![1e-5f32, 1e-6]),
     )
         .prop_flat_map(|(width, batch, eps)| {
             (
                 Just((width, batch, eps)),
-                prop::collection::vec(scalar(), width * batch),
-                prop::collection::vec(scalar(), width),
+                values(width * batch),
+                values(width),
             )
         })
         .prop_map(|((width, batch, eps), input, gamma)| NormCase {
@@ -116,15 +125,10 @@ pub fn norm_case() -> impl Strategy<Value = NormCase> {
 
 pub fn swiglu_case() -> impl Strategy<Value = SwigluCase> {
     (
-        prop::sample::select(vec![32usize, 64, 128]),
+        prop::sample::select(vec![32usize, 128, 512]),
         prop::sample::select(vec![1usize, 2, 3, 4]),
     )
-        .prop_flat_map(|(width, batch)| {
-            (
-                Just((width, batch)),
-                prop::collection::vec(scalar(), 2 * width * batch),
-            )
-        })
+        .prop_flat_map(|(width, batch)| (Just((width, batch)), values(2 * width * batch)))
         .prop_map(|((width, batch), gate_up)| SwigluCase {
             width,
             batch,

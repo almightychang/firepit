@@ -15,7 +15,10 @@ pub fn stream() -> Arc<Stream> {
 
 pub fn runner(cases: u32, source_file: &'static str) -> proptest::test_runner::TestRunner {
     proptest::test_runner::TestRunner::new(proptest::test_runner::Config {
-        cases,
+        cases: std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(cases),
         source_file: Some(source_file),
         failure_persistence: Some(Box::new(
             proptest::test_runner::FileFailurePersistence::WithSource("proptest-regressions"),
