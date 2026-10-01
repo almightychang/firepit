@@ -6,14 +6,12 @@ mod kernels {
     pub fn conv1d_silu<const STATE_TILE: i32>(
         out: &mut Tensor<f32, { [1] }>,
         input: &Tensor<f32, { [-1] }>,
-        prior: &Tensor<f32, { [-1, -1] }>,
         state: &mut Tensor<f32, { [1, STATE_TILE] }>,
         weight: &Tensor<f32, { [-1, -1] }>,
         kernel_size: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
-        let previous: Tile<f32, { [1, STATE_TILE] }> =
-            prior.partition(shape![1, STATE_TILE]).load([pid.0, 0]);
+        let previous: Tile<f32, { [1, STATE_TILE] }> = state.load();
         let taps = weight.partition(shape![1, 1]);
         let mut sum: Tile<f32, { [1] }> = constant(0.0f32, shape![1]);
         for tap in 0i32..(kernel_size - 1i32) {

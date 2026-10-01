@@ -119,12 +119,10 @@ fn gdn_projection_and_conv_match_hf() -> Result<(), Box<dyn std::error::Error>> 
             let mut state = api::copy_host_vec_to_device(&Arc::new(state_host))
                 .reshape(&[dims.conv_dim(), dims.conv_kernel() - 1])
                 .sync_on(&stream)?;
-            let prior = state.dup().sync_on(&stream)?;
             let mut output = api::zeros::<f32>(&[dims.conv_dim()]).sync_on(&stream)?;
             conv1d_silu(
                 (&mut output).partition([1]),
                 &qkv_gpu,
-                &prior,
                 state.partition([1, (dims.conv_kernel() - 1).next_power_of_two()]),
                 &conv_w,
                 dims.conv_kernel() as i32,

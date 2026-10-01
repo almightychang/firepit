@@ -41,7 +41,6 @@ fn gpu_step(
     let mut s = api::copy_host_vec_to_device(&Arc::new(state.to_vec()))
         .reshape(&[channels, kernel - 1])
         .sync_on(stream)?;
-    let previous = s.dup().sync_on(stream)?;
     let w = api::copy_host_vec_to_device(&Arc::new(weight.to_vec()))
         .reshape(&[channels, kernel])
         .sync_on(stream)?;
@@ -49,7 +48,6 @@ fn gpu_step(
     conv1d_silu(
         (&mut out).partition([1]),
         &x,
-        &previous,
         s.partition([1, (kernel - 1).next_power_of_two()]),
         &w,
         kernel as i32,
