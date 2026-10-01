@@ -181,12 +181,15 @@ fn detects_reversed_taps_and_stale_state() -> Result<(), Box<dyn std::error::Err
 
 #[test]
 fn rejects_invalid_dimensions() {
-    assert!(GdnDims::new(2048, 16, 32, 128, 128, 4).is_ok());
+    assert!(GdnDims::new(2048, 16, 32, 128, 128, 4, 1e-6).is_ok());
     for dims in [
         (0, 16, 32, 128, 128, 4),
         (2048, 0, 32, 128, 128, 4),
         (2048, 16, 32, 128, 128, 1),
+        (2048, 3, 4, 128, 128, 4),
+        (2048, 16, 32, 96, 128, 4),
     ] {
-        assert!(GdnDims::new(dims.0, dims.1, dims.2, dims.3, dims.4, dims.5).is_err());
+        assert!(GdnDims::new(dims.0, dims.1, dims.2, dims.3, dims.4, dims.5, 1e-6).is_err());
     }
+    assert!(GdnDims::new(2048, 16, 32, 128, 128, 4, 0.0).is_err());
 }

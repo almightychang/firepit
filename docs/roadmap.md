@@ -41,6 +41,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 
  E7. 하드웨어 aware 값 자동화                                       ○
     ○ GDN conv1d 채널 타일: 고정 타일 크기를 장치와 채널 수에 맞춰 선택
+    ○ GDN delta rule value 열 타일: 현재 32열을 장치와 head 차원에 맞춰 선택
     ○ GEMV 행 타일(BN): DEFAULT_GEMV_TILE 고정값 → row_tile 같은 SM 채우기 규칙
     ○ 행이 적은 행렬(MoE expert 등)이 SM을 못 채우면 split-K
     ○ GEMV 열 타일(NB): batch·레지스터 압박에 따라 autotune 또는 규칙
@@ -71,7 +72,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 | 2.5 Attention ② | KV cache, GQA, softmax, output gate | attention layer 하나가 여러 step에서 일치 | ✔ |
 | 2.6 MoE | router, top-8 선택, expert 가중합 | MoE 블록 하나가 일치 | ✔ |
 | 2.7 GDN ① | causal conv1d, conv state | conv 출력 일치 | ✔ |
-| 2.8 GDN ② | gating(α, β), delta rule 상태 갱신, 출력 gate | GDN layer 하나가 여러 step에서 일치 | ○ |
+| 2.8 GDN ② | gating(α, β), delta rule 상태 갱신, 출력 gate | GDN layer 하나가 여러 step에서 일치 | ✔ |
 | 2.9 전부 쌓기 | layer stack, tokenizer, greedy decode | 실제 문장 생성 | ○ |
 
 순서는 쉬운 개념부터 쌓는다. 각 개념이 다음 개념의 전제가 된다. cuTile 표현력의 한계는 2.6(MoE, 간접 읽기)과 2.8(GDN)에서 만난다.
@@ -97,6 +98,7 @@ scripts/dev.sh test -p firepit --test reference -- --ignored
 - 2.6: router logits, top-k 번호·가중치, routed 합, MoE Δx를 layer 0~3의 5 step과 비교했다. 최대 상대오차는 logits `3.82721087e-7`, routed 합 `4.32246025e-7`, Δx `1.40249628e-6`; top-k 가중치 최대 절대오차 `1.49011612e-7`, 번호 불일치 0건. 재정규화 누락과 top-(k−1) 대조 상대오차는 `5.30466856e-1`, `7.22364042e-2`. `expert_gemv`는 기존 dense GEMV와 본문이 비슷하다. 이슈 002의 cuTile macro 문제 해결 후 중복 제거를 검토한다.
 - 2.6 후속: `ExpertSelection`으로 device 번호와 가중치를 함께 보유한다. GPU top-k 또는 host 입력 검증으로만 생성하며 expert GEMV와 결합은 이 타입을 받는다.
 - 2.7: GDN 입력 projection 4개는 공개 GEMV를 각각 호출한다. 채널별 causal conv+SiLU와 state 갱신은 한 커널에서 수행한다. state는 `state.load()`와 `state.store()`로 같은 block 안에서 제자리 갱신한다. HF cache는 `[1, conv_dim, kernel]`, 커널 state는 마지막 `kernel−1` 값인 `[conv_dim, kernel−1]`이다. layer 0~2 × 5 step에서 q/k/v와 state를 비교했다.
+- 2.8: GDN delta rule은 `(value head, value 열 타일)`당 block 하나에서 q/k l2norm, β·g, state 감쇠·갱신·출력을 처리한다. 기존 RMSNorm 뒤에 SiLU gate를 적용하고 기존 GEMV로 `out_proj`를 계산한다. layer 0~2 × 5 step에서 core, recurrent state, gated norm, Δx를 HF와 비교했다.
 
 ## 확인할 것
 

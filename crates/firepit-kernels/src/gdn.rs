@@ -43,9 +43,86 @@ mod kernels {
         }
         state.store(shifted);
     }
+
+    #[cutile::entry()]
+    pub fn delta_step<const KEY_HEADS: i32, const VALUE_HEADS: i32, const DK: i32, const T: i32>(
+        out: &mut Tensor<f32, { [1, 1, T] }>,
+        state: &mut Tensor<f32, { [1, DK, T] }>,
+        query: &Tensor<f32, { [-1, DK] }>,
+        key: &Tensor<f32, { [-1, DK] }>,
+        value: &Tensor<f32, { [-1, -1] }>,
+        b: &Tensor<f32, { [-1] }>,
+        a: &Tensor<f32, { [-1] }>,
+        a_log: &Tensor<f32, { [-1] }>,
+        dt_bias: &Tensor<f32, { [-1] }>,
+        eps: f32,
+        inv_sqrt_dk: f32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let head = pid.0;
+        let key_head = head / (VALUE_HEADS / KEY_HEADS);
+        let q: Tile<f32, { [1, DK] }> = query.partition(shape![1, DK]).load([key_head, 0]);
+        let k: Tile<f32, { [1, DK] }> = key.partition(shape![1, DK]).load([key_head, 0]);
+        let q_norm: Tile<f32, { [1] }> = reduce_sum(q * q, 1);
+        let k_norm: Tile<f32, { [1] }> = reduce_sum(k * k, 1);
+        let q_scale = rsqrt(q_norm + eps.broadcast(shape![1]), ftz::Disabled)
+            * inv_sqrt_dk.broadcast(shape![1]);
+        let k_scale = rsqrt(k_norm + eps.broadcast(shape![1]), ftz::Disabled);
+        let q: Tile<f32, { [1, DK, T] }> =
+            (q * q_scale.reshape(shape![1, 1]).broadcast(shape![1, DK]))
+                .reshape(shape![1, DK, 1])
+                .broadcast(shape![1, DK, T]);
+        let k: Tile<f32, { [1, DK, T] }> =
+            (k * k_scale.reshape(shape![1, 1]).broadcast(shape![1, DK]))
+                .reshape(shape![1, DK, 1])
+                .broadcast(shape![1, DK, T]);
+
+        let b: Tile<f32, { [1] }> = b.partition(shape![1]).load([head]);
+        let a: Tile<f32, { [1] }> = a.partition(shape![1]).load([head]);
+        let a_log: Tile<f32, { [1] }> = a_log.partition(shape![1]).load([head]);
+        let dt: Tile<f32, { [1] }> = dt_bias.partition(shape![1]).load([head]);
+        let one: Tile<f32, { [1] }> = constant(1.0f32, shape![1]);
+        let zero: Tile<f32, { [1] }> = constant(0.0f32, shape![1]);
+        let negative: Tile<f32, { [1] }> = constant(-1.0f32, shape![1]);
+        let beta = one / (one + exp(b * negative));
+        let x = a + dt;
+        let tiny = exp(min_tile(x, zero));
+        let series = tiny - tiny * tiny * constant(0.5f32, shape![1])
+            + tiny * tiny * tiny * constant(0.33333334f32, shape![1]);
+        let ordinary = max_tile(x, zero) + log(one + exp(absf(x) * negative));
+        let cutoff: Tile<f32, { [1] }> = constant(-8.0f32, shape![1]);
+        let softplus = select(lt_tile(x, cutoff), series, ordinary);
+        let decay = exp(exp(a_log) * softplus * negative);
+
+        let old: Tile<f32, { [1, DK, T] }> = state.load();
+        let decayed = old * decay.reshape(shape![1, 1, 1]).broadcast(shape![1, DK, T]);
+        let memory: Tile<f32, { [1, 1, T] }> = reduce_sum(decayed * k, 1);
+        let memory: Tile<f32, { [1, T] }> = memory.reshape(shape![1, T]);
+        let v: Tile<f32, { [1, T] }> = value.partition(shape![1, T]).load([head, pid.2]);
+        let delta = (v - memory) * beta.reshape(shape![1, 1]).broadcast(shape![1, T]);
+        let next = decayed + k * delta.reshape(shape![1, 1, T]).broadcast(shape![1, DK, T]);
+        state.store(next);
+        let result: Tile<f32, { [1, 1, T] }> = reduce_sum(next * q, 1);
+        let result: Tile<f32, { [1, T] }> = result.reshape(shape![1, T]);
+        out.store(result.reshape(shape![1, 1, T]));
+    }
+
+    #[cutile::entry()]
+    pub fn gated_silu<const DV: i32>(
+        out: &mut Tensor<f32, { [1, DV] }>,
+        input: &Tensor<f32, { [-1, DV] }>,
+        gate: &Tensor<f32, { [-1, DV] }>,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let x: Tile<f32, { [1, DV] }> = input.partition(shape![1, DV]).load([pid.0, 0]);
+        let z: Tile<f32, { [1, DV] }> = gate.partition(shape![1, DV]).load([pid.0, 0]);
+        let one: Tile<f32, { [1, DV] }> = constant(1.0f32, shape![1, DV]);
+        let negative: Tile<f32, { [1, DV] }> = constant(-1.0f32, shape![1, DV]);
+        out.store(x * z / (one + exp(z * negative)));
+    }
 }
 
-pub use kernels::conv1d_silu;
+pub use kernels::{conv1d_silu, delta_step, gated_silu};
 
 use crate::weights::Q8_BLOCK;
 
@@ -69,6 +146,7 @@ pub struct GdnDims {
     value_head_dim: usize,
     conv_kernel: usize,
     conv_dim: usize,
+    eps: f32,
 }
 
 impl GdnDims {
@@ -79,6 +157,7 @@ impl GdnDims {
         key_head_dim: usize,
         value_head_dim: usize,
         conv_kernel: usize,
+        eps: f32,
     ) -> Result<Self, GdnDimensionError> {
         let valid = (|| {
             let key_dim = key_heads.checked_mul(key_head_dim)?;
@@ -89,13 +168,23 @@ impl GdnDims {
                 && hidden % Q8_BLOCK == 0
                 && key_heads > 0
                 && value_heads > 0
+                && value_heads % key_heads == 0
                 && key_head_dim > 0
+                && key_head_dim.is_power_of_two()
                 && value_head_dim > 0
+                && value_head_dim.is_power_of_two()
                 && conv_kernel >= 2
+                && eps.is_finite()
+                && eps > 0.0
                 && hidden <= i32::MAX as usize
                 && value_heads <= i32::MAX as usize
                 && conv_dim <= i32::MAX as usize
+                && value_dim % Q8_BLOCK == 0
                 && state_tile <= i32::MAX as usize
+                && value_heads
+                    .checked_mul(key_head_dim)?
+                    .checked_mul(value_head_dim)?
+                    <= i32::MAX as usize
                 && conv_dim.checked_mul(conv_kernel)? <= i32::MAX as usize)
                 .then_some(conv_dim)
         })();
@@ -108,6 +197,7 @@ impl GdnDims {
             value_head_dim,
             conv_kernel,
             conv_dim,
+            eps,
         })
     }
 
@@ -138,7 +228,21 @@ impl GdnDims {
     pub fn conv_dim(self) -> usize {
         self.conv_dim
     }
+    pub fn eps(self) -> f32 {
+        self.eps
+    }
+    pub fn inv_sqrt_key_dim(self) -> f32 {
+        1.0 / (self.key_head_dim as f32).sqrt()
+    }
     pub fn conv_generics(self) -> Vec<String> {
         vec![(self.conv_kernel - 1).next_power_of_two().to_string()]
+    }
+    pub fn delta_generics(self, value_tile: usize) -> Vec<String> {
+        vec![
+            self.key_heads.to_string(),
+            self.value_heads.to_string(),
+            self.key_head_dim.to_string(),
+            value_tile.to_string(),
+        ]
     }
 }

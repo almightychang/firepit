@@ -5,7 +5,7 @@ use cutile::tensor::{PartitionMut, Tensor, ToHostVec};
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit::{Checkpoint, SafetensorsFile};
 use firepit_kernels::attention::{AttentionDims, cache_append, online_attention, output_gate};
-use firepit_kernels::gdn::{GdnDims, conv1d_silu};
+use firepit_kernels::gdn::{GdnDims, conv1d_silu, delta_step, gated_silu};
 use firepit_kernels::gemv::expert_gemv;
 use firepit_kernels::gemv::gemv;
 use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile};
@@ -32,6 +32,9 @@ fn gdn_dims(model_dir: &std::path::Path) -> Result<GdnDims, Box<dyn std::error::
         get("linear_key_head_dim")?,
         get("linear_value_head_dim")?,
         get("linear_conv_kernel_dim")?,
+        text["rms_norm_eps"]
+            .as_f64()
+            .ok_or("missing rms_norm_eps")? as f32,
     )?)
 }
 
@@ -174,6 +177,231 @@ fn gdn_projection_and_conv_match_hf() -> Result<(), Box<dyn std::error::Error>> 
     }
     println!(
         "GDN worst projection_excess={worst_projection:?} conv_abs={worst_conv:?} state_abs={worst_state:.8e} first_path_abs={first_path:.8e}"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Qwen3.6 weights and regenerated GDN delta trace"]
+fn gdn_delta_norm_and_output_match_hf() -> Result<(), Box<dyn std::error::Error>> {
+    let model_dir = home("Models/qwen3.6-35b-a3b");
+    let dims = gdn_dims(&model_dir)?;
+    let weights = Checkpoint::open(&model_dir)?;
+    let refs = SafetensorsFile::open(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../refs/qwen36-prefix4.safetensors"),
+    )?;
+    let tokens: Vec<usize> = serde_json::from_str(refs.metadata("tokens").ok_or("no tokens")?)?;
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let mut worst = [0.0f64; 4];
+    let mut first_chunk_core = 0.0f32;
+    let mut first_chunk_state = 0.0f32;
+    let mut wrong_gamma = 0.0f64;
+    let tile = 32;
+    for layer in 0..3 {
+        let prefix = format!("model.language_model.layers.{layer}.linear_attn");
+        let a_log = weights.tensor(&format!("{prefix}.A_log"))?;
+        let dt_bias = weights.tensor(&format!("{prefix}.dt_bias"))?;
+        let norm_weight = weights.tensor(&format!("{prefix}.norm.weight"))?;
+        let projection = weights.tensor_bf16(&format!("{prefix}.out_proj.weight"))?;
+        assert_eq!(a_log.shape, [dims.value_heads()]);
+        assert_eq!(dt_bias.shape, [dims.value_heads()]);
+        assert_eq!(norm_weight.shape, [dims.value_head_dim()]);
+        assert_eq!(projection.shape, [dims.hidden(), dims.value_dim()]);
+        let out_host = projection.data;
+        let out_weight = Weight::Dense(DenseMatrix::upload(
+            out_host.clone(),
+            dims.hidden(),
+            dims.value_dim(),
+            &stream,
+        )?);
+        let upload =
+            |data: Vec<f32>| api::copy_host_vec_to_device(&Arc::new(data)).sync_on(&stream);
+        let a_log_gpu = upload(a_log.data)?;
+        let dt_gpu = upload(dt_bias.data)?;
+        let gamma = upload(norm_weight.data.clone())?;
+        for step in 0..tokens.len() {
+            let key = format!("step{step}/layer{layer}/gdn");
+            let q = refs.tensor(&format!("{key}/q"))?;
+            let k = refs.tensor(&format!("{key}/k"))?;
+            let v = refs.tensor(&format!("{key}/v"))?;
+            let b = refs.tensor(&format!("{key}/b"))?;
+            let a = refs.tensor(&format!("{key}/a"))?;
+            let prior = refs.tensor(&format!("{key}/recurrent_before"))?;
+            assert_eq!(
+                prior.shape,
+                [
+                    dims.value_heads(),
+                    dims.key_head_dim(),
+                    dims.value_head_dim()
+                ]
+            );
+            let q = api::copy_host_vec_to_device(&Arc::new(q.data))
+                .reshape(&[dims.key_heads(), dims.key_head_dim()])
+                .sync_on(&stream)?;
+            let k = api::copy_host_vec_to_device(&Arc::new(k.data))
+                .reshape(&[dims.key_heads(), dims.key_head_dim()])
+                .sync_on(&stream)?;
+            let v = api::copy_host_vec_to_device(&Arc::new(v.data))
+                .reshape(&[dims.value_heads(), dims.value_head_dim()])
+                .sync_on(&stream)?;
+            let b = upload(b.data)?;
+            let a = upload(a.data)?;
+            let mut state = api::copy_host_vec_to_device(&Arc::new(prior.data))
+                .reshape(&[
+                    dims.value_heads(),
+                    dims.key_head_dim(),
+                    dims.value_head_dim(),
+                ])
+                .sync_on(&stream)?;
+            let mut core = api::zeros::<f32>(&[dims.value_heads(), 1, dims.value_head_dim()])
+                .sync_on(&stream)?;
+            delta_step(
+                (&mut core).partition([1, 1, tile]),
+                state.partition([1, dims.key_head_dim(), tile]),
+                &q,
+                &k,
+                &v,
+                &b,
+                &a,
+                &a_log_gpu,
+                &dt_gpu,
+                dims.eps(),
+                dims.inv_sqrt_key_dim(),
+            )
+            .generics(dims.delta_generics(tile))
+            .sync_on(&stream)?;
+            let actual_core: Vec<f32> = core.to_host_vec().sync_on(&stream)?;
+            let actual_state: Vec<f32> = state.to_host_vec().sync_on(&stream)?;
+            let hf_core = refs.tensor(&format!("{key}/direct_core"))?;
+            let hf_state = refs.tensor(&format!("{key}/direct_recurrent_after"))?;
+            let core_error = relative_max(
+                &actual_core,
+                &hf_core.data.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+            );
+            let state_error = relative_max(
+                &actual_state,
+                &hf_state.data.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+            );
+            worst[0] = worst[0].max(core_error);
+            worst[1] = worst[1].max(state_error);
+            assert!(core_error < 2e-4, "{key} core relative {core_error}");
+            assert!(state_error < 2e-4, "{key} state relative {state_error}");
+            if step == 0 {
+                let chunk_core = refs.tensor(&format!("{key}/core"))?;
+                let chunk_state = refs.tensor(&format!("{key}/recurrent_after"))?;
+                first_chunk_core = first_chunk_core.max(max_error(&chunk_core.data, &hf_core.data));
+                first_chunk_state =
+                    first_chunk_state.max(max_error(&chunk_state.data, &hf_state.data));
+                assert!(first_chunk_core < 1e-6 && first_chunk_state < 1e-6);
+            }
+
+            let norm_in = refs.tensor(&format!("{key}/norm_in"))?;
+            let norm_z = refs.tensor(&format!("{key}/norm_z"))?;
+            assert_eq!(norm_in.shape, [dims.value_heads(), dims.value_head_dim()]);
+            let norm_input = api::copy_host_vec_to_device(&Arc::new(norm_in.data))
+                .reshape(&[dims.value_heads(), dims.value_head_dim()])
+                .sync_on(&stream)?;
+            let gate = api::copy_host_vec_to_device(&Arc::new(norm_z.data))
+                .reshape(&[dims.value_heads(), dims.value_head_dim()])
+                .sync_on(&stream)?;
+            let mut normalized =
+                api::zeros::<f32>(&[dims.value_heads(), dims.value_head_dim()]).sync_on(&stream)?;
+            rms_norm(
+                (&mut normalized).partition([1, dims.value_head_dim()]),
+                &norm_input,
+                &gamma,
+                1.0 / dims.value_head_dim() as f32,
+                dims.eps(),
+            )
+            .generics(vec![dims.value_head_dim().to_string()])
+            .sync_on(&stream)?;
+            let mut gated =
+                api::zeros::<f32>(&[dims.value_heads(), dims.value_head_dim()]).sync_on(&stream)?;
+            gated_silu(
+                (&mut gated).partition([1, dims.value_head_dim()]),
+                &normalized,
+                &gate,
+            )
+            .generics(vec![dims.value_head_dim().to_string()])
+            .sync_on(&stream)?;
+            let actual_norm: Vec<f32> = gated.to_host_vec().sync_on(&stream)?;
+            let hf_norm = refs.tensor(&format!("{key}/norm_out"))?;
+            let norm_error = relative_max(
+                &actual_norm,
+                &hf_norm.data.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+            );
+            worst[2] = worst[2].max(norm_error);
+            assert!(norm_error < 1e-5, "{key} norm relative {norm_error}");
+            if layer == 0 && step == 0 {
+                let wrong = upload(norm_weight.data.iter().map(|&w| 1.0 + w).collect())?;
+                let mut wrong_normalized =
+                    api::zeros::<f32>(&[dims.value_heads(), dims.value_head_dim()])
+                        .sync_on(&stream)?;
+                rms_norm(
+                    (&mut wrong_normalized).partition([1, dims.value_head_dim()]),
+                    &norm_input,
+                    &wrong,
+                    1.0 / dims.value_head_dim() as f32,
+                    dims.eps(),
+                )
+                .generics(vec![dims.value_head_dim().to_string()])
+                .sync_on(&stream)?;
+                let mut wrong_gated =
+                    api::zeros::<f32>(&[dims.value_heads(), dims.value_head_dim()])
+                        .sync_on(&stream)?;
+                gated_silu(
+                    (&mut wrong_gated).partition([1, dims.value_head_dim()]),
+                    &wrong_normalized,
+                    &gate,
+                )
+                .generics(vec![dims.value_head_dim().to_string()])
+                .sync_on(&stream)?;
+                let wrong_out: Vec<f32> = wrong_gated.to_host_vec().sync_on(&stream)?;
+                wrong_gamma = relative_max(
+                    &wrong_out,
+                    &hf_norm.data.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+                );
+                assert!(wrong_gamma > 1e-3);
+            }
+
+            let hf_norm_input = api::copy_host_vec_to_device(&Arc::new(hf_norm.data.clone()))
+                .reshape(&[1, dims.value_dim() / Q8_BLOCK, Q8_BLOCK])
+                .sync_on(&stream)?;
+            let mut delta = api::zeros::<f32>(&[1, dims.hidden()]).sync_on(&stream)?;
+            gemv(
+                &out_weight,
+                &hf_norm_input.view(&[1, dims.value_dim() / Q8_BLOCK, Q8_BLOCK])?,
+                (&mut delta).partition([1, DEFAULT_GEMV_TILE.rows]),
+                DEFAULT_GEMV_TILE,
+            )
+            .submit(&mut Eager(&stream))?;
+            let actual_delta: Vec<f32> = delta.to_host_vec().sync_on(&stream)?;
+            let hf_delta = refs.tensor(&format!("{key}/delta"))?;
+            let magnitude: Vec<f64> = out_host
+                .chunks(dims.value_dim())
+                .map(|row| {
+                    row.iter()
+                        .zip(&hf_norm.data)
+                        .map(|(w, x)| (f32::from(*w) as f64 * *x as f64).abs())
+                        .sum()
+                })
+                .collect();
+            let excess = check::inner_product_excess(
+                &actual_delta,
+                &hf_delta.data.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+                &magnitude,
+                dims.value_dim(),
+            );
+            worst[3] = worst[3].max(excess);
+            assert!(excess <= 2.0, "{key} out_proj Higham-Mary excess {excess}");
+            println!(
+                "layer{layer} step{step} core={core_error:.8e} state={state_error:.8e} norm={norm_error:.8e} out_proj_excess={excess:.8e}"
+            );
+        }
+    }
+    println!(
+        "GDN 2.8 worst={worst:?} first_chunk_core_abs={first_chunk_core:.8e} first_chunk_state_abs={first_chunk_state:.8e} wrong_gamma_relative={wrong_gamma:.8e}"
     );
     Ok(())
 }

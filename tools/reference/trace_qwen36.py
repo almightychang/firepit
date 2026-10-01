@@ -6,6 +6,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoTokenizer
+from transformers.models.qwen3_5_moe import modeling_qwen3_5_moe as qwen_module
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
 from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextRotaryEmbedding, apply_rotary_pos_emb, causal_conv1d_fn, causal_conv1d_update
 
@@ -56,6 +57,53 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
     step = 0
     attention = {}
     gdn_qkv = {}
+    gdn_calls = [0]
+    recurrent = qwen_module.torch_recurrent_gated_delta_rule
+    chunk = qwen_module.torch_chunk_gated_delta_rule
+
+    def delta_hook(fn):
+        def record(query, key, value, **kwargs):
+            layer = gdn_calls[0]
+            gdn_calls[0] += 1
+            prefix = f"step{step}/layer{layer}/gdn"
+            prior = kwargs.get("initial_state")
+            records[f"{prefix}/delta_q"] = query[0, 0].clone()
+            records[f"{prefix}/delta_k"] = key[0, 0].clone()
+            records[f"{prefix}/delta_v"] = value[0, 0].clone()
+            records[f"{prefix}/g"] = kwargs["g"][0, 0].clone()
+            records[f"{prefix}/beta"] = kwargs["beta"][0, 0].clone()
+            records[f"{prefix}/recurrent_before"] = (torch.zeros(query.shape[2], query.shape[3], value.shape[3]) if prior is None else prior[0].clone())
+            output, state = fn(query, key, value, **kwargs)
+            records[f"{prefix}/core"] = output[0, 0].clone()
+            records[f"{prefix}/recurrent_after"] = state[0].clone()
+            direct_args = dict(kwargs)
+            direct_args["initial_state"] = prior
+            direct_args["output_final_state"] = True
+            direct_output, direct_state = recurrent(query, key, value, **direct_args)
+            records[f"{prefix}/direct_core"] = direct_output[0, 0].clone()
+            records[f"{prefix}/direct_recurrent_after"] = direct_state[0].clone()
+            return output, state
+        return record
+
+    qwen_module.torch_recurrent_gated_delta_rule = delta_hook(recurrent)
+    qwen_module.torch_chunk_gated_delta_rule = delta_hook(chunk)
+
+    def gdn_norm_input(layer):
+        def record(_module, args):
+            prefix = f"step{step}/layer{layer}/gdn"
+            records[f"{prefix}/norm_in"] = args[0].clone()
+            records[f"{prefix}/norm_z"] = args[1].clone()
+        return record
+
+    def gdn_norm_output(layer):
+        def record(_module, _args, output):
+            records[f"step{step}/layer{layer}/gdn/norm_out"] = output.clone()
+        return record
+
+    def gdn_output(layer):
+        def record(_module, _args, output):
+            records[f"step{step}/layer{layer}/gdn/delta"] = output[0, 0].clone()
+        return record
     def gdn_input(layer):
         def record(_module, _args, kwargs):
             records[f"step{step}/layer{layer}/gdn/in"] = kwargs["hidden_states"][0, 0].clone()
@@ -136,6 +184,9 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
         if block.block_type == "linear_attention":
             gdn = block.linear_attn
             hooks += [gdn.register_forward_pre_hook(gdn_input(layer), with_kwargs=True)]
+            hooks += [gdn.norm.register_forward_pre_hook(gdn_norm_input(layer)),
+                      gdn.norm.register_forward_hook(gdn_norm_output(layer)),
+                      gdn.out_proj.register_forward_hook(gdn_output(layer))]
             for name in ("qkv", "z", "b", "a"):
                 hooks.append(getattr(gdn, f"in_proj_{name}").register_forward_hook(gdn_projection(layer, name)))
     if len(model.model.layers) > 3:
@@ -160,6 +211,7 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
         for step, token in enumerate(tokens):
             attention.clear()
             gdn_qkv.clear()
+            gdn_calls[0] = 0
             previous = {}
             for layer, block in enumerate(model.model.layers):
                 if block.block_type == "linear_attention":
@@ -200,6 +252,8 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
             records[f"step{step}/logits"] = model.lm_head(exit_norm)[0, 0].clone()
     for hook in hooks:
         hook.remove()
+    qwen_module.torch_recurrent_gated_delta_rule = recurrent
+    qwen_module.torch_chunk_gated_delta_rule = chunk
     return records
 
 
