@@ -7,6 +7,7 @@ use firepit::{Checkpoint, SafetensorsFile};
 use firepit_kernels::dense::{DenseMatrix, dense_gemv};
 use firepit_kernels::hybrid::rms_norm;
 use firepit_kernels::q8::DEFAULT_GEMV_TILE;
+use firepit_kernels::rope::{frequencies, rope};
 use firepit_kernels::swiglu::swiglu;
 use half::bf16;
 use std::path::PathBuf;
@@ -299,5 +300,180 @@ fn shared_expert_gaussian_matches_f64() -> Result<(), Box<dyn std::error::Error>
     }
     println!("shared_expert Gaussian f64 max_relative={worst:.8e}");
     assert!(worst <= 1e-5);
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Qwen3.6 weights and regenerated reference trace"]
+fn attention_projection_and_rope_match_hf() -> Result<(), Box<dyn std::error::Error>> {
+    const H: usize = 2048;
+    const D: usize = 256;
+    let weights = Checkpoint::open(home("Models/qwen3.6-35b-a3b"))?;
+    let refs = SafetensorsFile::open(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../refs/qwen36-prefix4.safetensors"),
+    )?;
+    let positions = [0, 1, 2, 3, 4, 100, 4095, 65535, 262143];
+    let (cos, sin) = frequencies(&positions);
+    let cos_ref = refs.tensor("rope/cos")?;
+    let sin_ref = refs.tensor("rope/sin")?;
+    assert_eq!(
+        refs.tensor("rope/positions")?.data,
+        positions.map(|p| p as f32)
+    );
+    assert_eq!(cos_ref.shape, [positions.len(), 64]);
+    assert_eq!(sin_ref.shape, [positions.len(), 64]);
+    for (row, position) in positions.iter().enumerate() {
+        let start = row * 64;
+        println!(
+            "rope position={position} cos_max_abs={:.8e} sin_max_abs={:.8e}",
+            max_error(&cos[start..start + 64], &cos_ref.data[start..start + 64]),
+            max_error(&sin[start..start + 64], &sin_ref.data[start..start + 64])
+        );
+    }
+    assert!(max_error(&cos, &cos_ref.data) < 1e-6);
+    assert!(max_error(&sin, &sin_ref.data) < 1e-6);
+
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let prefix = "model.language_model.layers.3.self_attn";
+    let load = |name: &str, rows| -> Result<_, Box<dyn std::error::Error>> {
+        let t = weights.tensor_bf16(&format!("{prefix}.{name}_proj.weight"))?;
+        assert_eq!(t.shape, [rows, H]);
+        Ok(DenseMatrix::upload(t.data, rows, H, &stream)?)
+    };
+    let q_weights = load("q", 8192)?;
+    let k_weights = load("k", 512)?;
+    let v_weights = load("v", 512)?;
+    let norm_weight = |name: &str| -> Result<_, Box<dyn std::error::Error>> {
+        let t = weights.tensor(&format!("{prefix}.{name}_norm.weight"))?;
+        assert_eq!(t.shape, [D]);
+        Ok(
+            api::copy_host_vec_to_device(&Arc::new(t.data.into_iter().map(|w| 1.0 + w).collect()))
+                .sync_on(&stream)?,
+        )
+    };
+    let q_gamma = norm_weight("q")?;
+    let k_gamma = norm_weight("k")?;
+    let mut worst = [0.0f64; 4];
+    let mut wrong_pair = 0.0f64;
+    let mut wrong_full = 0.0f64;
+    for step in 0..5 {
+        let key = format!("step{step}/layer3/attn");
+        let input = refs.tensor(&format!("{key}/in"))?;
+        assert_eq!(input.shape, [H]);
+        let x = api::copy_host_vec_to_device(&Arc::new(input.data))
+            .reshape(&[1, H])
+            .sync_on(&stream)?;
+        let x_view = x.view(&[1, H / 32, 32])?;
+        let project = |matrix: &DenseMatrix<bf16>, rows| -> Result<_, Box<dyn std::error::Error>> {
+            let mut output = api::zeros::<f32>(&[1, rows]).sync_on(&stream)?;
+            dense_gemv(
+                matrix,
+                &x_view,
+                (&mut output).partition([1, DEFAULT_GEMV_TILE.rows]),
+                DEFAULT_GEMV_TILE,
+            )
+            .sync_on(&stream)?;
+            Ok(output)
+        };
+        let q_proj = project(&q_weights, 8192)?;
+        let k_proj = project(&k_weights, 512)?;
+        let v_proj = project(&v_weights, 512)?;
+        let q_proj_host: Vec<f32> = q_proj.dup().to_host_vec().sync_on(&stream)?;
+        let gate: Vec<f32> = q_proj_host
+            .chunks_exact(512)
+            .flat_map(|row| row[256..].iter().copied())
+            .collect();
+        let q_in = q_proj.view(&[16, 512])?;
+        let gate_view = q_in.slice(&[0..16, 256..512])?;
+        assert_eq!(gate_view.shape(), &[16, 256]);
+        let q_in = q_in.slice(&[0..16, 0..256])?;
+        let mut q_norm = api::zeros::<f32>(&[16, D]).sync_on(&stream)?;
+        rms_norm(
+            (&mut q_norm).partition([1, D]),
+            &q_in,
+            &q_gamma,
+            1.0 / D as f32,
+            1e-6,
+        )
+        .generics(vec![D.to_string()])
+        .sync_on(&stream)?;
+        let k_in = k_proj.view(&[2, D])?;
+        let mut k_norm = api::zeros::<f32>(&[2, D]).sync_on(&stream)?;
+        rms_norm(
+            (&mut k_norm).partition([1, D]),
+            &k_in,
+            &k_gamma,
+            1.0 / D as f32,
+            1e-6,
+        )
+        .generics(vec![D.to_string()])
+        .sync_on(&stream)?;
+        let (cos, sin) = frequencies(&[step]);
+        let c = api::copy_host_vec_to_device(&Arc::new(cos))
+            .reshape(&[1, 64])
+            .sync_on(&stream)?;
+        let s = api::copy_host_vec_to_device(&Arc::new(sin))
+            .reshape(&[1, 64])
+            .sync_on(&stream)?;
+        let mut q = api::zeros::<f32>(&[16, D]).sync_on(&stream)?;
+        let mut k = api::zeros::<f32>(&[2, D]).sync_on(&stream)?;
+        rope((&mut q).partition([1, 256]), &q_norm, &c, &s)
+            .generics(vec!["16".into()])
+            .sync_on(&stream)?;
+        rope((&mut k).partition([1, 256]), &k_norm, &c, &s)
+            .generics(vec!["2".into()])
+            .sync_on(&stream)?;
+        let got = [
+            q.to_host_vec().sync_on(&stream)?,
+            k.to_host_vec().sync_on(&stream)?,
+            v_proj.to_host_vec().sync_on(&stream)?,
+            gate,
+        ];
+        for (i, name) in ["q", "k", "v", "gate"].iter().enumerate() {
+            let expected = refs.tensor(&format!("{key}/{name}"))?;
+            let expected_f64: Vec<f64> = expected.data.iter().map(|&v| v as f64).collect();
+            let error = relative_max(&got[i], &expected_f64);
+            worst[i] = worst[i].max(error);
+            println!("step{step} {name} max_relative={error:.8e}");
+        }
+        if step == 1 {
+            let before: Vec<f32> = q_norm.to_host_vec().sync_on(&stream)?;
+            let expected = refs.tensor(&format!("{key}/q"))?;
+            let (c, s) = frequencies(&[step]);
+            let mut adjacent = before.clone();
+            let mut full = before.clone();
+            for head in 0..16 {
+                for i in 0..64 {
+                    let pair = if i % 2 == 0 { i + 1 } else { i - 1 };
+                    adjacent[head * D + i] = before[head * D + i] * c[i]
+                        + if i % 2 == 0 {
+                            -before[head * D + pair]
+                        } else {
+                            before[head * D + pair]
+                        } * s[i];
+                }
+                for i in 64..D {
+                    let pair = if i < 128 { i + 128 } else { i - 128 };
+                    let angle = step as f32 * 10_000_000.0f32.powf(-((i % 128) as f32) / 128.0);
+                    full[head * D + i] = before[head * D + i] * angle.cos()
+                        + if i < 128 {
+                            -before[head * D + pair]
+                        } else {
+                            before[head * D + pair]
+                        } * angle.sin();
+                }
+            }
+            let target: Vec<f64> = expected.data.iter().map(|&v| v as f64).collect();
+            wrong_pair = relative_max(&adjacent, &target);
+            wrong_full = relative_max(&full, &target);
+        }
+    }
+    println!(
+        "attention HF max_relative q={:.8e} k={:.8e} v={:.8e} gate={:.8e} adjacent={wrong_pair:.8e} full={wrong_full:.8e}",
+        worst[0], worst[1], worst[2], worst[3]
+    );
+    assert!(worst.iter().all(|&x| x < 1e-5));
+    assert!(wrong_pair > 1e-5 && wrong_full > 1e-5);
     Ok(())
 }
