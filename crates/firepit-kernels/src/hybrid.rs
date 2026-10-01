@@ -54,6 +54,7 @@ mod kernels {
         state: &mut Tensor<f32, { [1, R, D] }>,
         input: &Tensor<f32, { [1, -1] }>,
         inv_d: f32,
+        decay: f32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
         let head = pid.0;
@@ -65,7 +66,7 @@ mod kernels {
             .load([0, head * (D / R) + row]);
         let v: Tile<f32, { [1, R, D] }> = v.reshape(shape![1, R, 1]).broadcast(shape![1, R, D]);
         let old: Tile<f32, { [1, R, D] }> = state.load();
-        let next = old * constant(0.9f32, shape![1, R, D]) + v * k;
+        let next = old * decay.broadcast(shape![1, R, D]) + v * k;
         state.store(next);
         let y: Tile<f32, { [1, R] }> = reduce_sum(next * k, 2);
         let y: Tile<f32, { [1, R] }> = y.reshape(shape![1, R]);

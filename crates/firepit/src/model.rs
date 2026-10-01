@@ -23,6 +23,8 @@ pub struct ModelConfig {
     pub head_dim: usize,
     pub vocab: usize,
     pub max_seq: usize,
+    pub rms_norm_eps: f32,
+    pub gdn_decay: f32,
 }
 
 impl Default for ModelConfig {
@@ -35,6 +37,8 @@ impl Default for ModelConfig {
             head_dim: 32,
             vocab: 512,
             max_seq: 32,
+            rms_norm_eps: 1e-5,
+            gdn_decay: 0.9,
         }
     }
 }
@@ -53,6 +57,8 @@ pub struct ModelDims {
     head_dim: usize,
     vocab: usize,
     max_seq: usize,
+    rms_norm_eps: f32,
+    gdn_decay: f32,
 }
 
 impl ModelDims {
@@ -82,6 +88,12 @@ impl ModelDims {
     }
     pub fn max_seq(&self) -> usize {
         self.max_seq
+    }
+    pub fn rms_norm_eps(&self) -> f32 {
+        self.rms_norm_eps
+    }
+    pub fn gdn_decay(&self) -> f32 {
+        self.gdn_decay
     }
     pub(crate) fn layers(&self) -> &[LayerDef] {
         &self.layers
@@ -127,6 +139,10 @@ impl TryFrom<ModelConfig> for ModelDims {
                 .checked_add(config.attention_layers)
                 .is_none()
             || config.max_seq > i32::MAX as usize
+            || !config.rms_norm_eps.is_finite()
+            || config.rms_norm_eps <= 0.0
+            || !config.gdn_decay.is_finite()
+            || !(0.0..=1.0).contains(&config.gdn_decay)
         {
             return Err(DimensionError);
         }
@@ -142,6 +158,8 @@ impl TryFrom<ModelConfig> for ModelDims {
             head_dim: config.head_dim,
             vocab: config.vocab,
             max_seq: config.max_seq,
+            rms_norm_eps: config.rms_norm_eps,
+            gdn_decay: config.gdn_decay,
         })
     }
 }

@@ -6,7 +6,7 @@ use cuda_core::Stream;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::TileKernel;
-use firepit_kernels::rope::{frequencies, rope};
+use firepit_kernels::rope::{frequencies, generics, rope};
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -15,45 +15,54 @@ fn gpu(
     input: &[f32],
     positions: &[usize],
     heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let batch = positions.len();
-    assert_eq!(input.len(), batch * heads * 256);
-    let (cos, sin) = frequencies(positions);
+    assert_eq!(input.len(), batch * heads * head_dim);
+    let (cos, sin) = frequencies(positions, 10_000_000.0, head_dim, rotary_dim);
     let x = api::copy_host_vec_to_device(&Arc::new(input.to_vec()))
-        .reshape(&[batch * heads, 256])
+        .reshape(&[batch * heads, head_dim])
         .sync_on(stream)?;
     let c = api::copy_host_vec_to_device(&Arc::new(cos))
-        .reshape(&[batch, 64])
+        .reshape(&[batch, head_dim])
         .sync_on(stream)?;
     let s = api::copy_host_vec_to_device(&Arc::new(sin))
-        .reshape(&[batch, 64])
+        .reshape(&[batch, head_dim])
         .sync_on(stream)?;
-    let mut output = api::zeros::<f32>(&[batch * heads, 256]).sync_on(stream)?;
-    rope((&mut output).partition([1, 256]), &x, &c, &s)
-        .generics(vec![heads.to_string()])
+    let mut output = api::zeros::<f32>(&[batch * heads, head_dim]).sync_on(stream)?;
+    rope((&mut output).partition([1, rotary_dim]), &x, &c, &s)
+        .generics(generics(heads, head_dim, rotary_dim))
         .sync_on(stream)?;
     Ok(output.to_host_vec().sync_on(stream)?)
 }
 
-fn oracle(input: &[f32], positions: &[usize], heads: usize) -> Vec<f64> {
-    let (cos, sin) = frequencies(positions);
+fn oracle(
+    input: &[f32],
+    positions: &[usize],
+    heads: usize,
+    head_dim: usize,
+    rotary_dim: usize,
+) -> Vec<f64> {
+    let (cos, sin) = frequencies(positions, 10_000_000.0, head_dim, rotary_dim);
+    let half = rotary_dim / 2;
     input
-        .chunks_exact(256)
+        .chunks_exact(head_dim)
         .enumerate()
         .flat_map(|(row, x)| {
-            let offset = row / heads * 64;
-            (0..256)
+            let offset = row / heads * head_dim;
+            (0..head_dim)
                 .map(|i| {
-                    if i >= 64 {
+                    if i >= rotary_dim {
                         x[i] as f64
                     } else {
-                        let other = if i < 32 {
-                            x[i + 32] as f64
+                        let other = if i < half {
+                            x[i + half] as f64
                         } else {
-                            x[i - 32] as f64
+                            x[i - half] as f64
                         };
                         x[i] as f64 * cos[offset + i] as f64
-                            + if i < 32 { -other } else { other } * sin[offset + i] as f64
+                            + if i < half { -other } else { other } * sin[offset + i] as f64
                     }
                 })
                 .collect::<Vec<_>>()
@@ -73,18 +82,19 @@ fn rope_matches_f64_oracle() {
             &(
                 prop::sample::select(vec![1usize, 2, 4]),
                 prop::sample::select(vec![1usize, 2, 16]),
+                prop::sample::select(vec![(256usize, 64usize), (128, 64), (128, 128)]),
             )
-                .prop_flat_map(|(batch, heads)| {
+                .prop_flat_map(|(batch, heads, (head_dim, rotary_dim))| {
                     (
-                        Just(heads),
+                        Just((heads, head_dim, rotary_dim)),
                         prop::collection::vec(0usize..=262143, batch),
-                        strategy::values(batch * heads * 256),
+                        strategy::values(batch * heads * head_dim),
                     )
                 }),
-            |(heads, positions, input)| {
-                let actual = gpu(&stream, &input, &positions, heads)
+            |((heads, head_dim, rotary_dim), positions, input)| {
+                let actual = gpu(&stream, &input, &positions, heads, head_dim, rotary_dim)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                let expected = oracle(&input, &positions, heads);
+                let expected = oracle(&input, &positions, heads, head_dim, rotary_dim);
                 prop_assert!(check::max_relative(&actual, &expected) < 3e-6);
                 Ok(())
             },
@@ -105,7 +115,7 @@ fn rope_preserves_norm_and_relative_position() -> Result<(), Box<dyn std::error:
     for row in [&q, &k, &q, &k, &q, &k] {
         input.extend(row);
     }
-    let result = gpu(&stream, &input, &[0, 100, 200, 300, 4095, 4195], 1)?;
+    let result = gpu(&stream, &input, &[0, 100, 200, 300, 4095, 4195], 1, 256, 64)?;
     assert!(check::max_abs(&result[..256], &q) < 1e-7);
     for row in result.chunks_exact(256).zip(input.chunks_exact(256)) {
         assert!((dot(row.0, row.0) - dot(row.1, row.1)).abs() < 1e-4);

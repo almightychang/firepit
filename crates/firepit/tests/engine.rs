@@ -272,9 +272,46 @@ fn rejects_dimensions_the_kernels_cannot_run() -> TestResult {
             hidden: 192,
             ..ModelConfig::default()
         },
+        ModelConfig {
+            rms_norm_eps: 0.0,
+            ..ModelConfig::default()
+        },
+        ModelConfig {
+            gdn_decay: f32::NAN,
+            ..ModelConfig::default()
+        },
     ] {
         assert!(ModelDims::try_from(config).is_err());
     }
+    Ok(())
+}
+
+#[test]
+fn model_parameters_change_synthetic_outputs() -> TestResult {
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let run = |config| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+        let model = Arc::new(Model::synthetic(ModelDims::try_from(config)?, &stream)?);
+        let mut engine = Engine::new(model, &device)?;
+        let mut session = engine.new_session(SessionId(1))?;
+        for token in [1, 2] {
+            let batch = engine.batch([(&mut session, token)])?;
+            engine.step_eager(batch)?;
+        }
+        let batch = engine.batch([(&mut session, 3)])?;
+        Ok(engine.step_eager(batch)?)
+    };
+    let baseline = run(ModelConfig::default())?;
+    let changed_eps = run(ModelConfig {
+        rms_norm_eps: 1.0,
+        ..ModelConfig::default()
+    })?;
+    let changed_decay = run(ModelConfig {
+        gdn_decay: 0.0,
+        ..ModelConfig::default()
+    })?;
+    assert!(compare(&baseline, &changed_eps) > 1e-6);
+    assert!(compare(&baseline, &changed_decay) > 1e-6);
     Ok(())
 }
 

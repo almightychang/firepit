@@ -114,7 +114,7 @@ fn run(
                         activation,
                         model.norm(norm),
                         1.0 / h as f32,
-                        1e-5,
+                        c.rms_norm_eps(),
                     )
                     .generics(vec![h.to_string()]),
                 )?;
@@ -181,6 +181,7 @@ fn run(
                                     recurrent.partition(c.recurrent_tile(plan.row)),
                                     &row_input,
                                     1.0 / d as f32,
+                                    c.gdn_decay(),
                                 )
                                 .generics(vec![heads.to_string(), d.to_string(), r.to_string()])
                                 .compile_options(
