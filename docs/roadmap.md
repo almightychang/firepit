@@ -39,6 +39,13 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
     ○ HC mixer · QSA (indexer + sparse attention) · n-gram PLE (SSD)
     ○ ds4 layer 출력과 비교
 
+ E7. 하드코딩 제거                                                 ○
+    ○ GEMV 행 타일(BN): DEFAULT_GEMV_TILE 고정값 → row_tile 같은 SM 채우기 규칙
+    ○ 행이 적은 행렬(MoE expert 등)이 SM을 못 채우면 split-K
+    ○ GEMV 열 타일(NB): batch·레지스터 압박에 따라 autotune 또는 규칙
+    ○ TARGET_BLOCKS_PER_SM, MIN_ROW_TILE, MAX_BATCH_SESSIONS 근거 재검토
+    ○ 합성 엔진 RMSNorm eps 1e-5 → 모델 config 값
+
  기여 트랙 (병행)
     ✔ cutile-rs #184 재현 · slice_mut 구현 (로컬 브랜치)
     ○ 이슈 001 게시 → PR (서명 커밋 설정 필요)
