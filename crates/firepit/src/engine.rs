@@ -2,13 +2,14 @@ use crate::model::{RowTile, Stream};
 use crate::plan::{Op, Slot, StepPlan};
 use crate::session::LayerState;
 use crate::{Batch, Model, Result, Session, SessionId};
-use cuda_async::cuda_graph::{CudaGraph, Scope};
-use cuda_async::device_operation::{DeviceOp, GraphNode};
+use cuda_async::cuda_graph::CudaGraph;
+use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
 use cutile::api;
 use cutile::tensor::{IntoPartition, PartitionMut, Tensor};
 use cutile::tile_kernel::{CompileOptions, TileKernel};
 use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, gemv};
+use firepit_kernels::sink::{Eager, Graph, Sink};
 use firepit_kernels::tile::{MIN_ROW_TILE, row_tile};
 use firepit_kernels::weights::Q8_BLOCK;
 use firepit_kernels::{elementwise, embedding, norm, synthetic};
@@ -23,22 +24,6 @@ static NEXT_ENGINE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) struct EngineId(u64);
-
-enum Sink<'a> {
-    Eager(&'a Stream),
-    Graph(&'a Scope),
-}
-fn submit<T: Send, N: GraphNode + DeviceOp<Output = T>>(sink: &Sink<'_>, op: N) -> Result<()> {
-    match sink {
-        Sink::Eager(stream) => {
-            op.sync_on(stream)?;
-        }
-        Sink::Graph(scope) => {
-            scope.record(op)?;
-        }
-    }
-    Ok(())
-}
 
 fn input_output(
     buffers: &mut [Tensor<f32>],
@@ -83,7 +68,7 @@ fn run(
     model: &Model,
     plan: &mut StepPlan,
     sessions: &mut [&mut Session],
-    sink: &Sink<'_>,
+    sink: &mut impl Sink,
 ) -> Result<()> {
     let batch = plan.batch;
     let c = &model.dims();
@@ -91,8 +76,7 @@ fn run(
     for op in &plan.ops {
         match *op {
             Op::Embed { out: output } => {
-                submit(
-                    sink,
+                sink.run(
                     embedding::embedding(
                         (&mut plan.buffers[output.index()]).partition([1, h]),
                         &model.embedding,
@@ -107,8 +91,7 @@ fn run(
                 out: output,
             } => {
                 let (activation, out) = input_output(&mut plan.buffers, input, output);
-                submit(
-                    sink,
+                sink.run(
                     norm::rms_norm(
                         out.partition([1, h]),
                         activation,
@@ -126,8 +109,7 @@ fn run(
             } => {
                 let (current, delta, out) =
                     two_inputs_output(&mut plan.buffers, input, second, output);
-                submit(
-                    sink,
+                sink.run(
                     elementwise::add(out.partition([1, h]), current, delta)
                         .generics(vec![h.to_string()]),
                 )?;
@@ -140,16 +122,13 @@ fn run(
                 let (input_tensor, out) = input_output(&mut plan.buffers, input, output);
                 let activation = input_tensor.view(&[batch, h])?;
                 let x = activation.view(&[batch, h / Q8_BLOCK, Q8_BLOCK])?;
-                let op = gemv(
+                gemv(
                     model.weights.get(weight),
                     &x,
                     out.partition([batch, DEFAULT_GEMV_TILE.rows]),
                     DEFAULT_GEMV_TILE,
-                );
-                match sink {
-                    Sink::Eager(stream) => op.sync_on(stream)?,
-                    Sink::Graph(scope) => op.record(scope)?,
-                }
+                )
+                .submit(sink)?;
             }
             Op::Session {
                 layer,
@@ -163,8 +142,7 @@ fn run(
                     match &mut session.state[layer] {
                         LayerState::Gdn { recurrent } => {
                             let r = plan.row.0;
-                            submit(
-                                sink,
+                            sink.run(
                                 synthetic::gdn_step(
                                     row_output.partition(c.session_output_tile(plan.row)),
                                     recurrent.partition(c.recurrent_tile(plan.row)),
@@ -179,8 +157,7 @@ fn run(
                             )?;
                         }
                         LayerState::Attention { k, v } => {
-                            submit(
-                                sink,
+                            sink.run(
                                 synthetic::kv_append(
                                     k.partition(c.cache_tile(plan.row)),
                                     v.partition(c.cache_tile(plan.row)),
@@ -197,8 +174,7 @@ fn run(
                                     CompileOptions::default().occupancy(TARGET_BLOCKS_PER_SM),
                                 ),
                             )?;
-                            submit(
-                                sink,
+                            sink.run(
                                 synthetic::attn_step(
                                     row_output.partition(c.session_output_tile(plan.row)),
                                     &*k,
@@ -307,7 +283,7 @@ impl Engine {
         self.step_with(batch, |model, plan, sessions, stream| {
             if plan.graph.is_none() {
                 let graph = CudaGraph::scope(stream, |scope| {
-                    run(model, plan, sessions, &Sink::Graph(scope))
+                    run(model, plan, sessions, &mut Graph(scope))
                         .map_err(|e| cuda_async::error::DeviceError::Internal(e.to_string()))
                 })?;
                 plan.graph = Some(graph);
@@ -318,7 +294,7 @@ impl Engine {
     }
     pub fn step_eager(&mut self, batch: Batch<'_>) -> Result<Vec<f32>> {
         self.step_with(batch, |model, plan, sessions, stream| {
-            run(model, plan, sessions, &Sink::Eager(stream))
+            run(model, plan, sessions, &mut Eager(stream))
         })
     }
     fn step_with(

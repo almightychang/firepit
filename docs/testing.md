@@ -2,7 +2,7 @@
 
 `crates/firepit-kernels/tests/common`에 f64 CPU oracle, 입력 전략, 오차 판정을 둔다.
 
-GEMV 검증은 `tests/gemv_dense.rs`와 `tests/gemv_q8.rs`에서 공개 `gemv(&Weight, ..)` 경로를 사용한다. expert 변형은 `tests/moe.rs`에서 검증한다.
+GEMV 검증은 `tests/gemv_dense.rs`와 `tests/gemv_q8.rs`에서 공개 `gemv(&Weight, ..)` 경로를 사용한다. dense PBT 가중치는 bf16로 반올림해 정확히 표현되는 f32 값으로 oracle을 계산한다. expert 변형은 `tests/moe.rs`에서 검증한다.
 
 ## PBT
 

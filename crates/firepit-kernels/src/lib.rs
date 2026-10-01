@@ -5,6 +5,7 @@ pub mod gemv;
 pub mod moe;
 pub mod norm;
 pub mod rope;
+pub mod sink;
 pub mod swiglu;
 pub mod synthetic;
 pub mod tile;

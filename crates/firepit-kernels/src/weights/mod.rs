@@ -8,7 +8,7 @@ pub use q8::Q8Matrix;
 pub use q8_format::{FormatError, HostQ8Matrix, Q8_BLOCK};
 
 #[derive(Clone)]
-pub enum Weight<T: cutile::DType = bf16> {
-    Dense(DenseMatrix<T>),
+pub enum Weight {
+    Dense(DenseMatrix<bf16>),
     Q8(Q8Matrix),
 }

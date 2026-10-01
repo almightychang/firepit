@@ -3,26 +3,33 @@ mod common;
 use common::{check, oracle, strategy};
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Stream;
-use cutile::DType;
 use cutile::api::{self, DeviceOpReshape};
-use cutile::core::ElementType;
 use cutile::tensor::{PartitionMut, ToHostVec};
 use firepit_kernels::gemv::DEFAULT_GEMV_TILE;
 use firepit_kernels::gemv::gemv;
+use firepit_kernels::sink::Eager;
 use firepit_kernels::weights::{DenseMatrix, Weight};
 use half::bf16;
 use proptest::prelude::*;
 use std::sync::Arc;
 
-fn gpu<T: DType + ElementType>(
+fn gpu(
     stream: &Arc<Stream>,
-    weights: Vec<T>,
+    weights: Vec<f32>,
     input: &[f32],
     rows: usize,
     cols: usize,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let batch = input.len() / cols;
     let padded = batch.next_power_of_two();
+    let weights: Vec<bf16> = weights
+        .into_iter()
+        .map(|weight| {
+            let rounded = bf16::from_f32(weight);
+            assert_eq!(rounded.to_f32(), weight);
+            rounded
+        })
+        .collect();
     let matrix = DenseMatrix::upload(weights, rows, cols, stream)?;
     let mut padded_input = input.to_vec();
     padded_input.resize(padded * cols, 0.0);
@@ -37,7 +44,7 @@ fn gpu<T: DType + ElementType>(
         (&mut y).partition([padded, DEFAULT_GEMV_TILE.rows]),
         DEFAULT_GEMV_TILE,
     )
-    .sync_on(stream)?;
+    .submit(&mut Eager(stream))?;
     let mut actual: Vec<f32> = y.to_host_vec().sync_on(stream)?;
     actual.truncate(batch * rows);
     Ok(actual)
@@ -48,31 +55,18 @@ fn dense_matches_f64_oracle() {
     let stream = common::stream();
     common::runner(64, file!())
         .run(&strategy::dense_case(), |case| {
-            let f32_out = gpu(
-                &stream,
-                case.weights.clone(),
-                &case.input,
-                case.rows,
-                case.cols,
-            )
-            .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            prop_assert_eq!(f32_out.len(), case.batch * case.rows);
-            let expected = oracle::dense(&case.weights, &case.input, case.rows, case.cols);
-            let magnitude =
-                oracle::dense_magnitude(&case.weights, &case.input, case.rows, case.cols);
-            prop_assert!(
-                check::inner_product_excess(&f32_out, &expected, &magnitude, case.cols) <= 1.0
-            );
-
-            let bf16_weights: Vec<bf16> =
-                case.weights.iter().copied().map(bf16::from_f32).collect();
-            let rounded: Vec<f32> = bf16_weights.iter().map(|w| w.to_f32()).collect();
-            let bf16_out = gpu(&stream, bf16_weights, &case.input, case.rows, case.cols)
+            let weights: Vec<f32> = case
+                .weights
+                .iter()
+                .map(|&weight| bf16::from_f32(weight).to_f32())
+                .collect();
+            let actual = gpu(&stream, weights.clone(), &case.input, case.rows, case.cols)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let expected = oracle::dense(&rounded, &case.input, case.rows, case.cols);
-            let magnitude = oracle::dense_magnitude(&rounded, &case.input, case.rows, case.cols);
+            prop_assert_eq!(actual.len(), case.batch * case.rows);
+            let expected = oracle::dense(&weights, &case.input, case.rows, case.cols);
+            let magnitude = oracle::dense_magnitude(&weights, &case.input, case.rows, case.cols);
             prop_assert!(
-                check::inner_product_excess(&bf16_out, &expected, &magnitude, case.cols) <= 1.0
+                check::inner_product_excess(&actual, &expected, &magnitude, case.cols) <= 1.0
             );
             Ok(())
         })

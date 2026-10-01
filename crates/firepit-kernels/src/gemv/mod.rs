@@ -4,12 +4,8 @@ mod q8;
 
 pub use expert::expert_gemv;
 
-use cuda_async::cuda_graph::Scope;
-use cuda_async::device_operation::DeviceOp;
-use cutile::DType;
-use cutile::core::ElementType;
+use crate::sink::Sink;
 use cutile::tensor::{Partition, Tensor, TensorView};
-use std::sync::Arc;
 
 use crate::weights::{Q8_BLOCK, Weight};
 
@@ -30,45 +26,30 @@ impl GemvTile {
     }
 }
 
-pub struct Gemv<'a, T: DType + ElementType> {
-    weight: &'a Weight<T>,
+pub struct Gemv<'a> {
+    weight: &'a Weight,
     x: &'a TensorView<'a, f32>,
     y: Partition<&'a mut Tensor<f32>>,
     tile: GemvTile,
 }
 
-pub fn gemv<'a, T: DType + ElementType>(
-    weight: &'a Weight<T>,
+pub fn gemv<'a>(
+    weight: &'a Weight,
     x: &'a TensorView<'a, f32>,
     y: Partition<&'a mut Tensor<f32>>,
     tile: GemvTile,
-) -> Gemv<'a, T> {
+) -> Gemv<'a> {
     Gemv { weight, x, y, tile }
 }
 
-impl<T: DType + ElementType> Gemv<'_, T> {
-    pub fn sync_on(
-        self,
-        stream: &Arc<cuda_core::Stream>,
-    ) -> Result<(), cuda_async::error::DeviceError> {
+impl Gemv<'_> {
+    pub fn submit<S: Sink>(self, sink: &mut S) -> Result<(), cuda_async::error::DeviceError> {
         match self.weight {
             Weight::Dense(w) => {
-                dense::dense_gemv(w, self.x, self.y, self.tile).sync_on(stream)?;
+                sink.run(dense::dense_gemv(w, self.x, self.y, self.tile))?;
             }
             Weight::Q8(w) => {
-                q8::q8_gemv(w, self.x, self.y, self.tile).sync_on(stream)?;
-            }
-        }
-        Ok(())
-    }
-
-    pub fn record(self, scope: &Scope) -> Result<(), cuda_async::error::DeviceError> {
-        match self.weight {
-            Weight::Dense(w) => {
-                scope.record(dense::dense_gemv(w, self.x, self.y, self.tile))?;
-            }
-            Weight::Q8(w) => {
-                scope.record(q8::q8_gemv(w, self.x, self.y, self.tile))?;
+                sink.run(q8::q8_gemv(w, self.x, self.y, self.tile))?;
             }
         }
         Ok(())

@@ -6,6 +6,7 @@ use firepit::Checkpoint;
 use firepit_kernels::gemv::DEFAULT_GEMV_TILE;
 use firepit_kernels::gemv::gemv;
 use firepit_kernels::moe::MoeDims;
+use firepit_kernels::sink::Eager;
 use firepit_kernels::swiglu::swiglu;
 use firepit_kernels::weights::{DenseMatrix, Weight};
 use half::bf16;
@@ -84,7 +85,7 @@ pub(super) fn gpu_expert_tensor(
         (&mut projected).partition([1, DEFAULT_GEMV_TILE.rows]),
         DEFAULT_GEMV_TILE,
     )
-    .sync_on(stream)?;
+    .submit(&mut Eager(stream))?;
     let mut activated = api::zeros::<f32>(&[1, dims.shared_intermediate()]).sync_on(stream)?;
     swiglu(
         (&mut activated).partition([1, dims.shared_intermediate()]),
@@ -99,7 +100,7 @@ pub(super) fn gpu_expert_tensor(
         (&mut output).partition([1, DEFAULT_GEMV_TILE.rows]),
         DEFAULT_GEMV_TILE,
     )
-    .sync_on(stream)?;
+    .submit(&mut Eager(stream))?;
     Ok(output)
 }
 

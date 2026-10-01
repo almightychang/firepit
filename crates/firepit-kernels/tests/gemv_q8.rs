@@ -6,6 +6,7 @@ use cuda_core::Stream;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile, gemv};
+use firepit_kernels::sink::Eager;
 use firepit_kernels::weights::{HostQ8Matrix, Weight};
 use half::f16;
 use proptest::prelude::*;
@@ -32,12 +33,12 @@ fn gpu(
     let mut y = api::zeros::<f32>(&[padded, rows]).sync_on(stream)?;
     let x_view = x.view(&[padded, cols / 32, 32])?;
     gemv(
-        &Weight::<half::bf16>::Q8(weights.clone()),
+        &Weight::Q8(weights.clone()),
         &x_view,
         (&mut y).partition([padded, tile.rows]),
         tile,
     )
-    .sync_on(stream)?;
+    .submit(&mut Eager(stream))?;
     let mut actual: Vec<f32> = y.to_host_vec().sync_on(stream)?;
     actual.truncate(batch * rows);
     Ok(actual)

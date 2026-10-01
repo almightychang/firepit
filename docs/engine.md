@@ -109,7 +109,7 @@ impl Engine {
 
 ## 6. step plan: 연산 목록 하나
 
-가중치 형식은 `firepit-kernels/src/weights`의 `Weight`가 나타낸다. 엔진은 가중치를 소유하고 `gemv(&Weight, x, y, tile)`을 호출한다. 형식별 GEMV 선택은 `firepit-kernels/src/gemv`에서 한다. E1의 embedding, RMSNorm, add는 각각 `embedding.rs`, `norm.rs`, `elementwise.rs`에 있고 합성 세션 커널은 `synthetic.rs`에 있다.
+가중치 형식은 `firepit-kernels/src/weights`의 `Weight`가 나타낸다. 엔진은 가중치를 소유하고 `gemv(&Weight, x, y, tile)`을 호출한다. 형식별 GEMV 선택은 `firepit-kernels/src/gemv`에서 한다. `firepit-kernels/src/sink.rs`의 `Sink`가 eager 실행과 CUDA Graph 캡처를 공통으로 처리한다. E1의 embedding, RMSNorm, add는 각각 `embedding.rs`, `norm.rs`, `elementwise.rs`에 있고 합성 세션 커널은 `synthetic.rs`에 있다.
 
 ```
  StepPlan = [Op]                          (phase, B)마다 한 번 생성

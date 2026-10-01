@@ -51,7 +51,7 @@ impl HostQ8Matrix {
 pub fn gemv(w: &Weight, x: &TensorView<f32>, y: Partition<&mut Tensor<f32>>, tile: GemvTile) -> Gemv;
 ```
 
-가중치는 공유 참조, 출력은 소유권 이동이다. 반환된 `Gemv`는 eager 실행에 `sync_on`, CUDA Graph 캡처에 `record`를 제공한다. 형식 선택은 이 타입 안에서 한다.
+가중치는 공유 참조, 출력은 소유권 이동이다. 반환된 `Gemv`는 `submit(&mut sink)`로 실행한다. `Sink` 구현이 eager 실행과 CUDA Graph 캡처를 해석하고, `Gemv::submit`이 가중치 형식을 한 번만 선택한다.
 
 ## 검증
 

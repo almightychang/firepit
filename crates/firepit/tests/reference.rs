@@ -11,6 +11,7 @@ use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile};
 use firepit_kernels::moe::{ExpertSelection, MoeDims, combine};
 use firepit_kernels::norm::rms_norm;
 use firepit_kernels::rope::{RopeDims, frequencies, generics as rope_generics, rope};
+use firepit_kernels::sink::Eager;
 use firepit_kernels::weights::{DenseMatrix, Weight};
 use half::bf16;
 use std::path::PathBuf;
@@ -106,7 +107,7 @@ fn zero_layer_exit_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
             (&mut logits).partition([1, DEFAULT_GEMV_TILE.rows]),
             DEFAULT_GEMV_TILE,
         )
-        .sync_on(&stream)?;
+        .submit(&mut Eager(&stream))?;
         let actual_logits: Vec<f32> = logits.to_host_vec().sync_on(&stream)?;
         max_logits = max_logits.max(max_error(&actual_logits, &expected_logits.data));
         let actual_top = argmax(&actual_logits);
@@ -353,7 +354,7 @@ fn attention_projection_and_rope_match_hf() -> Result<(), Box<dyn std::error::Er
                 (&mut output).partition([1, DEFAULT_GEMV_TILE.rows]),
                 DEFAULT_GEMV_TILE,
             )
-            .sync_on(&stream)?;
+            .submit(&mut Eager(&stream))?;
             Ok(output)
         };
         let q_proj = project(&q_weights, q_heads * D * 2)?;
@@ -594,7 +595,7 @@ fn attention_decode_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
             (&mut delta).partition([1, DEFAULT_GEMV_TILE.rows]),
             DEFAULT_GEMV_TILE,
         )
-        .sync_on(&stream)?;
+        .submit(&mut Eager(&stream))?;
         let actual_delta: Vec<f32> = delta.to_host_vec().sync_on(&stream)?;
         let expected_f64: Vec<f64> = expected_delta.data.iter().map(|&x| x as f64).collect();
         let delta_error = relative_max(&actual_delta, &expected_f64);
@@ -751,7 +752,7 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
                 logits.partition([1, DEFAULT_GEMV_TILE.rows]),
                 DEFAULT_GEMV_TILE,
             )
-            .sync_on(&stream)?;
+            .submit(&mut Eager(&stream))?;
             let got_logits: Vec<f32> = logits.dup().to_host_vec().sync_on(&stream)?;
             let hf_logits = refs.tensor(&format!("{key}/logits"))?;
             assert_eq!(hf_logits.shape, [dims.experts()]);
@@ -890,7 +891,7 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
                     blocks: DEFAULT_GEMV_TILE.blocks,
                 },
             )
-            .sync_on(&stream)?;
+            .submit(&mut Eager(&stream))?;
             let mut delta = api::zeros::<f32>(&[1, dims.hidden()]).sync_on(&stream)?;
             combine(
                 delta.partition([1, dims.hidden()]),
