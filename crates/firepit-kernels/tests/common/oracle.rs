@@ -37,3 +37,22 @@ pub fn rms_norm(input: &[f32], gamma: &[f32], eps: f32) -> Vec<f64> {
         })
         .collect()
 }
+
+pub fn swiglu(gate_up: &[f32], width: usize) -> Vec<f64> {
+    assert_eq!(gate_up.len() % (2 * width), 0);
+    gate_up
+        .chunks_exact(2 * width)
+        .flat_map(|row| {
+            let (gate, up) = row.split_at(width);
+            gate.iter().zip(up).map(|(&g, &u)| {
+                let g = g as f64;
+                let sigmoid = if g >= 0.0 {
+                    1.0 / (1.0 + (-g).exp())
+                } else {
+                    g.exp() / (1.0 + g.exp())
+                };
+                g * sigmoid * u as f64
+            })
+        })
+        .collect()
+}

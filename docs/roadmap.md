@@ -1,6 +1,6 @@
 # 로드맵
 
-갱신: 2026-09-30. ✔ 완료, ◐ 진행 중, ○ 미착수.
+갱신: 2026-10-01. ✔ 완료, ◐ 진행 중, ○ 미착수.
 
 firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이해하며 구현하는 공부 과정이기도 하다. 그래서 E2부터는 개념 하나를 한 덩이로 자른다.
 
@@ -66,7 +66,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 | 2.0 정답 기준 만들기 | config 읽기, 가중치 이름과 모양, forward에서 흐르는 값 | HF로 layer별 중간값 덤프, Rust가 실제 가중치 일부 로드 | ✔ |
 | 2.1 입구와 출구 | token → embedding, 마지막 norm → LM head → logits | layer 0개 모델의 logits가 HF와 일치 | ✔ |
 | 2.2 RMSNorm | 정규화하는 이유, Qwen의 weight 형태 | 실제 가중치로 일치 | ✔ (2.1의 final norm으로 확인) |
-| 2.3 SwiGLU MLP | FFN의 gate · up · down | shared expert 하나가 일치 | ○ |
+| 2.3 SwiGLU MLP | FFN의 gate · up · down | shared expert 하나가 일치 | ✔ |
 | 2.4 Attention ① | Q · K · V, RoPE, q/k norm | 한 token의 q, k가 일치 | ○ |
 | 2.5 Attention ② | KV cache, GQA, softmax, output gate | attention layer 하나가 여러 step에서 일치 | ○ |
 | 2.6 MoE | router, top-8 선택, expert 가중합 | MoE 블록 하나가 일치 | ○ |
@@ -91,6 +91,7 @@ scripts/dev.sh test -p firepit --test reference -- --ignored
 - Rust는 공식 `safetensors` crate의 header 타입으로 파일을 해석하고 필요한 바이트 범위만 읽는다(mmap을 쓰지 않아 unsafe가 없다).
 - 2.1 비교(5 step): exit_norm 최대 절대 오차 `3.81469727e-6`, logits `5.00679016e-6`; top-1 5개 모두 일치. 잘못된 scale(`w`)을 쓰면 exit_norm 최대 절대 오차 `2.56955013e1`.
 - 2.1b: 합성 모델의 bf16/Q8 가중치 dispatch를 같은 op 목록에 연결했다. batch 1~4, eager/graph, 세션 교체 비교 통과; 두 형식 출력의 최대 절대 차이는 `2.384186e-7`.
+- 2.3: 앞쪽 4개 layer의 shared expert 입력/출력을 HF hook으로 기록해 5 step × 4 layer를 비교했다. 최대 상대오차 `5.36579723e-6`, 실제 bf16 가중치와 Gaussian 입력의 f64 CPU 비교 `3.36419940e-7`. gate/up 순서를 뒤집으면 상대오차 `4.83147961e0`.
 
 ## 확인할 것
 

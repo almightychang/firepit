@@ -52,6 +52,15 @@ def load_prefix(model_dir: Path, layers: int) -> Qwen3_5MoeForCausalLM:
 
 def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
     records, cache = {}, None
+    step = 0
+    def expert_hook(layer):
+        def record(_module, args, output):
+            records[f"step{step}/layer{layer}/shared_expert/in"] = args[0][0].clone()
+            records[f"step{step}/layer{layer}/shared_expert/out"] = output[0].clone()
+        return record
+
+    hooks = [block.mlp.shared_expert.register_forward_hook(expert_hook(layer))
+             for layer, block in enumerate(model.model.layers)]
     with torch.no_grad():
         for step, token in enumerate(tokens):
             out = model.model(input_ids=torch.tensor([[token]]), past_key_values=cache, use_cache=True, output_hidden_states=True)
@@ -61,6 +70,8 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
             exit_norm = norm(out.hidden_states[0])
             records[f"step{step}/exit_norm"] = exit_norm[0, 0].clone()
             records[f"step{step}/logits"] = model.lm_head(exit_norm)[0, 0].clone()
+    for hook in hooks:
+        hook.remove()
     return records
 
 
