@@ -5,6 +5,7 @@
 ## PBT
 
 - 커널마다 기본 64건. `PROPTEST_CASES=256 scripts/dev.sh test ...`로 늘린다(컨테이너에 전달된다).
+- MoE expert GEMV는 기본 16건에서 공통 입력과 행별 입력을 모두 검사한다. 기본 shape는 작은 타일 경계와 배수를 쓰고, `PROPTEST_CASES=256`에서는 expert 8개·64행·512열과 router 256개를 추가한다.
 - proptest는 shape와 seed만 생성하고, 값은 seed에서 `prop_perturb`로 채운다. 분포는 원소마다 근사 Gaussian, 0, ±8 균등, ±32를 섞는다.
 - GEMV의 런타임 N·K는 16~1024행, 128~2048열에서 생성한다(실제 K=2048, expert N=512 포함). RMSNorm 폭은 32/128/2048, SwiGLU 폭은 32/128/512이다. const generic(JIT 특수화)은 고정 집합에서만 고른다.
 - 실패 시 축소된 반례는 테스트 파일 옆의 `.proptest-regressions`에 저장되고, 다음 실행에서 먼저 재생된다.

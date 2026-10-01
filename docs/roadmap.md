@@ -94,6 +94,7 @@ scripts/dev.sh test -p firepit --test reference -- --ignored
 - 2.4: layer 3 attention의 q/k/v/gate를 HF 5 step과 비교했다. 최대 상대오차는 각각 `4.68418046e-7`, `6.65132815e-7`, `3.92343450e-7`, `4.70510518e-7`. 텍스트의 세 위치 축이 같을 때 mRoPE 표는 1D 표와 일치했고, f32 host 표의 최대 절대오차는 `5.96046448e-8`이다. 인접 성분 회전과 전체 256차원 회전의 상대오차는 각각 `4.24366914e-1`, `5.18970913e-1`.
 - 2.5: f32 KV cache와 online softmax, GQA, output gate, o_proj를 layer 3 HF 5 step과 비교했다. `o_proj` 입력과 attention Δx의 최대 상대오차는 각각 `1.50475377e-7`, `3.44580795e-7`. scale 누락과 modulo GQA 매핑의 상대오차는 각각 `6.86910900e-1`, `1.48213966e0`. E1 합성 `kv_append`/`attn_step`은 유지하며 2.9 엔진 통합에서 실제 커널로 교체한다.
 - 2.6: router logits, top-k 번호·가중치, routed 합, MoE Δx를 layer 0~3의 5 step과 비교했다. 최대 상대오차는 logits `3.82721087e-7`, routed 합 `4.32246025e-7`, Δx `1.40249628e-6`; top-k 가중치 최대 절대오차 `1.49011612e-7`, 번호 불일치 0건. 재정규화 누락과 top-(k−1) 대조 상대오차는 `5.30466856e-1`, `7.22364042e-2`. `expert_gemv`는 기존 dense GEMV와 본문이 비슷하다. 이슈 002의 cuTile macro 문제 해결 후 중복 제거를 검토한다.
+- 2.6 후속: `ExpertSelection`으로 device 번호와 가중치를 함께 보유한다. GPU top-k 또는 host 입력 검증으로만 생성하며 expert GEMV와 결합은 이 타입을 받는다.
 
 ## 확인할 것
 

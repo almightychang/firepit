@@ -1,7 +1,8 @@
 use cuda_async::device_operation::{DeviceOp, GraphNode};
 use cutile::DType;
+use cutile::api;
 use cutile::core::ElementType;
-use cutile::tensor::{Partition, Tensor, TensorView};
+use cutile::tensor::{Partition, PartitionMut, Tensor, TensorView};
 use cutile::tile_kernel::TileKernel;
 use std::sync::Arc;
 
@@ -35,8 +36,11 @@ mod kernels {
             let peak_tile: Tile<f32, { [1] }> = reduce_max(remaining, 0i32);
             let peak: f32 = tile_to_scalar(peak_tile.reshape(shape![]));
             let matching: Tile<bool, { [SIZE] }> = eq_tile(remaining, peak.broadcast(shape![SIZE]));
-            let candidates: Tile<i32, { [SIZE] }> =
-                select(matching, positions, experts.broadcast(shape![SIZE]));
+            let candidates: Tile<i32, { [SIZE] }> = select(
+                matching,
+                positions,
+                (experts - 1i32).broadcast(shape![SIZE]),
+            );
             let winner_tile: Tile<i32, { [1] }> = reduce_min(candidates, 0i32);
             let winner: i32 = tile_to_scalar(winner_tile.reshape(shape![]));
             let score: Tile<f32, { [1] }> = exp((peak - origin).broadcast(shape![1]));
@@ -59,32 +63,29 @@ mod kernels {
         expert_ids: &Tensor<i32, { [-1] }>,
         blocks: i32,
         row_tiles: i32,
-        experts: i32,
         input_stride: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
         let expert_tile: Tile<i32, { [1] }> = expert_ids.partition(shape![1]).load([pid.0]);
         let expert: i32 = tile_to_scalar(expert_tile.reshape(shape![]));
+        let w_part = w.partition(shape![BN, NB, 32]);
+        let x_part = x.partition(shape![1, NB, 32]);
         let mut acc: Tile<f32, { [1, BN] }> = constant(0.0f32, shape![1, BN]);
-        if expert >= 0 && expert < experts {
-            let w_part = w.partition(shape![BN, NB, 32]);
-            let x_part = x.partition(shape![1, NB, 32]);
-            for kc in 0i32..(blocks / NB) {
-                let weights: Tile<T, { [BN, NB, 32] }> =
-                    w_part.load([expert * row_tiles + pid.1, kc, 0]);
-                let weights: Tile<f32, { [BN, NB, 32] }> = convert_tile(weights);
-                let xb: Tile<f32, { [1, NB, 32] }> = x_part.load([pid.0 * input_stride, kc, 0]);
-                let xb: Tile<f32, { [BN, NB, 32] }> = xb.broadcast(shape![BN, NB, 32]);
-                let products: Tile<f32, { [BN, NB] }> = reduce_sum(weights * xb, 2);
-                let products: Tile<f32, { [BN] }> = reduce_sum(products, 1);
-                acc = acc + products.reshape(shape![1, BN]);
-            }
+        for kc in 0i32..(blocks / NB) {
+            let weights: Tile<T, { [BN, NB, 32] }> =
+                w_part.load([expert * row_tiles + pid.1, kc, 0]);
+            let weights: Tile<f32, { [BN, NB, 32] }> = convert_tile(weights);
+            let xb: Tile<f32, { [1, NB, 32] }> = x_part.load([pid.0 * input_stride, kc, 0]);
+            let xb: Tile<f32, { [BN, NB, 32] }> = xb.broadcast(shape![BN, NB, 32]);
+            let products: Tile<f32, { [BN, NB] }> = reduce_sum(weights * xb, 2);
+            let products: Tile<f32, { [BN] }> = reduce_sum(products, 1);
+            acc = acc + products.reshape(shape![1, BN]);
         }
         y.store(acc);
     }
 
     #[cutile::entry()]
-    pub fn combine<const H: i32>(
+    pub fn combine_kernel<const H: i32>(
         out: &mut Tensor<f32, { [1, H] }>,
         routed: &Tensor<f32, { [-1, H] }>,
         weights: &Tensor<f32, { [-1] }>,
@@ -105,8 +106,6 @@ mod kernels {
         out.store(sum + shared * sigmoid.broadcast(shape![1, H]));
     }
 }
-
-pub use kernels::{combine, top_k};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeDimensionError;
@@ -203,14 +202,108 @@ impl MoeDims {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpertSelectionError {
+    Count,
+    Index,
+    Duplicate,
+    Weight,
+}
+
+impl std::fmt::Display for ExpertSelectionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid expert selection: {self:?}")
+    }
+}
+
+impl std::error::Error for ExpertSelectionError {}
+
+pub struct ExpertSelection {
+    indices: Tensor<i32>,
+    weights: Tensor<f32>,
+    dims: MoeDims,
+}
+
+impl ExpertSelection {
+    pub fn top_k(
+        logits: &TensorView<'_, f32>,
+        dims: &MoeDims,
+        stream: &Arc<cuda_core::Stream>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        assert_eq!(logits.shape(), &[dims.experts as i32]);
+        let padded = dims.top_k.next_power_of_two();
+        let mut indices = api::zeros::<i32>(&[padded]).sync_on(stream)?;
+        let mut weights = api::zeros::<f32>(&[padded]).sync_on(stream)?;
+        kernels::top_k(
+            logits,
+            indices.partition([padded]),
+            weights.partition([padded]),
+            dims.experts as i32,
+            dims.top_k as i32,
+        )
+        .generics(dims.top_k_generics())
+        .sync_on(stream)?;
+        Ok(Self {
+            indices,
+            weights,
+            dims: *dims,
+        })
+    }
+
+    pub fn parse(
+        indices: &[i32],
+        weights: &[f32],
+        dims: &MoeDims,
+        stream: &Arc<cuda_core::Stream>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        if indices.len() != dims.top_k || weights.len() != dims.top_k {
+            return Err(ExpertSelectionError::Count.into());
+        }
+        let mut seen = vec![false; dims.experts];
+        for &index in indices {
+            if index < 0 || index as usize >= dims.experts {
+                return Err(ExpertSelectionError::Index.into());
+            }
+            if std::mem::replace(&mut seen[index as usize], true) {
+                return Err(ExpertSelectionError::Duplicate.into());
+            }
+        }
+        let total: f32 = weights.iter().sum();
+        if weights
+            .iter()
+            .any(|&weight| !weight.is_finite() || weight < 0.0)
+            || !total.is_finite()
+            || total <= 0.0
+        {
+            return Err(ExpertSelectionError::Weight.into());
+        }
+        let padded = dims.top_k.next_power_of_two();
+        let mut padded_indices = indices.to_vec();
+        padded_indices.resize(padded, 0);
+        let mut padded_weights = weights.to_vec();
+        padded_weights.resize(padded, 0.0);
+        Ok(Self {
+            indices: api::copy_host_vec_to_device(&Arc::new(padded_indices)).sync_on(stream)?,
+            weights: api::copy_host_vec_to_device(&Arc::new(padded_weights)).sync_on(stream)?,
+            dims: *dims,
+        })
+    }
+
+    pub fn indices(&self) -> &Tensor<i32> {
+        &self.indices
+    }
+
+    pub fn weights(&self) -> &Tensor<f32> {
+        &self.weights
+    }
+}
+
 pub fn expert_gemv<'a, T: DType + ElementType>(
     w: &DenseMatrix<T>,
     x: &'a TensorView<'a, f32>,
-    expert_ids: &'a Tensor<i32>,
+    selection: &'a ExpertSelection,
     y: Partition<&'a mut Tensor<f32>>,
-    experts: usize,
     rows_per_expert: usize,
-    active: usize,
     input_stride: usize,
     tile: GemvTile,
 ) -> impl DeviceOp<
@@ -222,25 +315,22 @@ pub fn expert_gemv<'a, T: DType + ElementType>(
         i32,
         i32,
         i32,
-        i32,
     ),
 > + GraphNode
 + 'a {
-    assert!(
-        experts > 0 && experts <= i32::MAX as usize && rows_per_expert > 0 && input_stride <= 1
-    );
+    let dims = selection.dims;
+    assert!(rows_per_expert > 0 && input_stride <= 1);
     assert_eq!(
         w.rows,
-        experts
+        dims.experts
             .checked_mul(rows_per_expert)
             .expect("expert matrix rows overflow")
     );
     assert!(tile.rows > 0 && tile.blocks > 0 && tile.fits(rows_per_expert, w.cols));
-    assert!(active > 0 && active <= expert_ids.shape()[0] as usize);
     assert_eq!(
         x.shape(),
         &[
-            (if input_stride == 0 { 1 } else { active }) as i32,
+            (if input_stride == 0 { 1 } else { dims.top_k }) as i32,
             (w.cols / Q8_BLOCK) as i32,
             Q8_BLOCK as i32
         ]
@@ -249,10 +339,9 @@ pub fn expert_gemv<'a, T: DType + ElementType>(
         y,
         w.weights.clone(),
         x,
-        expert_ids,
+        &selection.indices,
         (w.cols / Q8_BLOCK) as i32,
         (rows_per_expert / tile.rows) as i32,
-        experts as i32,
         input_stride as i32,
     )
     .generics(vec![
@@ -260,6 +349,38 @@ pub fn expert_gemv<'a, T: DType + ElementType>(
         tile.rows.to_string(),
         tile.blocks.to_string(),
     ])
+}
+
+pub fn combine<'a>(
+    out: Partition<&'a mut Tensor<f32>>,
+    routed: &'a Tensor<f32>,
+    selection: &'a ExpertSelection,
+    shared: &'a Tensor<f32>,
+    gate: &'a Tensor<f32>,
+) -> impl DeviceOp<
+    Output = (
+        Partition<&'a mut Tensor<f32>>,
+        &'a Tensor<f32>,
+        &'a Tensor<f32>,
+        &'a Tensor<f32>,
+        &'a Tensor<f32>,
+        i32,
+    ),
+> + GraphNode
++ 'a {
+    let dims = selection.dims;
+    assert_eq!(routed.shape(), &[dims.top_k as i32, dims.hidden as i32]);
+    assert_eq!(shared.shape(), &[1, dims.hidden as i32]);
+    assert_eq!(gate.shape(), &[1, 1]);
+    kernels::combine_kernel(
+        out,
+        routed,
+        &selection.weights,
+        shared,
+        gate,
+        dims.top_k as i32,
+    )
+    .generics(dims.combine_generics())
 }
 
 #[cfg(test)]

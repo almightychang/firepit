@@ -7,7 +7,7 @@ use firepit::{Checkpoint, SafetensorsFile};
 use firepit_kernels::attention::{AttentionDims, cache_append, online_attention, output_gate};
 use firepit_kernels::dense::{DenseMatrix, dense_gemv};
 use firepit_kernels::hybrid::rms_norm;
-use firepit_kernels::moe::{MoeDims, combine, expert_gemv, top_k};
+use firepit_kernels::moe::{ExpertSelection, MoeDims, combine, expert_gemv};
 use firepit_kernels::q8::{DEFAULT_GEMV_TILE, GemvTile};
 use firepit_kernels::rope::{RopeDims, frequencies, generics as rope_generics, rope};
 use half::bf16;
@@ -656,18 +656,16 @@ fn expert_outputs(
     gate_up: &DenseMatrix<bf16>,
     down: &DenseMatrix<bf16>,
     x: &Tensor<f32>,
-    ids: &Tensor<i32>,
+    selection: &ExpertSelection,
 ) -> Result<Tensor<f32>, Box<dyn std::error::Error>> {
     let mut projected =
         api::zeros::<f32>(&[dims.top_k(), 2 * dims.intermediate()]).sync_on(stream)?;
     expert_gemv(
         gate_up,
         &x.view(&[1, dims.hidden() / 32, 32])?,
-        ids,
+        selection,
         projected.partition([1, DEFAULT_GEMV_TILE.rows]),
-        dims.experts(),
         2 * dims.intermediate(),
-        dims.top_k(),
         0,
         DEFAULT_GEMV_TILE,
     )
@@ -680,11 +678,9 @@ fn expert_outputs(
     expert_gemv(
         down,
         &activated.view(&[dims.top_k(), dims.intermediate() / 32, 32])?,
-        ids,
+        selection,
         outputs.partition([1, DEFAULT_GEMV_TILE.rows]),
-        dims.experts(),
         dims.hidden(),
-        dims.top_k(),
         1,
         DEFAULT_GEMV_TILE,
     )
@@ -777,20 +773,10 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
             worst[0] = worst[0].max(logits_error);
             assert!(logits_error < 1e-5, "{key} router logits {logits_error}");
 
-            let padded = dims.top_k().next_power_of_two();
-            let mut ids = api::zeros::<i32>(&[padded]).sync_on(&stream)?;
-            let mut weights = api::zeros::<f32>(&[padded]).sync_on(&stream)?;
-            top_k(
-                &logits.view(&[dims.experts()])?,
-                ids.partition([padded]),
-                weights.partition([padded]),
-                dims.experts() as i32,
-                dims.top_k() as i32,
-            )
-            .generics(dims.top_k_generics())
-            .sync_on(&stream)?;
-            let got_ids: Vec<i32> = ids.dup().to_host_vec().sync_on(&stream)?;
-            let got_weights: Vec<f32> = weights.dup().to_host_vec().sync_on(&stream)?;
+            let selection =
+                ExpertSelection::top_k(&logits.view(&[dims.experts()])?, &dims, &stream)?;
+            let got_ids: Vec<i32> = selection.indices().dup().to_host_vec().sync_on(&stream)?;
+            let got_weights: Vec<f32> = selection.weights().dup().to_host_vec().sync_on(&stream)?;
             let hf_ids = refs.tensor(&format!("{key}/indices"))?;
             let hf_weights = refs.tensor(&format!("{key}/weights"))?;
             assert_eq!(hf_ids.shape, [dims.top_k()]);
@@ -819,27 +805,20 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
                 assert!(weight_error < 1e-5, "{key} top-k weights {weight_error}");
             }
 
-            let mut hf_ids_padded: Vec<i32> = hf_ids.data.iter().map(|&v| v as i32).collect();
-            hf_ids_padded.resize(padded, 0);
-            let mut hf_weights_padded = hf_weights.data;
-            hf_weights_padded.resize(padded, 0.0);
-            let hf_ids_gpu =
-                api::copy_host_vec_to_device(&Arc::new(hf_ids_padded)).sync_on(&stream)?;
-            let hf_weights_gpu =
-                api::copy_host_vec_to_device(&Arc::new(hf_weights_padded)).sync_on(&stream)?;
-            let hf_outputs = expert_outputs(&stream, dims, &gate_up, &down, &x, &hf_ids_gpu)?;
+            let hf_ids_host: Vec<i32> = hf_ids.data.iter().map(|&v| v as i32).collect();
+            let hf_selection =
+                ExpertSelection::parse(&hf_ids_host, &hf_weights.data, &dims, &stream)?;
+            let hf_outputs = expert_outputs(&stream, dims, &gate_up, &down, &x, &hf_selection)?;
             let zero_shared = api::zeros::<f32>(&[1, dims.hidden()]).sync_on(&stream)?;
             let zero_gate = api::zeros::<f32>(&[1, 1]).sync_on(&stream)?;
             let mut routed = api::zeros::<f32>(&[1, dims.hidden()]).sync_on(&stream)?;
             combine(
                 routed.partition([1, dims.hidden()]),
                 &hf_outputs,
-                &hf_weights_gpu,
+                &hf_selection,
                 &zero_shared,
                 &zero_gate,
-                dims.top_k() as i32,
             )
-            .generics(dims.combine_generics())
             .sync_on(&stream)?;
             let got_routed: Vec<f32> = routed.to_host_vec().sync_on(&stream)?;
             let hf_routed = refs.tensor(&format!("{key}/routed"))?;
@@ -861,7 +840,7 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
                     .iter()
                     .map(|&v| ((v - maximum) as f64).exp())
                     .sum();
-                let mut no_renorm: Vec<f32> = hf_ids
+                let no_renorm: Vec<f32> = hf_ids
                     .data
                     .iter()
                     .map(|&id| {
@@ -869,8 +848,7 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
                             as f32
                     })
                     .collect();
-                no_renorm.resize(padded, 0.0);
-                let mut top_k_minus_one = hf_weights_gpu.dup().to_host_vec().sync_on(&stream)?;
+                let mut top_k_minus_one = hf_weights.data.clone();
                 top_k_minus_one[dims.top_k() - 1] = 0.0;
                 let sum: f32 = top_k_minus_one[..dims.top_k() - 1].iter().sum();
                 for weight in &mut top_k_minus_one[..dims.top_k() - 1] {
@@ -878,18 +856,16 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let wrong_output =
                     |scores: Vec<f32>| -> Result<Vec<f32>, Box<dyn std::error::Error>> {
-                        let scores =
-                            api::copy_host_vec_to_device(&Arc::new(scores)).sync_on(&stream)?;
+                        let wrong_selection =
+                            ExpertSelection::parse(&hf_ids_host, &scores, &dims, &stream)?;
                         let mut out = api::zeros::<f32>(&[1, dims.hidden()]).sync_on(&stream)?;
                         combine(
                             out.partition([1, dims.hidden()]),
                             &hf_outputs,
-                            &scores,
+                            &wrong_selection,
                             &zero_shared,
                             &zero_gate,
-                            dims.top_k() as i32,
                         )
-                        .generics(dims.combine_generics())
                         .sync_on(&stream)?;
                         Ok(out.to_host_vec().sync_on(&stream)?)
                     };
@@ -899,7 +875,7 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
                 assert!(wrong_renorm > 1e-5 && wrong_k > 1e-5);
             }
 
-            let own_outputs = expert_outputs(&stream, dims, &gate_up, &down, &x, &ids)?;
+            let own_outputs = expert_outputs(&stream, dims, &gate_up, &down, &x, &selection)?;
             let shared_output =
                 gpu_expert_tensor(&stream, &shared.gate_up, &shared.down, &x, dims)?;
             let mut gate = api::zeros::<f32>(&[1, 1]).sync_on(&stream)?;
@@ -917,12 +893,10 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
             combine(
                 delta.partition([1, dims.hidden()]),
                 &own_outputs,
-                &weights,
+                &selection,
                 &shared_output,
                 &gate,
-                dims.top_k() as i32,
             )
-            .generics(dims.combine_generics())
             .sync_on(&stream)?;
             let got_delta: Vec<f32> = delta.to_host_vec().sync_on(&stream)?;
             let hf_delta = refs.tensor(&format!("{key}/delta"))?;

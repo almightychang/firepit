@@ -2,9 +2,9 @@ use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
-use cutile::tile_kernel::TileKernel;
+use cutile::tile_kernel::ToHostVecOp;
 use firepit_kernels::dense::DenseMatrix;
-use firepit_kernels::moe::{MoeDims, combine, expert_gemv, top_k};
+use firepit_kernels::moe::{ExpertSelection, MoeDims, combine, expert_gemv};
 use firepit_kernels::q8::GemvTile;
 use std::sync::Arc;
 
@@ -15,19 +15,9 @@ fn top_k_gpu_smoke() -> Result<(), Box<dyn std::error::Error>> {
     let stream = device.new_stream()?;
     let logits = api::copy_host_vec_to_device(&Arc::new(vec![0.2f32, 2.0, -1.0, 1.0, 3.0]))
         .sync_on(&stream)?;
-    let mut ids = api::zeros::<i32>(&[dims.top_k().next_power_of_two()]).sync_on(&stream)?;
-    let mut weights = api::zeros::<f32>(&[dims.top_k().next_power_of_two()]).sync_on(&stream)?;
-    top_k(
-        &logits,
-        ids.partition([dims.top_k().next_power_of_two()]),
-        weights.partition([dims.top_k().next_power_of_two()]),
-        dims.experts() as i32,
-        dims.top_k() as i32,
-    )
-    .generics(dims.top_k_generics())
-    .sync_on(&stream)?;
-    let ids: Vec<i32> = ids.to_host_vec().sync_on(&stream)?;
-    let weights: Vec<f32> = weights.to_host_vec().sync_on(&stream)?;
+    let selection = ExpertSelection::top_k(&logits.view(&[dims.experts()])?, &dims, &stream)?;
+    let ids: Vec<i32> = selection.indices().dup().to_host_vec().sync_on(&stream)?;
+    let weights: Vec<f32> = selection.weights().dup().to_host_vec().sync_on(&stream)?;
     assert_eq!(&ids[..dims.top_k()], &[4, 1, 3]);
     assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
     Ok(())
@@ -46,16 +36,15 @@ fn expert_gemv_gpu_smoke() -> Result<(), Box<dyn std::error::Error>> {
     let x = api::copy_host_vec_to_device(&Arc::new(vec![1.0f32; 32]))
         .reshape(&[1, 1, 32])
         .sync_on(&stream)?;
-    let ids = api::copy_host_vec_to_device(&Arc::new(vec![1i32, 0])).sync_on(&stream)?;
+    let dims = MoeDims::new(32, 32, 32, 2, 2)?;
+    let selection = ExpertSelection::parse(&[1, 0], &[0.5, 0.5], &dims, &stream)?;
     let mut y = api::zeros::<f32>(&[2, 32]).sync_on(&stream)?;
     expert_gemv(
         &matrix,
         &x.view(&[1, 1, 32])?,
-        &ids,
+        &selection,
         y.partition([1, 16]),
-        2,
         32,
-        2,
         0,
         GemvTile {
             rows: 16,
@@ -80,31 +69,22 @@ fn ids_host(rank: usize) -> usize {
 }
 
 #[test]
-fn expert_gemv_rejects_device_index_out_of_range() -> Result<(), Box<dyn std::error::Error>> {
+fn expert_selection_parse_rejects_invalid_inputs() -> Result<(), Box<dyn std::error::Error>> {
     let stream = common::stream();
-    let matrix = DenseMatrix::upload(vec![1.0f32; 2 * 16 * 128], 32, 128, &stream)?;
-    let x = api::copy_host_vec_to_device(&Arc::new(vec![1.0f32; 128]))
-        .reshape(&[1, 4, 32])
-        .sync_on(&stream)?;
-    let ids = api::copy_host_vec_to_device(&Arc::new(vec![-1i32, 2])).sync_on(&stream)?;
-    let mut y = api::zeros::<f32>(&[2, 16]).sync_on(&stream)?;
-    expert_gemv(
-        &matrix,
-        &x.view(&[1, 4, 32])?,
-        &ids,
-        y.partition([1, 16]),
-        2,
-        16,
-        2,
-        0,
-        GemvTile {
-            rows: 16,
-            blocks: 4,
-        },
-    )
-    .sync_on(&stream)?;
-    let actual: Vec<f32> = y.to_host_vec().sync_on(&stream)?;
-    assert!(actual.iter().all(|&v| v == 0.0));
+    let dims = MoeDims::new(32, 32, 32, 2, 2)?;
+    for (ids, weights) in [
+        (vec![-1, 0], vec![0.5, 0.5]),
+        (vec![0, 2], vec![0.5, 0.5]),
+        (vec![0], vec![1.0]),
+        (vec![0, 0], vec![0.5, 0.5]),
+        (vec![0, 1], vec![f32::NAN, 0.5]),
+        (vec![0, 1], vec![f32::INFINITY, 0.5]),
+        (vec![0, 1], vec![-0.1, 1.1]),
+        (vec![0, 1], vec![0.0, 0.0]),
+    ] {
+        assert!(ExpertSelection::parse(&ids, &weights, &dims, &stream).is_err());
+    }
+    assert!(ExpertSelection::parse(&[0, 1], &[0.5], &dims, &stream).is_err());
     Ok(())
 }
 
@@ -117,7 +97,8 @@ fn combine_gpu_smoke() -> Result<(), Box<dyn std::error::Error>> {
     ))
     .reshape(&[2, 32])
     .sync_on(&stream)?;
-    let weights = api::copy_host_vec_to_device(&Arc::new(vec![0.25f32, 0.75])).sync_on(&stream)?;
+    let dims = MoeDims::new(32, 32, 32, 2, 2)?;
+    let selection = ExpertSelection::parse(&[0, 1], &[0.25, 0.75], &dims, &stream)?;
     let shared = api::copy_host_vec_to_device(&Arc::new(vec![2.0f32; 32]))
         .reshape(&[1, 32])
         .sync_on(&stream)?;
@@ -125,9 +106,7 @@ fn combine_gpu_smoke() -> Result<(), Box<dyn std::error::Error>> {
         .reshape(&[1, 1])
         .sync_on(&stream)?;
     let mut out = api::zeros::<f32>(&[1, 32]).sync_on(&stream)?;
-    combine(out.partition([1, 32]), &routed, &weights, &shared, &gate, 2)
-        .generics(vec!["32".into()])
-        .sync_on(&stream)?;
+    combine(out.partition([1, 32]), &routed, &selection, &shared, &gate).sync_on(&stream)?;
     let actual: Vec<f32> = out.to_host_vec().sync_on(&stream)?;
     assert!(actual.iter().all(|v| (v - 3.5).abs() < 1e-6));
     Ok(())
@@ -137,6 +116,13 @@ mod common;
 use common::{check, strategy};
 use proptest::prelude::*;
 
+fn deep_cases() -> bool {
+    std::env::var("PROPTEST_CASES")
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .is_some_and(|cases| cases >= 256)
+}
+
 fn select_gpu(
     stream: &Arc<cuda_core::Stream>,
     logits: &[f32],
@@ -144,20 +130,9 @@ fn select_gpu(
 ) -> Result<(Vec<i32>, Vec<f32>), Box<dyn std::error::Error>> {
     let dims = MoeDims::new(32, 32, 32, logits.len(), k)?;
     let x = api::copy_host_vec_to_device(&Arc::new(logits.to_vec())).sync_on(stream)?;
-    let pad = k.next_power_of_two();
-    let mut ids = api::zeros::<i32>(&[pad]).sync_on(stream)?;
-    let mut weights = api::zeros::<f32>(&[pad]).sync_on(stream)?;
-    top_k(
-        &x,
-        ids.partition([pad]),
-        weights.partition([pad]),
-        logits.len() as i32,
-        k as i32,
-    )
-    .generics(dims.top_k_generics())
-    .sync_on(stream)?;
-    let mut ids: Vec<i32> = ids.to_host_vec().sync_on(stream)?;
-    let mut weights: Vec<f32> = weights.to_host_vec().sync_on(stream)?;
+    let selection = ExpertSelection::top_k(&x.view(&[logits.len()])?, &dims, stream)?;
+    let mut ids: Vec<i32> = selection.indices().dup().to_host_vec().sync_on(stream)?;
+    let mut weights: Vec<f32> = selection.weights().dup().to_host_vec().sync_on(stream)?;
     ids.truncate(k);
     weights.truncate(k);
     Ok((ids, weights))
@@ -166,11 +141,17 @@ fn select_gpu(
 #[test]
 fn top_k_oracle_and_metamorphic() {
     let stream = common::stream();
-    let cases = (
-        prop::sample::select(vec![8usize, 16, 32, 64, 256]),
-        1usize..=8,
-    )
-        .prop_flat_map(|(experts, k)| (Just(experts), Just(k), strategy::values(experts)));
+    let mut sizes = vec![5usize, 8, 16, 32];
+    if deep_cases() {
+        sizes.push(256);
+    }
+    let cases = prop::sample::select(sizes).prop_flat_map(|experts| {
+        (
+            Just(experts),
+            1usize..=experts.min(8),
+            strategy::values(experts),
+        )
+    });
     common::runner(64, file!())
         .run(&cases, |(experts, k, values)| {
             let logits: Vec<f32> = values
@@ -193,6 +174,9 @@ fn top_k_oracle_and_metamorphic() {
                 prop_assert_eq!(ids[rank], expected[rank] as i32);
                 prop_assert!((weights[rank] as f64 - scores[rank] / total).abs() < 2e-6);
             }
+            let unique: std::collections::HashSet<_> = ids.iter().copied().collect();
+            prop_assert_eq!(unique.len(), k);
+            prop_assert!(ids.iter().all(|&id| id >= 0 && (id as usize) < experts));
             prop_assert!((weights.iter().sum::<f32>() - 1.0).abs() < 2e-6);
             let reversed: Vec<f32> = logits.iter().copied().rev().collect();
             let (permuted, permuted_weights) = select_gpu(&stream, &reversed, k)
@@ -220,12 +204,27 @@ fn top_k_oracle_and_metamorphic() {
 #[test]
 fn expert_gemv_matches_f64_oracle() {
     let stream = common::stream();
+    let mut experts = vec![2usize, 4];
+    let mut rows = vec![16usize, 32];
+    let mut cols = vec![128usize, 256];
+    if deep_cases() {
+        experts.push(8);
+        rows.push(64);
+        cols.push(512);
+    }
     let cases = (
-        prop::sample::select(vec![2usize, 4, 8]),
-        prop::sample::select(vec![16usize, 32, 64]),
-        prop::sample::select(vec![128usize, 256]),
-        1usize..=4,
+        prop::sample::select(experts),
+        prop::sample::select(rows),
+        prop::sample::select(cols),
     )
+        .prop_flat_map(|(experts, rows, cols)| {
+            (
+                Just(experts),
+                Just(rows),
+                Just(cols),
+                1usize..=experts.min(4),
+            )
+        })
         .prop_flat_map(|(experts, rows, cols, k)| {
             (
                 Just((experts, rows, cols, k)),
@@ -233,15 +232,16 @@ fn expert_gemv_matches_f64_oracle() {
                 strategy::values(k * cols),
             )
         });
-    common::runner(64, file!())
+    common::runner(16, file!())
         .run(&cases, |((experts, rows, cols, k), weights, inputs)| {
             let ids_host: Vec<i32> = (0..k)
                 .map(|rank| ((rank * 3 + 1) % experts) as i32)
                 .collect();
-            let matrix = DenseMatrix::upload(weights.clone(), experts * rows, cols, &stream)
+            let dims = MoeDims::new(cols, 32, 32, experts, k)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let ids = api::copy_host_vec_to_device(&Arc::new(ids_host.clone()))
-                .sync_on(&stream)
+            let selection = ExpertSelection::parse(&ids_host, &vec![1.0; k], &dims, &stream)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let matrix = DenseMatrix::upload(weights.clone(), experts * rows, cols, &stream)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
             for stride in [0usize, 1] {
                 let input = if stride == 0 {
@@ -260,11 +260,9 @@ fn expert_gemv_matches_f64_oracle() {
                     &matrix,
                     &x.view(&[if stride == 0 { 1 } else { k }, cols / 32, 32])
                         .map_err(|e| TestCaseError::fail(e.to_string()))?,
-                    &ids,
+                    &selection,
                     out.partition([1, 16]),
-                    experts,
                     rows,
-                    k,
                     stride,
                     GemvTile {
                         rows: 16,
@@ -319,8 +317,11 @@ fn combine_matches_f64_oracle() {
                 .reshape(&[k, h])
                 .sync_on(&stream)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let weights_gpu = api::copy_host_vec_to_device(&Arc::new(weights.clone()))
-                .sync_on(&stream)
+            let scores: Vec<f32> = weights.iter().map(|&weight| weight.abs() + 1.0).collect();
+            let dims =
+                MoeDims::new(h, 32, 32, k, k).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let ids: Vec<i32> = (0..k as i32).collect();
+            let selection = ExpertSelection::parse(&ids, &scores, &dims, &stream)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
             let shared_gpu = api::copy_host_vec_to_device(&Arc::new(shared.clone()))
                 .reshape(&[1, h])
@@ -336,12 +337,10 @@ fn combine_matches_f64_oracle() {
             combine(
                 out.partition([1, h]),
                 &routed_gpu,
-                &weights_gpu,
+                &selection,
                 &shared_gpu,
                 &gate_gpu,
-                k as i32,
             )
-            .generics(vec![h.to_string()])
             .sync_on(&stream)
             .map_err(|e| TestCaseError::fail(e.to_string()))?;
             let got: Vec<f32> = out
@@ -352,12 +351,20 @@ fn combine_matches_f64_oracle() {
             let expected: Vec<f64> = (0..h)
                 .map(|col| {
                     (0..k)
-                        .map(|rank| weights[rank] as f64 * routed[rank * h + col] as f64)
+                        .map(|rank| scores[rank] as f64 * routed[rank * h + col] as f64)
                         .sum::<f64>()
                         + sigmoid * shared[col] as f64
                 })
                 .collect();
-            prop_assert!(check::max_relative(&got, &expected) < 1e-5);
+            let magnitude: Vec<f64> = (0..h)
+                .map(|col| {
+                    (0..k)
+                        .map(|rank| (scores[rank] as f64 * routed[rank * h + col] as f64).abs())
+                        .sum::<f64>()
+                        + (sigmoid * shared[col] as f64).abs()
+                })
+                .collect();
+            prop_assert!(check::inner_product_excess(&got, &expected, &magnitude, k + 2) <= 1.0);
             Ok(())
         })
         .unwrap();
