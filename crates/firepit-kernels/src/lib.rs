@@ -1,3 +1,4 @@
+pub mod attention;
 pub mod dense;
 pub mod hybrid;
 pub mod q8;

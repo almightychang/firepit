@@ -4,6 +4,7 @@ use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit::{Checkpoint, SafetensorsFile};
+use firepit_kernels::attention::{AttentionDims, cache_append, online_attention, output_gate};
 use firepit_kernels::dense::{DenseMatrix, dense_gemv};
 use firepit_kernels::hybrid::rms_norm;
 use firepit_kernels::q8::DEFAULT_GEMV_TILE;
@@ -510,5 +511,199 @@ fn attention_projection_and_rope_match_hf() -> Result<(), Box<dyn std::error::Er
     );
     assert!(worst.iter().all(|&x| x < 1e-5));
     assert!(wrong_pair > 1e-5 && wrong_full > 1e-5);
+    Ok(())
+}
+
+fn alternate_attention(
+    dims: &AttentionDims,
+    query: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    gate: &[f32],
+    length: usize,
+) -> Vec<f32> {
+    let (d, qh, kvh) = (dims.head_dim(), dims.q_heads(), dims.kv_heads());
+    let mut out = vec![0.0; qh * d];
+    for h in 0..qh {
+        let kh = h % kvh;
+        let scores: Vec<f64> = (0..length)
+            .map(|t| {
+                let base = (t * kvh + kh) * d;
+                (0..d)
+                    .map(|i| query[h * d + i] as f64 * keys[base + i] as f64)
+                    .sum::<f64>()
+                    * dims.scale() as f64
+            })
+            .collect();
+        let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let weights: Vec<f64> = scores.iter().map(|&s| (s - maximum).exp()).collect();
+        let denominator: f64 = weights.iter().sum();
+        for i in 0..d {
+            let value: f64 = (0..length)
+                .map(|t| weights[t] * values[(t * kvh + kh) * d + i] as f64)
+                .sum::<f64>()
+                / denominator;
+            out[h * d + i] = (value / (1.0 + (-(gate[h * d + i] as f64)).exp())) as f32;
+        }
+    }
+    out
+}
+
+#[test]
+#[ignore = "needs Qwen3.6 weights and regenerated reference trace"]
+fn attention_decode_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
+    let model_dir = home("Models/qwen3.6-35b-a3b");
+    let config: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
+    let text = &config["text_config"];
+    let parse = |key: &str| -> Result<usize, Box<dyn std::error::Error>> {
+        Ok(text[key].as_u64().ok_or(format!("missing {key}"))? as usize)
+    };
+    let dims = AttentionDims::new(
+        parse("max_position_embeddings")?,
+        parse("num_attention_heads")?,
+        parse("num_key_value_heads")?,
+        parse("head_dim")?,
+    )?;
+    let weights = Checkpoint::open(model_dir)?;
+    let refs = SafetensorsFile::open(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../refs/qwen36-prefix4.safetensors"),
+    )?;
+    let o = weights.tensor_bf16("model.language_model.layers.3.self_attn.o_proj.weight")?;
+    let hidden = parse("hidden_size")?;
+    assert_eq!(o.shape, [hidden, dims.q_heads() * dims.head_dim()]);
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let matrix = DenseMatrix::upload(o.data, hidden, dims.q_heads() * dims.head_dim(), &stream)?;
+    let mut k_cache =
+        api::zeros::<f32>(&[dims.max_seq(), dims.kv_heads(), dims.head_dim()]).sync_on(&stream)?;
+    let mut v_cache =
+        api::zeros::<f32>(&[dims.max_seq(), dims.kv_heads(), dims.head_dim()]).sync_on(&stream)?;
+    let mut history_k = Vec::new();
+    let mut history_v = Vec::new();
+    let mut worst_input = 0.0f64;
+    let mut worst_delta = 0.0f64;
+    let mut wrong_scale = 0.0f64;
+    let mut wrong_gqa = 0.0f64;
+    for step in 0..5 {
+        let prefix = format!("step{step}/layer3/attn");
+        let q = refs.tensor(&format!("{prefix}/q"))?;
+        let k = refs.tensor(&format!("{prefix}/k"))?;
+        let v = refs.tensor(&format!("{prefix}/v"))?;
+        let gate = refs.tensor(&format!("{prefix}/gate"))?;
+        let expected_input = refs.tensor(&format!("{prefix}/o_proj_in"))?;
+        let expected_delta = refs.tensor(&format!("{prefix}/delta"))?;
+        assert_eq!(q.shape, [dims.q_heads() * dims.head_dim()]);
+        assert_eq!(k.shape, [dims.kv_heads() * dims.head_dim()]);
+        assert_eq!(v.shape, k.shape);
+        let q_device = api::copy_host_vec_to_device(&Arc::new(q.data.clone()))
+            .reshape(&[dims.q_heads(), dims.head_dim()])
+            .sync_on(&stream)?;
+        let k_device = api::copy_host_vec_to_device(&Arc::new(k.data.clone()))
+            .reshape(&[dims.kv_heads(), dims.head_dim()])
+            .sync_on(&stream)?;
+        let v_device = api::copy_host_vec_to_device(&Arc::new(v.data.clone()))
+            .reshape(&[dims.kv_heads(), dims.head_dim()])
+            .sync_on(&stream)?;
+        let g_device = api::copy_host_vec_to_device(&Arc::new(gate.data.clone()))
+            .reshape(&[dims.q_heads(), dims.head_dim()])
+            .sync_on(&stream)?;
+        let position =
+            api::copy_host_vec_to_device(&Arc::new(vec![step as i32])).sync_on(&stream)?;
+        cache_append(
+            k_cache.partition([dims.max_seq(), 1, dims.head_dim()]),
+            v_cache.partition([dims.max_seq(), 1, dims.head_dim()]),
+            &k_device,
+            &v_device,
+            &position,
+        )
+        .generics(dims.cache_generics())
+        .sync_on(&stream)?;
+        let mut attention =
+            api::zeros::<f32>(&[dims.q_heads(), dims.head_dim()]).sync_on(&stream)?;
+        online_attention(
+            (&mut attention).partition([1, dims.head_dim()]),
+            &q_device,
+            &k_cache,
+            &v_cache,
+            &position,
+            dims.scale(),
+        )
+        .generics(dims.attention_generics())
+        .sync_on(&stream)?;
+        let mut gated = api::zeros::<f32>(&[dims.q_heads(), dims.head_dim()]).sync_on(&stream)?;
+        output_gate(
+            (&mut gated).partition([1, dims.head_dim()]),
+            &attention,
+            &g_device,
+        )
+        .generics(dims.gate_generics())
+        .sync_on(&stream)?;
+        let actual_input: Vec<f32> = gated.dup().to_host_vec().sync_on(&stream)?;
+        let expected_f64: Vec<f64> = expected_input.data.iter().map(|&x| x as f64).collect();
+        let input_error = relative_max(&actual_input, &expected_f64);
+        worst_input = worst_input.max(input_error);
+        let mut delta = api::zeros::<f32>(&[1, hidden]).sync_on(&stream)?;
+        dense_gemv(
+            &matrix,
+            &gated.view(&[1, dims.q_heads() * dims.head_dim() / 32, 32])?,
+            (&mut delta).partition([1, DEFAULT_GEMV_TILE.rows]),
+            DEFAULT_GEMV_TILE,
+        )
+        .sync_on(&stream)?;
+        let actual_delta: Vec<f32> = delta.to_host_vec().sync_on(&stream)?;
+        let expected_f64: Vec<f64> = expected_delta.data.iter().map(|&x| x as f64).collect();
+        let delta_error = relative_max(&actual_delta, &expected_f64);
+        worst_delta = worst_delta.max(delta_error);
+        println!(
+            "step{step} o_proj_in max_relative={input_error:.8e} delta max_relative={delta_error:.8e}"
+        );
+        history_k.extend(k.data.iter().copied());
+        history_v.extend(v.data.iter().copied());
+        if step == 4 {
+            let mut unscaled =
+                api::zeros::<f32>(&[dims.q_heads(), dims.head_dim()]).sync_on(&stream)?;
+            online_attention(
+                (&mut unscaled).partition([1, dims.head_dim()]),
+                &q_device,
+                &k_cache,
+                &v_cache,
+                &position,
+                1.0,
+            )
+            .generics(dims.attention_generics())
+            .sync_on(&stream)?;
+            let mut wrong =
+                api::zeros::<f32>(&[dims.q_heads(), dims.head_dim()]).sync_on(&stream)?;
+            output_gate(
+                (&mut wrong).partition([1, dims.head_dim()]),
+                &unscaled,
+                &g_device,
+            )
+            .generics(dims.gate_generics())
+            .sync_on(&stream)?;
+            wrong_scale = relative_max(
+                &wrong.to_host_vec().sync_on(&stream)?,
+                &expected_input
+                    .data
+                    .iter()
+                    .map(|&x| x as f64)
+                    .collect::<Vec<_>>(),
+            );
+            wrong_gqa = relative_max(
+                &alternate_attention(&dims, &q.data, &history_k, &history_v, &gate.data, step + 1),
+                &expected_input
+                    .data
+                    .iter()
+                    .map(|&x| x as f64)
+                    .collect::<Vec<_>>(),
+            );
+        }
+    }
+    println!(
+        "attention decode HF o_proj_in={worst_input:.8e} delta={worst_delta:.8e} no_scale={wrong_scale:.8e} modulo_gqa={wrong_gqa:.8e}"
+    );
+    assert!(worst_input < 1e-5 && worst_delta < 1e-5);
+    assert!(wrong_scale > 1e-5 && wrong_gqa > 1e-5);
     Ok(())
 }

@@ -82,6 +82,12 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
     def rotary(_module, _args, output):
         attention["cos"], attention["sin"] = (x.clone() for x in output)
 
+    def output_input(_module, args):
+        records[f"step{step}/layer3/attn/o_proj_in"] = args[0][0, 0].clone()
+
+    def attn_output(_module, _args, output):
+        records[f"step{step}/layer3/attn/delta"] = output[0][0, 0].clone()
+
     hooks = [block.mlp.shared_expert.register_forward_hook(expert_hook(layer))
              for layer, block in enumerate(model.model.layers)]
     if len(model.model.layers) > 3:
@@ -93,6 +99,8 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
             attn.q_norm.register_forward_hook(normalized("q")),
             attn.k_norm.register_forward_hook(normalized("k")),
             model.model.rotary_emb.register_forward_hook(rotary),
+            attn.o_proj.register_forward_pre_hook(output_input),
+            attn.register_forward_hook(attn_output),
         ]
     with torch.no_grad():
         positions = torch.tensor([0, 1, 2, 3, 4, 100, 4095, 65535, 262143])
