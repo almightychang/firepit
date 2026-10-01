@@ -7,7 +7,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from transformers import AutoTokenizer
 from transformers.models.qwen3_5_moe.configuration_qwen3_5_moe import Qwen3_5MoeTextConfig
-from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextRotaryEmbedding, apply_rotary_pos_emb
+from transformers.models.qwen3_5_moe.modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextRotaryEmbedding, apply_rotary_pos_emb, causal_conv1d_fn, causal_conv1d_update
 
 MODEL_ID = "Qwen/Qwen3.6-35B-A3B"
 CHECKPOINT_PREFIX = "model.language_model."
@@ -55,6 +55,19 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
     records, cache = {}, None
     step = 0
     attention = {}
+    gdn_qkv = {}
+    def gdn_input(layer):
+        def record(_module, _args, kwargs):
+            records[f"step{step}/layer{layer}/gdn/in"] = kwargs["hidden_states"][0, 0].clone()
+        return record
+
+    def gdn_projection(layer, name):
+        def record(_module, _args, output):
+            value = output[0, 0].clone()
+            records[f"step{step}/layer{layer}/gdn/{name}"] = value
+            if name == "qkv":
+                gdn_qkv[layer] = value
+        return record
     def expert_hook(layer):
         def record(_module, args, output):
             records[f"step{step}/layer{layer}/shared_expert/in"] = args[0][0].clone()
@@ -120,6 +133,11 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
             block.mlp.experts.register_forward_hook(routed_hook(layer)),
             block.mlp.register_forward_hook(moe_output(layer)),
         ]
+        if block.block_type == "linear_attention":
+            gdn = block.linear_attn
+            hooks += [gdn.register_forward_pre_hook(gdn_input(layer), with_kwargs=True)]
+            for name in ("qkv", "z", "b", "a"):
+                hooks.append(getattr(gdn, f"in_proj_{name}").register_forward_hook(gdn_projection(layer, name)))
     if len(model.model.layers) > 3:
         attn = model.model.layers[3].self_attn
         hooks += [
@@ -141,8 +159,31 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
         records["rope/sin"] = sin[0].clone()
         for step, token in enumerate(tokens):
             attention.clear()
+            gdn_qkv.clear()
+            previous = {}
+            for layer, block in enumerate(model.model.layers):
+                if block.block_type == "linear_attention":
+                    gdn = block.linear_attn
+                    prior = None if cache is None else cache.layers[layer].conv_states[0]
+                    previous[layer] = (torch.zeros(1, gdn.conv_dim, gdn.conv_kernel_size) if prior is None else prior.clone())
+                    records[f"step{step}/layer{layer}/gdn/state_before"] = previous[layer][0].clone()
             out = model.model(input_ids=torch.tensor([[token]]), past_key_values=cache, use_cache=True, output_hidden_states=True)
             cache = out.past_key_values
+            for layer, prior in previous.items():
+                gdn = model.model.layers[layer].linear_attn
+                key = f"step{step}/layer{layer}/gdn"
+                records[f"{key}/state_after"] = cache.layers[layer].conv_states[0][0].clone()
+                state = prior[..., 1:].clone()
+                mixed = causal_conv1d_update(gdn_qkv[layer].reshape(1, gdn.conv_dim, 1), state, gdn.conv1d.weight.squeeze(1), gdn.conv1d.bias, gdn.activation)
+                records[f"{key}/conv"] = mixed[0, :, 0].clone()
+                if step == 0:
+                    first = causal_conv1d_fn(gdn_qkv[layer].reshape(1, gdn.conv_dim, 1), gdn.conv1d.weight.squeeze(1), gdn.conv1d.bias, activation=gdn.activation)
+                    records[f"{key}/conv_first_path"] = first[0, :, -1].clone()
+                records[f"{key}/state_update"] = state[0].clone()
+                q, k, v = torch.split(mixed[0, :, 0], [gdn.key_dim, gdn.key_dim, gdn.value_dim])
+                records[f"{key}/q"] = q.clone()
+                records[f"{key}/k"] = k.clone()
+                records[f"{key}/v"] = v.clone()
             if len(model.model.layers) > 3:
                 key = f"step{step}/layer3/attn"
                 q, k = apply_rotary_pos_emb(attention["q"].transpose(1, 2), attention["k"].transpose(1, 2), attention["cos"], attention["sin"])

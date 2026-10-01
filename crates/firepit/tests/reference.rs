@@ -5,6 +5,7 @@ use cutile::tensor::{PartitionMut, Tensor, ToHostVec};
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit::{Checkpoint, SafetensorsFile};
 use firepit_kernels::attention::{AttentionDims, cache_append, online_attention, output_gate};
+use firepit_kernels::gdn::{GdnDims, conv1d_silu};
 use firepit_kernels::gemv::expert_gemv;
 use firepit_kernels::gemv::gemv;
 use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile};
@@ -12,10 +13,172 @@ use firepit_kernels::moe::{ExpertSelection, MoeDims, combine};
 use firepit_kernels::norm::rms_norm;
 use firepit_kernels::rope::{RopeDims, frequencies, generics as rope_generics, rope};
 use firepit_kernels::sink::Eager;
-use firepit_kernels::weights::{DenseMatrix, Weight};
+use firepit_kernels::weights::{DenseMatrix, Q8_BLOCK, Weight};
 use half::bf16;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+fn gdn_dims(model_dir: &std::path::Path) -> Result<GdnDims, Box<dyn std::error::Error>> {
+    let config: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
+    let text = &config["text_config"];
+    let get = |name: &str| -> Result<usize, Box<dyn std::error::Error>> {
+        Ok(text[name].as_u64().ok_or(format!("missing {name}"))? as usize)
+    };
+    Ok(GdnDims::new(
+        get("hidden_size")?,
+        get("linear_num_key_heads")?,
+        get("linear_num_value_heads")?,
+        get("linear_key_head_dim")?,
+        get("linear_value_head_dim")?,
+        get("linear_conv_kernel_dim")?,
+    )?)
+}
+
+#[test]
+#[ignore = "needs Qwen3.6 weights and regenerated GDN reference trace"]
+fn gdn_projection_and_conv_match_hf() -> Result<(), Box<dyn std::error::Error>> {
+    let model_dir = home("Models/qwen3.6-35b-a3b");
+    let dims = gdn_dims(&model_dir)?;
+    let weights = Checkpoint::open(&model_dir)?;
+    let refs = SafetensorsFile::open(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../refs/qwen36-prefix4.safetensors"),
+    )?;
+    let tokens: Vec<usize> = serde_json::from_str(refs.metadata("tokens").ok_or("no tokens")?)?;
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let mut worst_projection = [0.0f64; 4];
+    let mut worst_conv = [[0.0f32; 3]; 3];
+    let mut worst_state = 0.0f32;
+    let mut first_path = 0.0f32;
+    for layer in 0..3 {
+        let prefix = format!("model.language_model.layers.{layer}.linear_attn");
+        let mut matrices = Vec::new();
+        for (name, rows) in [
+            ("qkv", dims.conv_dim()),
+            ("z", dims.value_dim()),
+            ("b", dims.value_heads()),
+            ("a", dims.value_heads()),
+        ] {
+            let tensor = weights.tensor_bf16(&format!("{prefix}.in_proj_{name}.weight"))?;
+            assert_eq!(tensor.shape, [rows, dims.hidden()]);
+            let host = tensor.data;
+            let gpu = DenseMatrix::upload(host.clone(), rows, dims.hidden(), &stream)?;
+            matrices.push((name, rows, host, Weight::Dense(gpu)));
+        }
+        let conv_weight = weights.tensor(&format!("{prefix}.conv1d.weight"))?;
+        assert_eq!(conv_weight.shape, [dims.conv_dim(), 1, dims.conv_kernel()]);
+        let conv_w = api::copy_host_vec_to_device(&Arc::new(conv_weight.data))
+            .reshape(&[dims.conv_dim(), dims.conv_kernel()])
+            .sync_on(&stream)?;
+        for step in 0..tokens.len() {
+            let key = format!("step{step}/layer{layer}/gdn");
+            let mut projection_excess = [0.0f64; 4];
+            let mut conv_error = [0.0f32; 3];
+            let input = refs.tensor(&format!("{key}/in"))?;
+            assert_eq!(input.shape, [dims.hidden()]);
+            let x = api::copy_host_vec_to_device(&Arc::new(input.data.clone())).sync_on(&stream)?;
+            let x_view = x.view(&[1, dims.hidden() / Q8_BLOCK, Q8_BLOCK])?;
+            for (index, (name, rows, host, matrix)) in matrices.iter().enumerate() {
+                let expected = refs.tensor(&format!("{key}/{name}"))?;
+                assert_eq!(expected.shape, [*rows]);
+                let mut output = api::zeros::<f32>(&[1, *rows]).sync_on(&stream)?;
+                gemv(
+                    matrix,
+                    &x_view,
+                    (&mut output).partition([1, DEFAULT_GEMV_TILE.rows]),
+                    DEFAULT_GEMV_TILE,
+                )
+                .submit(&mut Eager(&stream))?;
+                let actual: Vec<f32> = output.to_host_vec().sync_on(&stream)?;
+                let magnitude: Vec<f64> = host
+                    .chunks(dims.hidden())
+                    .map(|row| {
+                        row.iter()
+                            .zip(&input.data)
+                            .map(|(w, x)| (f32::from(*w) as f64 * *x as f64).abs())
+                            .sum()
+                    })
+                    .collect();
+                let reference: Vec<f64> = expected.data.iter().map(|&v| v as f64).collect();
+                let excess =
+                    check::inner_product_excess(&actual, &reference, &magnitude, dims.hidden());
+                worst_projection[index] = worst_projection[index].max(excess);
+                projection_excess[index] = excess;
+                assert!(excess <= 2.0, "{key}/{name} Higham-Mary excess {excess}");
+            }
+            let qkv = refs.tensor(&format!("{key}/qkv"))?;
+            let before = refs.tensor(&format!("{key}/state_before"))?;
+            assert_eq!(before.shape, [dims.conv_dim(), dims.conv_kernel()]);
+            let state_host: Vec<f32> = before
+                .data
+                .chunks(dims.conv_kernel())
+                .flat_map(|row| row[1..].iter().copied())
+                .collect();
+            let qkv_gpu = api::copy_host_vec_to_device(&Arc::new(qkv.data)).sync_on(&stream)?;
+            let mut state = api::copy_host_vec_to_device(&Arc::new(state_host))
+                .reshape(&[dims.conv_dim(), dims.conv_kernel() - 1])
+                .sync_on(&stream)?;
+            let prior = state.dup().sync_on(&stream)?;
+            let mut output = api::zeros::<f32>(&[dims.conv_dim()]).sync_on(&stream)?;
+            conv1d_silu(
+                (&mut output).partition([1]),
+                &qkv_gpu,
+                &prior,
+                state.partition([1, (dims.conv_kernel() - 1).next_power_of_two()]),
+                &conv_w,
+                dims.conv_kernel() as i32,
+            )
+            .generics(dims.conv_generics())
+            .sync_on(&stream)?;
+            let _query = output.slice(&[0..dims.key_dim()])?;
+            let _key = output.slice(&[dims.key_dim()..2 * dims.key_dim()])?;
+            let _value = output.slice(&[2 * dims.key_dim()..dims.conv_dim()])?;
+            let actual: Vec<f32> = output.to_host_vec().sync_on(&stream)?;
+            let after: Vec<f32> = state.to_host_vec().sync_on(&stream)?;
+            for (part, range) in [
+                0..dims.key_dim(),
+                dims.key_dim()..2 * dims.key_dim(),
+                2 * dims.key_dim()..dims.conv_dim(),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let name = ["q", "k", "v"][part];
+                let target = refs.tensor(&format!("{key}/{name}"))?;
+                let error = max_error(&actual[range], &target.data);
+                worst_conv[layer][part] = worst_conv[layer][part].max(error);
+                conv_error[part] = error;
+                assert!(error < 1e-4, "{key}/{name} max_abs {error}");
+            }
+            let target_state = refs.tensor(&format!("{key}/state_update"))?;
+            let state_error = max_error(&after, &target_state.data);
+            let hf_after = refs.tensor(&format!("{key}/state_after"))?;
+            let hf_state: Vec<f32> = hf_after
+                .data
+                .chunks(dims.conv_kernel())
+                .flat_map(|row| row[1..].iter().copied())
+                .collect();
+            assert_eq!(max_error(&after, &hf_state), 0.0, "{key} HF cache state");
+            worst_state = worst_state.max(state_error);
+            assert_eq!(state_error, 0.0, "{key} state");
+            if step == 0 {
+                let direct = refs.tensor(&format!("{key}/conv"))?;
+                let prefill = refs.tensor(&format!("{key}/conv_first_path"))?;
+                let error = max_error(&direct.data, &prefill.data);
+                first_path = first_path.max(error);
+                assert!(error < 1e-6, "{key} first path {error}");
+            }
+            println!(
+                "layer{layer} step{step} projection_excess={projection_excess:?} conv_abs={conv_error:?} state_abs={state_error:.8e}"
+            );
+        }
+    }
+    println!(
+        "GDN worst projection_excess={worst_projection:?} conv_abs={worst_conv:?} state_abs={worst_state:.8e} first_path_abs={first_path:.8e}"
+    );
+    Ok(())
+}
 
 #[allow(dead_code)]
 #[path = "../../firepit-kernels/tests/common/check.rs"]

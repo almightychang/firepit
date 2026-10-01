@@ -1,6 +1,7 @@
 pub mod attention;
 pub mod elementwise;
 pub mod embedding;
+pub mod gdn;
 pub mod gemv;
 pub mod moe;
 pub mod norm;
