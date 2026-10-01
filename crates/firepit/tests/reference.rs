@@ -7,7 +7,7 @@ use firepit::{Checkpoint, SafetensorsFile};
 use firepit_kernels::dense::{DenseMatrix, dense_gemv};
 use firepit_kernels::hybrid::rms_norm;
 use firepit_kernels::q8::DEFAULT_GEMV_TILE;
-use firepit_kernels::rope::{frequencies, generics as rope_generics, rope};
+use firepit_kernels::rope::{RopeDims, frequencies, generics as rope_generics, rope};
 use firepit_kernels::swiglu::swiglu;
 use half::bf16;
 use std::path::PathBuf;
@@ -323,13 +323,15 @@ fn attention_projection_and_rope_match_hf() -> Result<(), Box<dyn std::error::Er
         * text["rope_parameters"]["partial_rotary_factor"]
             .as_f64()
             .ok_or("no rotary factor")?) as usize;
+    let q_rope = RopeDims::new(q_heads, D, rotary_dim, theta)?;
+    let k_rope = RopeDims::new(kv_heads, D, rotary_dim, theta)?;
     let norm_eps = text["rms_norm_eps"].as_f64().ok_or("no norm eps")? as f32;
     let weights = Checkpoint::open(model_dir)?;
     let refs = SafetensorsFile::open(
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../refs/qwen36-prefix4.safetensors"),
     )?;
     let positions = [0, 1, 2, 3, 4, 100, 4095, 65535, 262143];
-    let (cos, sin) = frequencies(&positions, theta, D, rotary_dim);
+    let (cos, sin) = frequencies(&positions, &q_rope);
     let cos_ref = refs.tensor("rope/cos")?;
     let sin_ref = refs.tensor("rope/sin")?;
     assert_eq!(
@@ -442,7 +444,7 @@ fn attention_projection_and_rope_match_hf() -> Result<(), Box<dyn std::error::Er
         )
         .generics(vec![D.to_string()])
         .sync_on(&stream)?;
-        let (cos, sin) = frequencies(&[step], theta, D, rotary_dim);
+        let (cos, sin) = frequencies(&[step], &q_rope);
         let c = api::copy_host_vec_to_device(&Arc::new(cos))
             .reshape(&[1, D])
             .sync_on(&stream)?;
@@ -452,10 +454,10 @@ fn attention_projection_and_rope_match_hf() -> Result<(), Box<dyn std::error::Er
         let mut q = api::zeros::<f32>(&[q_heads, D]).sync_on(&stream)?;
         let mut k = api::zeros::<f32>(&[kv_heads, D]).sync_on(&stream)?;
         rope((&mut q).partition([1, rotary_dim]), &q_norm, &c, &s)
-            .generics(rope_generics(q_heads, D, rotary_dim))
+            .generics(rope_generics(&q_rope))
             .sync_on(&stream)?;
         rope((&mut k).partition([1, rotary_dim]), &k_norm, &c, &s)
-            .generics(rope_generics(kv_heads, D, rotary_dim))
+            .generics(rope_generics(&k_rope))
             .sync_on(&stream)?;
         let got = [
             q.to_host_vec().sync_on(&stream)?,
@@ -473,7 +475,7 @@ fn attention_projection_and_rope_match_hf() -> Result<(), Box<dyn std::error::Er
         if step == 1 {
             let before: Vec<f32> = q_norm.to_host_vec().sync_on(&stream)?;
             let expected = refs.tensor(&format!("{key}/q"))?;
-            let (c, s) = frequencies(&[step], theta, D, rotary_dim);
+            let (c, s) = frequencies(&[step], &q_rope);
             let mut adjacent = before.clone();
             let mut full = before.clone();
             for head in 0..q_heads {

@@ -6,7 +6,7 @@ use cuda_core::Stream;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::TileKernel;
-use firepit_kernels::rope::{frequencies, generics, rope};
+use firepit_kernels::rope::{RopeDims, frequencies, generics, rope};
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -14,13 +14,12 @@ fn gpu(
     stream: &Arc<Stream>,
     input: &[f32],
     positions: &[usize],
-    heads: usize,
-    head_dim: usize,
-    rotary_dim: usize,
+    dims: &RopeDims,
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let (heads, head_dim, rotary_dim) = (dims.heads(), dims.head_dim(), dims.rotary_dim());
     let batch = positions.len();
     assert_eq!(input.len(), batch * heads * head_dim);
-    let (cos, sin) = frequencies(positions, 10_000_000.0, head_dim, rotary_dim);
+    let (cos, sin) = frequencies(positions, dims);
     let x = api::copy_host_vec_to_device(&Arc::new(input.to_vec()))
         .reshape(&[batch * heads, head_dim])
         .sync_on(stream)?;
@@ -32,19 +31,14 @@ fn gpu(
         .sync_on(stream)?;
     let mut output = api::zeros::<f32>(&[batch * heads, head_dim]).sync_on(stream)?;
     rope((&mut output).partition([1, rotary_dim]), &x, &c, &s)
-        .generics(generics(heads, head_dim, rotary_dim))
+        .generics(generics(dims))
         .sync_on(stream)?;
     Ok(output.to_host_vec().sync_on(stream)?)
 }
 
-fn oracle(
-    input: &[f32],
-    positions: &[usize],
-    heads: usize,
-    head_dim: usize,
-    rotary_dim: usize,
-) -> Vec<f64> {
-    let (cos, sin) = frequencies(positions, 10_000_000.0, head_dim, rotary_dim);
+fn oracle(input: &[f32], positions: &[usize], dims: &RopeDims) -> Vec<f64> {
+    let (heads, head_dim, rotary_dim) = (dims.heads(), dims.head_dim(), dims.rotary_dim());
+    let (cos, sin) = frequencies(positions, dims);
     let half = rotary_dim / 2;
     input
         .chunks_exact(head_dim)
@@ -92,9 +86,10 @@ fn rope_matches_f64_oracle() {
                     )
                 }),
             |((heads, head_dim, rotary_dim), positions, input)| {
-                let actual = gpu(&stream, &input, &positions, heads, head_dim, rotary_dim)
+                let dims = RopeDims::new(heads, head_dim, rotary_dim, 10_000_000.0).unwrap();
+                let actual = gpu(&stream, &input, &positions, &dims)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                let expected = oracle(&input, &positions, heads, head_dim, rotary_dim);
+                let expected = oracle(&input, &positions, &dims);
                 prop_assert!(check::max_relative(&actual, &expected) < 3e-6);
                 Ok(())
             },
@@ -115,7 +110,8 @@ fn rope_preserves_norm_and_relative_position() -> Result<(), Box<dyn std::error:
     for row in [&q, &k, &q, &k, &q, &k] {
         input.extend(row);
     }
-    let result = gpu(&stream, &input, &[0, 100, 200, 300, 4095, 4195], 1, 256, 64)?;
+    let dims = RopeDims::new(1, 256, 64, 10_000_000.0)?;
+    let result = gpu(&stream, &input, &[0, 100, 200, 300, 4095, 4195], &dims)?;
     assert!(check::max_abs(&result[..256], &q) < 1e-7);
     for row in result.chunks_exact(256).zip(input.chunks_exact(256)) {
         assert!((dot(row.0, row.0) - dot(row.1, row.1)).abs() < 1e-4);
