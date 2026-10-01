@@ -3,52 +3,6 @@ mod kernels {
     use cutile::core::*;
 
     #[cutile::entry()]
-    pub fn embedding<const H: i32>(
-        out: &mut Tensor<f32, { [1, H] }>,
-        table: &Tensor<f32, { [-1, H] }>,
-        tokens: &Tensor<i32, { [-1] }>,
-    ) {
-        let pid: (i32, i32, i32) = get_tile_block_id();
-        let token: Tile<i32, { [1] }> = tokens.partition(shape![1]).load([pid.0]);
-        let index: i32 = tile_to_scalar(token.reshape(shape![]));
-        let row: Tile<f32, { [1, H] }> = table.partition(shape![1, H]).load([index, 0]);
-        out.store(row);
-    }
-
-    #[cutile::entry()]
-    pub fn rms_norm<const H: i32>(
-        out: &mut Tensor<f32, { [1, H] }>,
-        input: &Tensor<f32, { [-1, H] }>,
-        weight: &Tensor<f32, { [H] }>,
-        inv_h: f32,
-        eps: f32,
-    ) {
-        let pid: (i32, i32, i32) = get_tile_block_id();
-        let x: Tile<f32, { [1, H] }> = input.partition(shape![1, H]).load([pid.0, 0]);
-        let squares: Tile<f32, { [1] }> = reduce_sum(x * x, 1);
-        let squares: Tile<f32, { [1, 1] }> = squares.reshape(shape![1, 1]);
-        let scale = rsqrt(
-            squares * inv_h.broadcast(shape![1, 1]) + eps.broadcast(shape![1, 1]),
-            ftz::Disabled,
-        );
-        let gamma: Tile<f32, { [H] }> = weight.partition(shape![H]).load([0]);
-        let gamma: Tile<f32, { [1, H] }> = gamma.reshape(shape![1, H]);
-        out.store(x * scale.broadcast(shape![1, H]) * gamma);
-    }
-
-    #[cutile::entry()]
-    pub fn add<const H: i32>(
-        out: &mut Tensor<f32, { [1, H] }>,
-        a: &Tensor<f32, { [-1, H] }>,
-        b: &Tensor<f32, { [-1, H] }>,
-    ) {
-        let pid: (i32, i32, i32) = get_tile_block_id();
-        let ap = a.partition(shape![1, H]).load([pid.0, 0]);
-        let bp = b.partition(shape![1, H]).load([pid.0, 0]);
-        out.store(ap + bp);
-    }
-
-    #[cutile::entry()]
     pub fn gdn_step<const HEADS: i32, const D: i32, const R: i32>(
         out: &mut Tensor<f32, { [1, R] }>,
         state: &mut Tensor<f32, { [1, R, D] }>,
@@ -138,4 +92,4 @@ mod kernels {
     }
 }
 
-pub use kernels::{add, attn_step, embedding, gdn_step, kv_append, rms_norm};
+pub use kernels::{attn_step, gdn_step, kv_append};

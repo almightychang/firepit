@@ -5,11 +5,13 @@ use cutile::tensor::{PartitionMut, Tensor, ToHostVec};
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit::{Checkpoint, SafetensorsFile};
 use firepit_kernels::attention::{AttentionDims, cache_append, online_attention, output_gate};
-use firepit_kernels::dense::{DenseMatrix, dense_gemv};
-use firepit_kernels::hybrid::rms_norm;
-use firepit_kernels::moe::{ExpertSelection, MoeDims, combine, expert_gemv};
-use firepit_kernels::q8::{DEFAULT_GEMV_TILE, GemvTile};
+use firepit_kernels::gemv::expert_gemv;
+use firepit_kernels::gemv::gemv;
+use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile};
+use firepit_kernels::moe::{ExpertSelection, MoeDims, combine};
+use firepit_kernels::norm::rms_norm;
 use firepit_kernels::rope::{RopeDims, frequencies, generics as rope_generics, rope};
+use firepit_kernels::weights::{DenseMatrix, Weight};
 use half::bf16;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -98,8 +100,8 @@ fn zero_layer_exit_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut logits = api::zeros::<f32>(&[1, 248320]).sync_on(&stream)?;
         let x_view = normalized.view(&[1, H / 32, 32])?;
-        dense_gemv(
-            &head,
+        gemv(
+            &Weight::Dense(head.clone()),
             &x_view,
             (&mut logits).partition([1, DEFAULT_GEMV_TILE.rows]),
             DEFAULT_GEMV_TILE,
@@ -345,8 +347,8 @@ fn attention_projection_and_rope_match_hf() -> Result<(), Box<dyn std::error::Er
         let x_view = x.view(&[1, H / 32, 32])?;
         let project = |matrix: &DenseMatrix<bf16>, rows| -> Result<_, Box<dyn std::error::Error>> {
             let mut output = api::zeros::<f32>(&[1, rows]).sync_on(&stream)?;
-            dense_gemv(
-                matrix,
+            gemv(
+                &Weight::Dense(matrix.clone()),
                 &x_view,
                 (&mut output).partition([1, DEFAULT_GEMV_TILE.rows]),
                 DEFAULT_GEMV_TILE,
@@ -586,8 +588,8 @@ fn attention_decode_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
         let input_error = relative_max(&actual_input, &expected_f64);
         worst_input = worst_input.max(input_error);
         let mut delta = api::zeros::<f32>(&[1, hidden]).sync_on(&stream)?;
-        dense_gemv(
-            &matrix,
+        gemv(
+            &Weight::Dense(matrix.clone()),
             &gated.view(&[1, dims.q_heads() * dims.head_dim() / 32, 32])?,
             (&mut delta).partition([1, DEFAULT_GEMV_TILE.rows]),
             DEFAULT_GEMV_TILE,
@@ -743,8 +745,8 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
                 .reshape(&[1, dims.hidden()])
                 .sync_on(&stream)?;
             let mut logits = api::zeros::<f32>(&[1, dims.experts()]).sync_on(&stream)?;
-            dense_gemv(
-                &router,
+            gemv(
+                &Weight::Dense(router.clone()),
                 &x.view(&[1, dims.hidden() / 32, 32])?,
                 logits.partition([1, DEFAULT_GEMV_TILE.rows]),
                 DEFAULT_GEMV_TILE,
@@ -879,8 +881,8 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
             let shared_output =
                 gpu_expert_tensor(&stream, &shared.gate_up, &shared.down, &x, dims)?;
             let mut gate = api::zeros::<f32>(&[1, 1]).sync_on(&stream)?;
-            dense_gemv(
-                &shared_gate,
+            gemv(
+                &Weight::Dense(shared_gate.clone()),
                 &x.view(&[1, dims.hidden() / 32, 32])?,
                 gate.partition([1, 1]),
                 GemvTile {

@@ -1,4 +1,4 @@
-use crate::model::{RowTile, Stream, Weight};
+use crate::model::{RowTile, Stream};
 use crate::plan::{Op, Slot, StepPlan};
 use crate::session::LayerState;
 use crate::{Batch, Model, Result, Session, SessionId};
@@ -8,10 +8,10 @@ use cuda_core::Device;
 use cutile::api;
 use cutile::tensor::{IntoPartition, PartitionMut, Tensor};
 use cutile::tile_kernel::{CompileOptions, TileKernel};
-use firepit_kernels::dense::dense_gemv;
-use firepit_kernels::hybrid;
-use firepit_kernels::q8::{DEFAULT_GEMV_TILE, Q8_BLOCK, q8_gemv};
+use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, gemv};
 use firepit_kernels::tile::{MIN_ROW_TILE, row_tile};
+use firepit_kernels::weights::Q8_BLOCK;
+use firepit_kernels::{elementwise, embedding, norm, synthetic};
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -93,7 +93,7 @@ fn run(
             Op::Embed { out: output } => {
                 submit(
                     sink,
-                    hybrid::embedding(
+                    embedding::embedding(
                         (&mut plan.buffers[output.index()]).partition([1, h]),
                         &model.embedding,
                         &plan.tokens,
@@ -109,7 +109,7 @@ fn run(
                 let (activation, out) = input_output(&mut plan.buffers, input, output);
                 submit(
                     sink,
-                    hybrid::rms_norm(
+                    norm::rms_norm(
                         out.partition([1, h]),
                         activation,
                         model.norm(norm),
@@ -128,7 +128,7 @@ fn run(
                     two_inputs_output(&mut plan.buffers, input, second, output);
                 submit(
                     sink,
-                    hybrid::add(out.partition([1, h]), current, delta)
+                    elementwise::add(out.partition([1, h]), current, delta)
                         .generics(vec![h.to_string()]),
                 )?;
             }
@@ -140,26 +140,15 @@ fn run(
                 let (input_tensor, out) = input_output(&mut plan.buffers, input, output);
                 let activation = input_tensor.view(&[batch, h])?;
                 let x = activation.view(&[batch, h / Q8_BLOCK, Q8_BLOCK])?;
-                let w = model.weights.get(weight);
-                match w {
-                    Weight::Bf16(w) => submit(
-                        sink,
-                        dense_gemv(
-                            w,
-                            &x,
-                            out.partition([batch, DEFAULT_GEMV_TILE.rows]),
-                            DEFAULT_GEMV_TILE,
-                        ),
-                    )?,
-                    Weight::Q8(w) => submit(
-                        sink,
-                        q8_gemv(
-                            w,
-                            &x,
-                            out.partition([batch, DEFAULT_GEMV_TILE.rows]),
-                            DEFAULT_GEMV_TILE,
-                        ),
-                    )?,
+                let op = gemv(
+                    model.weights.get(weight),
+                    &x,
+                    out.partition([batch, DEFAULT_GEMV_TILE.rows]),
+                    DEFAULT_GEMV_TILE,
+                );
+                match sink {
+                    Sink::Eager(stream) => op.sync_on(stream)?,
+                    Sink::Graph(scope) => op.record(scope)?,
                 }
             }
             Op::Session {
@@ -176,7 +165,7 @@ fn run(
                             let r = plan.row.0;
                             submit(
                                 sink,
-                                hybrid::gdn_step(
+                                synthetic::gdn_step(
                                     row_output.partition(c.session_output_tile(plan.row)),
                                     recurrent.partition(c.recurrent_tile(plan.row)),
                                     &row_input,
@@ -192,7 +181,7 @@ fn run(
                         LayerState::Attention { k, v } => {
                             submit(
                                 sink,
-                                hybrid::kv_append(
+                                synthetic::kv_append(
                                     k.partition(c.cache_tile(plan.row)),
                                     v.partition(c.cache_tile(plan.row)),
                                     &row_input,
@@ -210,7 +199,7 @@ fn run(
                             )?;
                             submit(
                                 sink,
-                                hybrid::attn_step(
+                                synthetic::attn_step(
                                     row_output.partition(c.session_output_tile(plan.row)),
                                     &*k,
                                     &*v,

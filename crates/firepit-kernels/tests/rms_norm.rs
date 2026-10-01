@@ -6,7 +6,7 @@ use cuda_core::Stream;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::TileKernel;
-use firepit_kernels::hybrid::rms_norm;
+use firepit_kernels::norm::rms_norm;
 use proptest::prelude::*;
 use std::sync::Arc;
 

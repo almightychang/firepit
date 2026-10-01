@@ -48,10 +48,10 @@ impl HostQ8Matrix {
     pub fn from_gguf_q8_0(blocks: &[u8], rows: usize, cols: usize) -> Result<Self>;
 }
 
-pub fn q8_gemv(w: &Q8Matrix, x: &TensorView<f32>, y: Partition<&mut Tensor<f32>>, tile: GemvTile) -> impl DeviceOp;
+pub fn gemv(w: &Weight, x: &TensorView<f32>, y: Partition<&mut Tensor<f32>>, tile: GemvTile) -> Gemv;
 ```
 
-가중치는 공유 참조, 출력은 소유권 이동이다. step graph와 CUDA Graph에 넣을 수 있도록 `DeviceOp`을 반환한다.
+가중치는 공유 참조, 출력은 소유권 이동이다. 반환된 `Gemv`는 eager 실행에 `sync_on`, CUDA Graph 캡처에 `record`를 제공한다. 형식 선택은 이 타입 안에서 한다.
 
 ## 검증
 

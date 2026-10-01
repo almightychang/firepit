@@ -3,10 +3,11 @@ use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, Tensor, ToHostVec};
 use cutile::tile_kernel::TileKernel;
 use firepit::Checkpoint;
-use firepit_kernels::dense::{DenseMatrix, dense_gemv};
+use firepit_kernels::gemv::DEFAULT_GEMV_TILE;
+use firepit_kernels::gemv::gemv;
 use firepit_kernels::moe::MoeDims;
-use firepit_kernels::q8::DEFAULT_GEMV_TILE;
 use firepit_kernels::swiglu::swiglu;
+use firepit_kernels::weights::{DenseMatrix, Weight};
 use half::bf16;
 use std::sync::Arc;
 
@@ -77,8 +78,8 @@ pub(super) fn gpu_expert_tensor(
     dims: MoeDims,
 ) -> Result<Tensor<f32>, Box<dyn std::error::Error>> {
     let mut projected = api::zeros::<f32>(&[1, 2 * dims.shared_intermediate()]).sync_on(stream)?;
-    dense_gemv(
-        gate_up,
+    gemv(
+        &Weight::Dense(gate_up.clone()),
         &x.view(&[1, dims.hidden() / 32, 32])?,
         (&mut projected).partition([1, DEFAULT_GEMV_TILE.rows]),
         DEFAULT_GEMV_TILE,
@@ -92,8 +93,8 @@ pub(super) fn gpu_expert_tensor(
     .generics(vec![dims.shared_intermediate().to_string()])
     .sync_on(stream)?;
     let mut output = api::zeros::<f32>(&[1, dims.hidden()]).sync_on(stream)?;
-    dense_gemv(
-        down,
+    gemv(
+        &Weight::Dense(down.clone()),
         &activated.view(&[1, dims.shared_intermediate() / 32, 32])?,
         (&mut output).partition([1, DEFAULT_GEMV_TILE.rows]),
         DEFAULT_GEMV_TILE,

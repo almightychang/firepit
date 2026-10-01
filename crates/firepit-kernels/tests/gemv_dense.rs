@@ -7,8 +7,9 @@ use cutile::DType;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::core::ElementType;
 use cutile::tensor::{PartitionMut, ToHostVec};
-use firepit_kernels::dense::{DenseMatrix, dense_gemv};
-use firepit_kernels::q8::DEFAULT_GEMV_TILE;
+use firepit_kernels::gemv::DEFAULT_GEMV_TILE;
+use firepit_kernels::gemv::gemv;
+use firepit_kernels::weights::{DenseMatrix, Weight};
 use half::bf16;
 use proptest::prelude::*;
 use std::sync::Arc;
@@ -30,8 +31,8 @@ fn gpu<T: DType + ElementType>(
         .sync_on(stream)?;
     let mut y = api::zeros::<f32>(&[padded, rows]).sync_on(stream)?;
     let x_view = x.view(&[padded, cols / 32, 32])?;
-    dense_gemv(
-        &matrix,
+    gemv(
+        &Weight::Dense(matrix.clone()),
         &x_view,
         (&mut y).partition([padded, DEFAULT_GEMV_TILE.rows]),
         DEFAULT_GEMV_TILE,

@@ -3,9 +3,10 @@ use cuda_core::Device;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::ToHostVecOp;
-use firepit_kernels::dense::DenseMatrix;
-use firepit_kernels::moe::{ExpertSelection, MoeDims, combine, expert_gemv};
-use firepit_kernels::q8::GemvTile;
+use firepit_kernels::gemv::GemvTile;
+use firepit_kernels::gemv::expert_gemv;
+use firepit_kernels::moe::{ExpertSelection, MoeDims, combine};
+use firepit_kernels::weights::DenseMatrix;
 use std::sync::Arc;
 
 #[test]

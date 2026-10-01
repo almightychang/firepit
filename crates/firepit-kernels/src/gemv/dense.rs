@@ -33,4 +33,40 @@ mod kernels {
     }
 }
 
-pub(super) use kernels::dense_gemv_kernel;
+use super::GemvTile;
+use crate::weights::{DenseMatrix, Q8_BLOCK};
+use cuda_async::device_operation::{DeviceOp, GraphNode};
+use cutile::DType;
+use cutile::core::ElementType;
+use cutile::tensor::{Partition, Tensor, TensorView};
+use cutile::tile_kernel::TileKernel;
+use std::sync::Arc;
+
+pub(super) fn dense_gemv<'a, T: DType + ElementType>(
+    w: &DenseMatrix<T>,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<&'a mut Tensor<f32>>,
+    tile: GemvTile,
+) -> impl DeviceOp<
+    Output = (
+        Partition<&'a mut Tensor<f32>>,
+        Arc<Tensor<T>>,
+        &'a TensorView<'a, f32>,
+        i32,
+    ),
+> + GraphNode
++ 'a {
+    let batch = x.shape()[0] as usize;
+    assert!(batch > 0 && tile.rows > 0 && tile.blocks > 0);
+    assert_eq!(
+        x.shape(),
+        &[batch as i32, (w.cols / Q8_BLOCK) as i32, Q8_BLOCK as i32]
+    );
+    assert!(tile.fits(w.rows, w.cols));
+    kernels::dense_gemv_kernel(y, w.weights.clone(), x, (w.cols / Q8_BLOCK) as i32).generics(vec![
+        T::DTYPE.as_str().to_string(),
+        batch.to_string(),
+        tile.rows.to_string(),
+        tile.blocks.to_string(),
+    ])
+}

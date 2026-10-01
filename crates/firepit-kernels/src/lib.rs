@@ -1,8 +1,11 @@
 pub mod attention;
-pub mod dense;
-pub mod hybrid;
+pub mod elementwise;
+pub mod embedding;
+pub mod gemv;
 pub mod moe;
-pub mod q8;
+pub mod norm;
 pub mod rope;
 pub mod swiglu;
+pub mod synthetic;
 pub mod tile;
+pub mod weights;

@@ -5,7 +5,8 @@ use cuda_async::device_operation::DeviceOp;
 use cuda_core::Stream;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
-use firepit_kernels::q8::{DEFAULT_GEMV_TILE, GemvTile, HostQ8Matrix, q8_gemv};
+use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile, gemv};
+use firepit_kernels::weights::{HostQ8Matrix, Weight};
 use half::f16;
 use proptest::prelude::*;
 use std::sync::Arc;
@@ -30,8 +31,8 @@ fn gpu(
         .sync_on(stream)?;
     let mut y = api::zeros::<f32>(&[padded, rows]).sync_on(stream)?;
     let x_view = x.view(&[padded, cols / 32, 32])?;
-    q8_gemv(
-        &weights,
+    gemv(
+        &Weight::<half::bf16>::Q8(weights.clone()),
         &x_view,
         (&mut y).partition([padded, tile.rows]),
         tile,

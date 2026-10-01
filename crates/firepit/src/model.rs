@@ -4,9 +4,9 @@ use crate::{Result, Session, SessionId};
 use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::Tensor;
-use firepit_kernels::dense::DenseMatrix;
-use firepit_kernels::q8::{DEFAULT_GEMV_TILE, HostQ8Matrix, Q8_BLOCK, Q8Matrix};
+use firepit_kernels::gemv::DEFAULT_GEMV_TILE;
 use firepit_kernels::tile::splits_into_row_tiles;
+use firepit_kernels::weights::{DenseMatrix, HostQ8Matrix, Q8_BLOCK, Weight};
 use half::{bf16, f16};
 use std::sync::Arc;
 
@@ -174,11 +174,6 @@ pub(crate) struct ModelWeights {
     pub output_head: Weight,
 }
 
-pub(crate) enum Weight {
-    Bf16(DenseMatrix<bf16>),
-    Q8(Q8Matrix),
-}
-
 #[derive(Clone, Copy, Debug)]
 pub enum SyntheticWeightFormat {
     Bf16,
@@ -316,7 +311,7 @@ fn synthetic_weight(
         .map(|i| ((i * 13 + seed * 7) % 17) as i8 - 8)
         .collect();
     Ok(match format {
-        SyntheticWeightFormat::Bf16 => Weight::Bf16(DenseMatrix::upload(
+        SyntheticWeightFormat::Bf16 => Weight::Dense(DenseMatrix::upload(
             values
                 .into_iter()
                 .map(|x| bf16::from_f32(x as f32 / 256.0))
