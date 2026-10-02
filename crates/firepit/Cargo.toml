@@ -11,6 +11,7 @@ cuda-core.workspace = true
 half.workspace = true
 safetensors = "0.8"
 serde_json = "1"
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
 
 [dev-dependencies]
 trybuild = "1"
