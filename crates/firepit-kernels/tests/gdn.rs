@@ -29,6 +29,27 @@ fn oracle(
         .collect()
 }
 
+fn magnitude(
+    input: &[f32],
+    state: &[f32],
+    weight: &[f32],
+    channels: usize,
+    kernel: usize,
+) -> Vec<f64> {
+    (0..channels)
+        .map(|channel| {
+            let row = channel * (kernel - 1);
+            let taps = channel * kernel;
+            (0..kernel - 1)
+                .map(|t| (state[row + t] as f64 * weight[taps + t] as f64).abs())
+                .sum::<f64>()
+                + (input[channel] as f64 * weight[taps + kernel - 1] as f64).abs()
+        })
+        .collect()
+}
+
+const SILU_MAX_SLOPE: f64 = 1.1;
+
 fn gpu_step(
     stream: &Arc<cuda_core::Stream>,
     input: &[f32],
@@ -81,7 +102,16 @@ fn conv_matches_f64_oracle() {
                 let (got, updated) = gpu_step(&stream, &input, &state, &weight, kernel)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 let expected = oracle(&input, &state, &weight, channels, kernel);
-                prop_assert!(check::max_relative(&got, &expected) < 2e-5);
+                let magnitude = magnitude(&input, &state, &weight, channels, kernel);
+                prop_assert!(
+                    check::activated_inner_product_excess(
+                        &got,
+                        &expected,
+                        &magnitude,
+                        kernel,
+                        SILU_MAX_SLOPE
+                    ) <= 1.0
+                );
                 for channel in 0..channels {
                     let start = channel * (kernel - 1);
                     prop_assert_eq!(
