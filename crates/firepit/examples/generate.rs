@@ -101,14 +101,15 @@ fn main() -> Result<()> {
         return Err("prompt is empty or exceeds max_seq".into());
     }
     let eos = eos_ids(&args.model, &tokenizer)?;
+    let device = Device::new(0)?;
     let model = Arc::new(Model::from_checkpoint(
         &args.model,
         LoadOptions {
             max_seq: args.max_seq,
             layers: args.layers,
         },
+        &device,
     )?);
-    let device = Device::new(0)?;
     let mut engine = Engine::new(model, &device)?;
     let mut session = engine.new_session(SessionId(1))?;
     let mut prefill = Vec::with_capacity(input.len());

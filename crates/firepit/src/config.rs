@@ -18,14 +18,14 @@ impl TryFrom<Value> for ModelConfig {
         } else {
             value
         };
-        QwenDims::parse(&text, 1, None)?;
+        ModelDims::parse(&text, 1, None)?;
         Ok(Self { text })
     }
 }
 
 impl ModelConfig {
-    pub fn dims(&self, max_seq: usize, prefix_layers: Option<usize>) -> Result<QwenDims> {
-        QwenDims::parse(&self.text, max_seq, prefix_layers)
+    pub fn dims(&self, max_seq: usize, prefix_layers: Option<usize>) -> Result<ModelDims> {
+        ModelDims::parse(&self.text, max_seq, prefix_layers)
     }
 
     pub fn text(&self) -> &Value {
@@ -39,7 +39,7 @@ pub enum LayerKind {
     Attention,
 }
 
-pub struct QwenDims {
+pub struct ModelDims {
     hidden: usize,
     vocab: usize,
     layers: Vec<LayerKind>,
@@ -52,7 +52,7 @@ pub struct QwenDims {
     max_seq: usize,
 }
 
-impl QwenDims {
+impl ModelDims {
     pub fn parse(text: &Value, max_seq: usize, prefix_layers: Option<usize>) -> Result<Self> {
         let integer = |name: &str| -> Result<usize> {
             Ok(text[name]

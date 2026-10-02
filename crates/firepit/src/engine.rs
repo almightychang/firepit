@@ -1,7 +1,8 @@
+use crate::Result;
 use crate::checkpoint::Stream;
-use crate::qwen_model::{MixerWeights, QwenModel};
-use crate::qwen_plan::{NormName, Op, QwenPlan, Slot, WeightName};
-use crate::{LayerKind, Result};
+use crate::model::{MixerWeights, Model};
+use crate::plan::{NormName, Op, Slot, StepPlan, WeightName};
+use crate::session::{Batch, LayerState, Session, SessionId};
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
@@ -13,61 +14,20 @@ use firepit_kernels::sink::{Eager, Graph, Sink};
 use firepit_kernels::tile::{MIN_ROW_TILE, row_tile};
 use firepit_kernels::weights::{Q8_BLOCK, Weight};
 use firepit_kernels::{attention, elementwise, embedding, gdn, moe, norm, rope, swiglu};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-static NEXT_QWEN_ENGINE: AtomicU64 = AtomicU64::new(1);
-static NEXT_QWEN_SESSION: AtomicU64 = AtomicU64::new(1);
-const MAX_BATCH_SESSIONS: usize = 4;
+static NEXT_ENGINE: AtomicU64 = AtomicU64::new(1);
 const TARGET_BLOCKS_PER_SM: usize = 1;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SessionId(pub u64);
-
-pub enum QwenLayerState {
-    Gdn {
-        conv: Tensor<f32>,
-        recurrent: Tensor<f32>,
-    },
-    Attention {
-        k: Tensor<f32>,
-        v: Tensor<f32>,
-    },
-}
-
-pub struct QwenSession {
-    id: SessionId,
-    engine: u64,
-    instance: u64,
-    position: usize,
-    state: Vec<QwenLayerState>,
-    poisoned: bool,
-}
-
-impl QwenSession {
-    pub fn id(&self) -> SessionId {
-        self.id
-    }
-    pub fn position(&self) -> usize {
-        self.position
-    }
-}
-
-pub struct QwenBatch<'a> {
-    engine: u64,
-    sessions: Vec<&'a mut QwenSession>,
-    tokens: Vec<u32>,
-    original_rows: Vec<usize>,
-}
 
 struct CachedPlan {
     instances: Vec<u64>,
-    plan: QwenPlan,
+    plan: StepPlan,
 }
 
-pub struct QwenEngine {
-    model: Arc<QwenModel>,
+pub struct Engine {
+    model: Arc<Model>,
     stream: Stream,
     id: u64,
     gdn_value_tile: usize,
@@ -135,7 +95,7 @@ fn gemv_tile(rows: usize, cols: usize) -> GemvTile {
     tile
 }
 
-fn weight(model: &QwenModel, layer: usize, name: WeightName) -> &Weight {
+fn weight(model: &Model, layer: usize, name: WeightName) -> &Weight {
     use WeightName::*;
     if matches!(name, LmHead) {
         return &model.lm_head;
@@ -187,9 +147,9 @@ fn weight(model: &QwenModel, layer: usize, name: WeightName) -> &Weight {
 }
 
 fn run(
-    model: &QwenModel,
-    plan: &mut QwenPlan,
-    sessions: &mut [&mut QwenSession],
+    model: &Model,
+    plan: &mut StepPlan,
+    sessions: &mut [&mut Session],
     sink: &mut impl Sink,
 ) -> Result<()> {
     let d = &model.dims;
@@ -317,7 +277,7 @@ fn run(
                         let source_row = source.slice(&[b..b + 1, 0..g.conv_dim()])?;
                         let x = source_row.view(&[g.conv_dim()])?;
                         let y = target.slice_mut(&[b * g.conv_dim()..(b + 1) * g.conv_dim()])?;
-                        let QwenLayerState::Gdn { conv, .. } = &mut session.state[layer] else {
+                        let LayerState::Gdn { conv, .. } = &mut session.state[layer] else {
                             unreachable!()
                         };
                         sink.run(
@@ -361,8 +321,7 @@ fn run(
                             0..1,
                             0..g.value_head_dim(),
                         ])?;
-                        let QwenLayerState::Gdn { recurrent, .. } = &mut session.state[layer]
-                        else {
+                        let LayerState::Gdn { recurrent, .. } = &mut session.state[layer] else {
                             unreachable!()
                         };
                         let tile = plan.gdn_value_tile;
@@ -422,7 +381,7 @@ fn run(
                             values.slice(&[b..b + 1, 0..a.kv_heads() * a.head_dim()])?;
                         let key = key_row.view(&[a.kv_heads(), a.head_dim()])?;
                         let value = value_row.view(&[a.kv_heads(), a.head_dim()])?;
-                        let QwenLayerState::Attention { k, v } = &mut session.state[layer] else {
+                        let LayerState::Attention { k, v } = &mut session.state[layer] else {
                             unreachable!()
                         };
                         sink.run(
@@ -447,7 +406,7 @@ fn run(
                             b * a.q_heads()..(b + 1) * a.q_heads(),
                             0..a.head_dim(),
                         ])?;
-                        let QwenLayerState::Attention { k, v } = &session.state[layer] else {
+                        let LayerState::Attention { k, v } = &session.state[layer] else {
                             unreachable!()
                         };
                         sink.run(
@@ -597,8 +556,8 @@ fn run(
     Ok(())
 }
 
-impl QwenEngine {
-    pub fn new(model: Arc<QwenModel>, device: &Arc<Device>) -> Result<Self> {
+impl Engine {
+    pub fn new(model: Arc<Model>, device: &Arc<Device>) -> Result<Self> {
         if model.device_ordinal != device.ordinal() {
             return Err("model and engine must use the same device".into());
         }
@@ -615,7 +574,7 @@ impl QwenEngine {
         Ok(Self {
             model,
             stream: device.new_stream()?,
-            id: NEXT_QWEN_ENGINE.fetch_add(1, Ordering::Relaxed),
+            id: NEXT_ENGINE.fetch_add(1, Ordering::Relaxed),
             gdn_value_tile,
             plans: HashMap::new(),
             #[cfg(test)]
@@ -623,46 +582,11 @@ impl QwenEngine {
         })
     }
 
-    pub fn new_session(&self, id: SessionId) -> Result<QwenSession> {
-        let d = &self.model.dims;
-        let mut state = Vec::with_capacity(d.layers().len());
-        for kind in d.layers() {
-            state.push(match kind {
-                LayerKind::Gdn => {
-                    let g = d.gdn();
-                    QwenLayerState::Gdn {
-                        conv: api::zeros::<f32>(&[g.conv_dim(), g.conv_kernel() - 1])
-                            .sync_on(&self.stream)?,
-                        recurrent: api::zeros::<f32>(&[
-                            g.value_heads(),
-                            g.key_head_dim(),
-                            g.value_head_dim(),
-                        ])
-                        .sync_on(&self.stream)?,
-                    }
-                }
-                LayerKind::Attention => {
-                    let a = d.attention();
-                    QwenLayerState::Attention {
-                        k: api::zeros::<f32>(&[a.max_seq(), a.kv_heads(), a.head_dim()])
-                            .sync_on(&self.stream)?,
-                        v: api::zeros::<f32>(&[a.max_seq(), a.kv_heads(), a.head_dim()])
-                            .sync_on(&self.stream)?,
-                    }
-                }
-            });
-        }
-        Ok(QwenSession {
-            id,
-            engine: self.id,
-            instance: NEXT_QWEN_SESSION.fetch_add(1, Ordering::Relaxed),
-            position: 0,
-            state,
-            poisoned: false,
-        })
+    pub fn new_session(&self, id: SessionId) -> Result<Session> {
+        Session::new(id, self.id, &self.model.dims, &self.stream)
     }
 
-    pub fn close_session(&mut self, session: QwenSession) -> Result<()> {
+    pub fn close_session(&mut self, session: Session) -> Result<()> {
         if session.engine != self.id {
             return Err("session belongs to another engine".into());
         }
@@ -673,51 +597,18 @@ impl QwenEngine {
 
     pub fn batch<'a>(
         &self,
-        entries: impl IntoIterator<Item = (&'a mut QwenSession, u32)>,
-    ) -> Result<QwenBatch<'a>> {
-        let mut entries: Vec<_> = entries
-            .into_iter()
-            .enumerate()
-            .map(|(original, (session, token))| (session, token, original))
-            .collect();
-        if entries.is_empty() || entries.len() > MAX_BATCH_SESSIONS {
-            return Err("invalid batch size".into());
-        }
-        let mut ids = HashSet::new();
-        for (session, token, _) in &entries {
-            if !ids.insert(session.id)
-                || session.engine != self.id
-                || session.poisoned
-                || session.position >= self.model.dims.max_seq()
-                || *token as usize >= self.model.dims.vocab()
-            {
-                return Err("invalid session or token".into());
-            }
-        }
-        entries.sort_by_key(|(session, _, _)| session.id);
-        let mut sessions = Vec::with_capacity(entries.len());
-        let mut tokens = Vec::with_capacity(entries.len());
-        let mut original_rows = Vec::with_capacity(entries.len());
-        for (session, token, original) in entries {
-            sessions.push(session);
-            tokens.push(token);
-            original_rows.push(original);
-        }
-        Ok(QwenBatch {
-            engine: self.id,
-            sessions,
-            tokens,
-            original_rows,
-        })
+        entries: impl IntoIterator<Item = (&'a mut Session, u32)>,
+    ) -> Result<Batch<'a>> {
+        Batch::from_entries(self.id, entries, &self.model.dims)
     }
 
-    pub fn step_eager(&mut self, batch: QwenBatch<'_>) -> Result<Vec<f32>> {
+    pub fn step_eager(&mut self, batch: Batch<'_>) -> Result<Vec<f32>> {
         self.step_with(batch, |model, plan, sessions, stream| {
             run(model, plan, sessions, &mut Eager(stream))
         })
     }
 
-    pub fn step(&mut self, batch: QwenBatch<'_>) -> Result<Vec<f32>> {
+    pub fn step(&mut self, batch: Batch<'_>) -> Result<Vec<f32>> {
         self.step_with(batch, |model, plan, sessions, stream| {
             if plan.graph.is_none() {
                 let graph = CudaGraph::scope(stream, |scope| {
@@ -733,8 +624,8 @@ impl QwenEngine {
 
     fn step_with(
         &mut self,
-        mut batch: QwenBatch<'_>,
-        execute: impl FnOnce(&QwenModel, &mut QwenPlan, &mut [&mut QwenSession], &Stream) -> Result<()>,
+        mut batch: Batch<'_>,
+        execute: impl FnOnce(&Model, &mut StepPlan, &mut [&mut Session], &Stream) -> Result<()>,
     ) -> Result<Vec<f32>> {
         if batch.engine != self.id {
             return Err("batch belongs to another engine".into());
@@ -751,7 +642,7 @@ impl QwenEngine {
                 size,
                 CachedPlan {
                     instances,
-                    plan: QwenPlan::new(&self.model, size, self.gdn_value_tile, &self.stream)?,
+                    plan: StepPlan::new(&self.model, size, self.gdn_value_tile, &self.stream)?,
                 },
             );
         }
@@ -817,10 +708,10 @@ mod tests {
     use crate::SafetensorsFile;
     use std::path::Path;
 
-    fn small_model(device: &Arc<Device>) -> Result<Arc<QwenModel>> {
+    fn small_model(device: &Arc<Device>) -> Result<Arc<Model>> {
         let config: serde_json::Value =
             serde_json::from_str(include_str!("../tests/fixtures/small-qwen.json"))?;
-        Ok(Arc::new(QwenModel::random_from_config(
+        Ok(Arc::new(Model::random_from_config(
             &config["text_config"],
             8,
             7,
@@ -832,7 +723,7 @@ mod tests {
     fn gpu_failure_poisons_session() -> Result<()> {
         let device = Device::new(0)?;
         let model = small_model(&device)?;
-        let mut engine = QwenEngine::new(model, &device)?;
+        let mut engine = Engine::new(model, &device)?;
         let mut session = engine.new_session(SessionId(1))?;
         engine.fail_after_gpu_work = true;
         let batch = engine.batch([(&mut session, 1)])?;
@@ -847,10 +738,10 @@ mod tests {
         let device = Device::new(0)?;
         let model = small_model(&device)?;
         for size in 1..=4 {
-            let mut together = QwenEngine::new(model.clone(), &device)?;
-            let mut graph = QwenEngine::new(model.clone(), &device)?;
+            let mut together = Engine::new(model.clone(), &device)?;
+            let mut graph = Engine::new(model.clone(), &device)?;
             let mut singles = (0..size)
-                .map(|_| QwenEngine::new(model.clone(), &device))
+                .map(|_| Engine::new(model.clone(), &device))
                 .collect::<Result<Vec<_>>>()?;
             let mut together_sessions = (0..size)
                 .map(|i| together.new_session(SessionId(i as u64 + 1)))
@@ -893,22 +784,23 @@ mod tests {
     #[ignore = "needs local Qwen3.6 checkpoint and GPU"]
     fn prefix_logits_match_hf_eager() -> Result<()> {
         let dir = Path::new(env!("HOME")).join("Models/qwen3.6-35b-a3b");
+        let device = Device::new(0)?;
         let refs = SafetensorsFile::open(
             Path::new(env!("CARGO_MANIFEST_DIR")).join("../../refs/qwen36-prefix4.safetensors"),
         )?;
         let tokens: Vec<u32> =
             serde_json::from_str(refs.metadata("tokens").ok_or("missing tokens")?)?;
-        let mut model = Arc::new(QwenModel::from_checkpoint(
+        let mut model = Arc::new(Model::from_checkpoint(
             dir,
             crate::LoadOptions {
                 max_seq: tokens.len(),
                 layers: Some(4),
             },
+            &device,
         )?);
-        let device = Device::new(0)?;
-        let mut graph_engine = QwenEngine::new(model.clone(), &device)?;
+        let mut graph_engine = Engine::new(model.clone(), &device)?;
         let mut graph_session = graph_engine.new_session(SessionId(2))?;
-        let mut engine = QwenEngine::new(model.clone(), &device)?;
+        let mut engine = Engine::new(model.clone(), &device)?;
         let mut session = engine.new_session(SessionId(1))?;
         for (step, &token) in tokens.iter().enumerate() {
             let batch = engine.batch([(&mut session, token)])?;
@@ -953,7 +845,7 @@ mod tests {
             .ok_or("model still shared")?
             .layers
             .swap(0, 1);
-        let mut shuffled = QwenEngine::new(model, &device)?;
+        let mut shuffled = Engine::new(model, &device)?;
         let mut shuffled_session = shuffled.new_session(SessionId(3))?;
         let shuffled_batch = shuffled.batch([(&mut shuffled_session, tokens[0])])?;
         let shuffled_logits = shuffled.step_eager(shuffled_batch)?;

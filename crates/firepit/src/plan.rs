@@ -1,5 +1,5 @@
 use crate::checkpoint::Stream;
-use crate::qwen_model::QwenModel;
+use crate::model::Model;
 use crate::{LayerKind, Result};
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::DeviceOp;
@@ -82,7 +82,7 @@ impl Slot {
         self as usize
     }
 
-    fn shape(self, model: &QwenModel, batch: usize) -> Vec<usize> {
+    fn shape(self, model: &Model, batch: usize) -> Vec<usize> {
         let d = &model.dims;
         let g = d.gdn();
         let a = d.attention();
@@ -227,7 +227,7 @@ pub enum Op {
     },
 }
 
-pub struct QwenPlan {
+pub struct StepPlan {
     pub ops: Vec<Op>,
     pub batch: usize,
     pub buffers: Vec<Tensor<f32>>,
@@ -240,9 +240,9 @@ pub struct QwenPlan {
     pub gdn_value_tile: usize,
 }
 
-impl QwenPlan {
+impl StepPlan {
     pub fn new(
-        model: &QwenModel,
+        model: &Model,
         batch: usize,
         gdn_value_tile: usize,
         stream: &Stream,

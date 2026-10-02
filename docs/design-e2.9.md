@@ -91,7 +91,7 @@ LayerState::Attention { k: [max_seq, 2, 256], v: [max_seq, 2, 256] }   f32
 ## 6. 모델 로드
 
 - `ModelConfig: TryFrom<config.json의 text_config>` → `ModelDims` 안에 AttentionDims, RopeDims, MoeDims, GdnDims를 품는다. layer 종류는 `layer_types`.
-- `Model::from_checkpoint(dir, LoadOptions { max_seq, layers: Option<usize> })`. `layers`는 앞쪽 N layer만 로드하는 prefix (5080 검증용).
+- `Model::from_checkpoint(dir, LoadOptions { max_seq, layers: Option<usize> }, &device)`. `layers`는 앞쪽 N layer만 로드하는 prefix (5080 검증용). 장치는 호출자가 명시한다.
 - 형식은 bf16만. Q8 로드(ISQ)는 E4.
 - norm 규약: layer norm, final norm, q/k norm은 로드할 때 `1 + w`. GDN gated norm은 `w` 그대로.
 - 가중치 이름 규칙과 로더는 reference 테스트와 공용으로 둔다.

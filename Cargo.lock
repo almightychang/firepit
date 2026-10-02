@@ -520,6 +520,7 @@ dependencies = [
  "cuda-async",
  "cuda-core",
  "cutile",
+ "firepit",
  "firepit-kernels",
  "half",
  "safetensors",
