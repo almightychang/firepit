@@ -10,6 +10,7 @@ use cutile::tensor::{IntoPartition, PartitionMut, Tensor};
 use cutile::tile_kernel::TileKernel;
 use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile, expert_gemv_view, gemv};
 use firepit_kernels::sink::{Eager, Graph, Sink};
+use firepit_kernels::tile::{MIN_ROW_TILE, row_tile};
 use firepit_kernels::weights::{Q8_BLOCK, Weight};
 use firepit_kernels::{attention, elementwise, embedding, gdn, moe, norm, rope, swiglu};
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 static NEXT_QWEN_ENGINE: AtomicU64 = AtomicU64::new(1);
 static NEXT_QWEN_SESSION: AtomicU64 = AtomicU64::new(1);
 const MAX_BATCH_SESSIONS: usize = 4;
+const TARGET_BLOCKS_PER_SM: usize = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(pub u64);
@@ -68,6 +70,7 @@ pub struct QwenEngine {
     model: Arc<QwenModel>,
     stream: Stream,
     id: u64,
+    gdn_value_tile: usize,
     plans: HashMap<usize, CachedPlan>,
     #[cfg(test)]
     fail_after_gpu_work: bool,
@@ -362,7 +365,7 @@ fn run(
                         else {
                             unreachable!()
                         };
-                        let tile = g.value_head_dim();
+                        let tile = plan.gdn_value_tile;
                         sink.run(
                             gdn::delta_step(
                                 y.partition([1, 1, tile]),
@@ -599,10 +602,21 @@ impl QwenEngine {
         if model.device_ordinal != device.ordinal() {
             return Err("model and engine must use the same device".into());
         }
+        let sm =
+            cuda_core::simt::CudaContext::new(device.ordinal())?.multiprocessor_count()? as usize;
+        let g = model.dims.gdn();
+        let gdn_value_tile = row_tile(
+            g.value_head_dim(),
+            g.value_heads(),
+            sm,
+            TARGET_BLOCKS_PER_SM,
+            MIN_ROW_TILE,
+        );
         Ok(Self {
             model,
             stream: device.new_stream()?,
             id: NEXT_QWEN_ENGINE.fetch_add(1, Ordering::Relaxed),
+            gdn_value_tile,
             plans: HashMap::new(),
             #[cfg(test)]
             fail_after_gpu_work: false,
@@ -737,7 +751,7 @@ impl QwenEngine {
                 size,
                 CachedPlan {
                     instances,
-                    plan: QwenPlan::new(&self.model, size, &self.stream)?,
+                    plan: QwenPlan::new(&self.model, size, self.gdn_value_tile, &self.stream)?,
                 },
             );
         }

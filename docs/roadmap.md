@@ -99,7 +99,7 @@ scripts/dev.sh test -p firepit --test reference -- --ignored
 - 2.6 후속: `ExpertSelection`으로 device 번호와 가중치를 함께 보유한다. GPU top-k 또는 host 입력 검증으로만 생성하며 expert GEMV와 결합은 이 타입을 받는다.
 - 2.7: GDN 입력 projection 4개는 공개 GEMV를 각각 호출한다. 채널별 causal conv+SiLU와 state 갱신은 한 커널에서 수행한다. state는 `state.load()`와 `state.store()`로 같은 block 안에서 제자리 갱신한다. HF cache는 `[1, conv_dim, kernel]`, 커널 state는 마지막 `kernel−1` 값인 `[conv_dim, kernel−1]`이다. layer 0~2 × 5 step에서 q/k/v와 state를 비교했다.
 - 2.8: GDN delta rule은 `(value head, value 열 타일)`당 block 하나에서 q/k l2norm, β·g, state 감쇠·갱신·출력을 처리한다. 기존 RMSNorm 뒤에 SiLU gate를 적용하고 기존 GEMV로 `out_proj`를 계산한다. layer 0~2 × 5 step에서 core, recurrent state, gated norm, Δx를 HF와 비교했다.
-- 2.9a: checkpoint 앞쪽 4개 layer(GDN 3, attention 1)를 실제 MoE와 함께 엔진에 연결했다. 5 step prefix logits의 HF 상대오차 최대 `5.51832190e-7`, top-1 5개 일치. graph 결과는 eager와 같았다. 5080에서 로드 전후 GPU 메모리는 `3459 → 13069 MiB`였다(`max_seq=5`, 계측 실행 기준).
+- 2.9a: checkpoint 앞쪽 4개 layer(GDN 3, attention 1)를 실제 MoE와 함께 엔진에 연결했다. 5 step prefix logits의 HF 상대오차 최대 `5.68042530e-7`, top-1 5개 일치. graph 결과는 eager와 같았다. 5080에서 로드 전후 GPU 메모리는 `3459 → 13069 MiB`였다(`max_seq=5`, 계측 실행 기준).
 
 ## 확인할 것
 

@@ -237,10 +237,16 @@ pub struct QwenPlan {
     pub sin: Tensor<f32>,
     pub selections: Vec<Vec<ExpertSelection>>,
     pub graph: Option<CudaGraph<()>>,
+    pub gdn_value_tile: usize,
 }
 
 impl QwenPlan {
-    pub fn new(model: &QwenModel, batch: usize, stream: &Stream) -> Result<Self> {
+    pub fn new(
+        model: &QwenModel,
+        batch: usize,
+        gdn_value_tile: usize,
+        stream: &Stream,
+    ) -> Result<Self> {
         let mut ops = vec![Op::Embed {
             out: Slot::Residual0,
         }];
@@ -419,6 +425,7 @@ impl QwenPlan {
             sin,
             selections,
             graph: None,
+            gdn_value_tile,
         })
     }
 
