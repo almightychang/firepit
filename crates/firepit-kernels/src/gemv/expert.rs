@@ -4,7 +4,7 @@ use crate::weights::{DenseMatrix, Q8_BLOCK};
 use cuda_async::device_operation::{DeviceOp, GraphNode};
 use cutile::DType;
 use cutile::core::ElementType;
-use cutile::tensor::{Partition, Tensor, TensorView};
+use cutile::tensor::{Partition, Tensor, TensorView, TensorViewMut};
 use cutile::tile_kernel::TileKernel;
 use std::sync::Arc;
 
@@ -79,6 +79,46 @@ pub fn expert_gemv<'a, T: DType + ElementType>(
             Q8_BLOCK as i32
         ]
     );
+    kernels::expert_gemv_kernel(
+        y,
+        w.weights.clone(),
+        x,
+        selection.indices(),
+        (w.cols / Q8_BLOCK) as i32,
+        (rows_per_expert / tile.rows) as i32,
+        input_stride as i32,
+    )
+    .generics(vec![
+        T::DTYPE.as_str().to_string(),
+        tile.rows.to_string(),
+        tile.blocks.to_string(),
+    ])
+}
+
+pub fn expert_gemv_view<'a, T: DType + ElementType>(
+    w: &DenseMatrix<T>,
+    x: &'a TensorView<'a, f32>,
+    selection: &'a ExpertSelection,
+    y: Partition<TensorViewMut<'a, f32>>,
+    rows_per_expert: usize,
+    input_stride: usize,
+    tile: GemvTile,
+) -> impl DeviceOp<
+    Output = (
+        Partition<TensorViewMut<'a, f32>>,
+        Arc<Tensor<T>>,
+        &'a TensorView<'a, f32>,
+        &'a Tensor<i32>,
+        i32,
+        i32,
+        i32,
+    ),
+> + GraphNode
++ 'a {
+    let dims = selection.dims();
+    assert!(rows_per_expert > 0 && input_stride <= 1);
+    assert_eq!(w.rows, dims.experts() * rows_per_expert);
+    assert!(tile.fits(rows_per_expert, w.cols));
     kernels::expert_gemv_kernel(
         y,
         w.weights.clone(),

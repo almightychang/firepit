@@ -1,5 +1,5 @@
 use cuda_core::Device;
-use firepit::{Engine, Model, ModelConfig, ModelDims, SessionId};
+use firepit::{Engine, Model, SessionId};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -14,8 +14,11 @@ fn step_times() -> Result<(), Box<dyn std::error::Error>> {
     assert!(!cfg!(debug_assertions), "timing needs --release");
     let device = Device::new(0)?;
     let stream = device.new_stream()?;
-    let model = Arc::new(Model::synthetic(
-        ModelDims::try_from(ModelConfig::default())?,
+    let config: serde_json::Value = serde_json::from_str(include_str!("fixtures/small-qwen.json"))?;
+    let model = Arc::new(Model::random_from_config(
+        &config["text_config"],
+        32,
+        7,
         &stream,
     )?);
     let sm = cuda_core::simt::CudaContext::new(device.ordinal())?.multiprocessor_count()?;

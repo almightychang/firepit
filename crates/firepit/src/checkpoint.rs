@@ -1,4 +1,8 @@
 use crate::Result;
+use cuda_async::device_operation::DeviceOp;
+use cutile::api::{self, DeviceOpReshape};
+use cutile::tensor::Tensor;
+use firepit_kernels::weights::DenseMatrix;
 use half::bf16;
 use safetensors::Dtype;
 use safetensors::tensor::{Metadata, TensorInfo};
@@ -6,15 +10,30 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Arc;
+
+pub type Stream = Arc<cuda_core::Stream>;
 
 pub struct HostTensor {
     pub shape: Vec<usize>,
     pub data: Vec<f32>,
 }
 
+#[derive(Clone)]
 pub struct HostBf16Tensor {
     pub shape: Vec<usize>,
     pub data: Vec<bf16>,
+}
+
+impl HostBf16Tensor {
+    pub fn upload_matrix(self, stream: &Stream) -> Result<DenseMatrix<bf16>> {
+        let (&cols, leading) = self.shape.split_last().ok_or("matrix has no dimensions")?;
+        if leading.is_empty() {
+            return Err("matrix must have at least two dimensions".into());
+        }
+        let rows = leading.iter().product();
+        Ok(DenseMatrix::upload(self.data, rows, cols, stream)?)
+    }
 }
 
 pub struct SafetensorsFile {
@@ -147,8 +166,73 @@ impl Checkpoint {
         self.shard(name)?.tensor_bf16(name)
     }
 
+    pub fn stacked_bf16(
+        &self,
+        first: &str,
+        second: &str,
+        rows: usize,
+        cols: usize,
+    ) -> Result<HostBf16Tensor> {
+        let mut gate = self.tensor_bf16(first)?;
+        let up = self.tensor_bf16(second)?;
+        if gate.shape != [rows, cols] || up.shape != gate.shape {
+            return Err("stacked matrix shape mismatch".into());
+        }
+        gate.data.extend(up.data);
+        gate.shape = vec![2 * rows, cols];
+        Ok(gate)
+    }
+
     pub fn row(&self, name: &str, row: usize) -> Result<HostTensor> {
         self.shard(name)?.row(name, row)
+    }
+
+    pub fn matrix_bf16(
+        &self,
+        name: &str,
+        shape: &[usize],
+        stream: &Stream,
+    ) -> Result<DenseMatrix<bf16>> {
+        let tensor = self.tensor_bf16(name)?;
+        if tensor.shape != shape || shape.len() < 2 {
+            return Err(format!("{name}: expected shape {shape:?}, got {:?}", tensor.shape).into());
+        }
+        tensor.upload_matrix(stream)
+    }
+
+    pub fn vector(
+        &self,
+        name: &str,
+        len: usize,
+        offset: f32,
+        stream: &Stream,
+    ) -> Result<Tensor<f32>> {
+        let tensor = self.tensor(name)?;
+        if tensor.shape != [len] {
+            return Err(format!("{name}: expected [{len}], got {:?}", tensor.shape).into());
+        }
+        Ok(api::copy_host_vec_to_device(&Arc::new(
+            tensor.data.into_iter().map(|x| x + offset).collect(),
+        ))
+        .sync_on(stream)?)
+    }
+
+    pub fn embedding(
+        &self,
+        name: &str,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<Tensor<f32>> {
+        let tensor = self.tensor(name)?;
+        if tensor.shape != [rows, cols] {
+            return Err(
+                format!("{name}: expected [{rows}, {cols}], got {:?}", tensor.shape).into(),
+            );
+        }
+        Ok(api::copy_host_vec_to_device(&Arc::new(tensor.data))
+            .reshape(&[rows, cols])
+            .sync_on(stream)?)
     }
 
     fn shard(&self, name: &str) -> Result<&SafetensorsFile> {

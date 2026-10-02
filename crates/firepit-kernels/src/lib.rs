@@ -8,6 +8,5 @@ pub mod norm;
 pub mod rope;
 pub mod sink;
 pub mod swiglu;
-pub mod synthetic;
 pub mod tile;
 pub mod weights;

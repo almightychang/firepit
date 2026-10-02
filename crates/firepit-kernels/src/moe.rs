@@ -1,9 +1,10 @@
 use cuda_async::device_operation::{DeviceOp, GraphNode};
 use cutile::api;
-use cutile::tensor::{Partition, PartitionMut, Tensor, TensorView};
+use cutile::tensor::{Partition, PartitionMut, Tensor, TensorView, TensorViewMut};
 use cutile::tile_kernel::TileKernel;
 use std::sync::Arc;
 
+use crate::sink::Sink;
 use crate::weights::Q8_BLOCK;
 
 #[cutile::module]
@@ -193,29 +194,47 @@ pub struct ExpertSelection {
 }
 
 impl ExpertSelection {
+    pub fn empty(
+        dims: &MoeDims,
+        stream: &Arc<cuda_core::Stream>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let padded = dims.top_k.next_power_of_two();
+        Ok(Self {
+            indices: api::zeros::<i32>(&[padded]).sync_on(stream)?,
+            weights: api::zeros::<f32>(&[padded]).sync_on(stream)?,
+            dims: *dims,
+        })
+    }
+
+    pub fn select(
+        &mut self,
+        logits: &TensorView<'_, f32>,
+        sink: &mut impl Sink,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        assert_eq!(logits.shape(), &[self.dims.experts as i32]);
+        let padded = self.dims.top_k.next_power_of_two();
+        sink.run(
+            kernels::top_k(
+                logits,
+                self.indices.partition([padded]),
+                self.weights.partition([padded]),
+                self.dims.experts as i32,
+                self.dims.top_k as i32,
+            )
+            .generics(self.dims.top_k_generics()),
+        )?;
+        Ok(())
+    }
+
     pub fn top_k(
         logits: &TensorView<'_, f32>,
         dims: &MoeDims,
         stream: &Arc<cuda_core::Stream>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         assert_eq!(logits.shape(), &[dims.experts as i32]);
-        let padded = dims.top_k.next_power_of_two();
-        let mut indices = api::zeros::<i32>(&[padded]).sync_on(stream)?;
-        let mut weights = api::zeros::<f32>(&[padded]).sync_on(stream)?;
-        kernels::top_k(
-            logits,
-            indices.partition([padded]),
-            weights.partition([padded]),
-            dims.experts as i32,
-            dims.top_k as i32,
-        )
-        .generics(dims.top_k_generics())
-        .sync_on(stream)?;
-        Ok(Self {
-            indices,
-            weights,
-            dims: *dims,
-        })
+        let mut selection = Self::empty(dims, stream)?;
+        selection.select(logits, &mut crate::sink::Eager(stream))?;
+        Ok(selection)
     }
 
     pub fn parse(
@@ -283,6 +302,38 @@ pub fn combine<'a>(
         &'a Tensor<f32>,
         &'a Tensor<f32>,
         &'a Tensor<f32>,
+        i32,
+    ),
+> + GraphNode
++ 'a {
+    let dims = selection.dims;
+    assert_eq!(routed.shape(), &[dims.top_k as i32, dims.hidden as i32]);
+    assert_eq!(shared.shape(), &[1, dims.hidden as i32]);
+    assert_eq!(gate.shape(), &[1, 1]);
+    kernels::combine_kernel(
+        out,
+        routed,
+        &selection.weights,
+        shared,
+        gate,
+        dims.top_k as i32,
+    )
+    .generics(dims.combine_generics())
+}
+
+pub fn combine_view<'a>(
+    out: Partition<TensorViewMut<'a, f32>>,
+    routed: &'a TensorView<'a, f32>,
+    selection: &'a ExpertSelection,
+    shared: &'a TensorView<'a, f32>,
+    gate: &'a TensorView<'a, f32>,
+) -> impl DeviceOp<
+    Output = (
+        Partition<TensorViewMut<'a, f32>>,
+        &'a TensorView<'a, f32>,
+        &'a Tensor<f32>,
+        &'a TensorView<'a, f32>,
+        &'a TensorView<'a, f32>,
         i32,
     ),
 > + GraphNode

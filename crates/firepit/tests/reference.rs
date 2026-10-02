@@ -65,8 +65,8 @@ fn gdn_projection_and_conv_match_hf() -> Result<(), Box<dyn std::error::Error>> 
         ] {
             let tensor = weights.tensor_bf16(&format!("{prefix}.in_proj_{name}.weight"))?;
             assert_eq!(tensor.shape, [rows, dims.hidden()]);
-            let host = tensor.data;
-            let gpu = DenseMatrix::upload(host.clone(), rows, dims.hidden(), &stream)?;
+            let host = tensor.data.clone();
+            let gpu = tensor.upload_matrix(&stream)?;
             matrices.push((name, rows, host, Weight::Dense(gpu)));
         }
         let conv_weight = weights.tensor(&format!("{prefix}.conv1d.weight"))?;
@@ -208,13 +208,8 @@ fn gdn_delta_norm_and_output_match_hf() -> Result<(), Box<dyn std::error::Error>
         assert_eq!(dt_bias.shape, [dims.value_heads()]);
         assert_eq!(norm_weight.shape, [dims.value_head_dim()]);
         assert_eq!(projection.shape, [dims.hidden(), dims.value_dim()]);
-        let out_host = projection.data;
-        let out_weight = Weight::Dense(DenseMatrix::upload(
-            out_host.clone(),
-            dims.hidden(),
-            dims.value_dim(),
-            &stream,
-        )?);
+        let out_host = projection.data.clone();
+        let out_weight = Weight::Dense(projection.upload_matrix(&stream)?);
         let upload =
             |data: Vec<f32>| api::copy_host_vec_to_device(&Arc::new(data)).sync_on(&stream);
         let a_log_gpu = upload(a_log.data)?;
@@ -452,7 +447,7 @@ fn zero_layer_exit_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
         api::copy_host_vec_to_device(&Arc::new(norm.data.iter().map(|x| 1.0 + x).collect()))
             .sync_on(&stream)?;
     let wrong_gamma = api::copy_host_vec_to_device(&Arc::new(norm.data)).sync_on(&stream)?;
-    let head = DenseMatrix::upload(head.data, 248320, H, &stream)?;
+    let head = head.upload_matrix(&stream)?;
     let mut max_norm = 0.0f32;
     let mut max_logits = 0.0f32;
     let mut wrong_scale_error = 0.0f32;
@@ -709,7 +704,7 @@ fn attention_projection_and_rope_match_hf() -> Result<(), Box<dyn std::error::Er
     let load = |name: &str, rows| -> Result<_, Box<dyn std::error::Error>> {
         let t = weights.tensor_bf16(&format!("{prefix}.{name}_proj.weight"))?;
         assert_eq!(t.shape, [rows, H]);
-        Ok(DenseMatrix::upload(t.data, rows, H, &stream)?)
+        Ok(t.upload_matrix(&stream)?)
     };
     let q_weights = load("q", q_heads * D * 2)?;
     let k_weights = load("k", kv_heads * D)?;
@@ -908,7 +903,7 @@ fn attention_decode_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(o.shape, [hidden, dims.q_heads() * dims.head_dim()]);
     let device = Device::new(0)?;
     let stream = device.new_stream()?;
-    let matrix = DenseMatrix::upload(o.data, hidden, dims.q_heads() * dims.head_dim(), &stream)?;
+    let matrix = o.upload_matrix(&stream)?;
     let mut k_cache =
         api::zeros::<f32>(&[dims.max_seq(), dims.kv_heads(), dims.head_dim()]).sync_on(&stream)?;
     let mut v_cache =
@@ -1100,33 +1095,23 @@ fn moe_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
         let router = checkpoint.tensor_bf16(&format!("{prefix}.gate.weight"))?;
         assert_eq!(router.shape, [dims.experts(), dims.hidden()]);
         let router_host = router.data.clone();
-        let router = DenseMatrix::upload(router.data, dims.experts(), dims.hidden(), &stream)?;
+        let router = router.upload_matrix(&stream)?;
         let gate_up = checkpoint.tensor_bf16(&format!("{prefix}.experts.gate_up_proj"))?;
         assert_eq!(
             gate_up.shape,
             [dims.experts(), 2 * dims.intermediate(), dims.hidden()]
         );
-        let gate_up = DenseMatrix::upload(
-            gate_up.data,
-            dims.experts() * 2 * dims.intermediate(),
-            dims.hidden(),
-            &stream,
-        )?;
+        let gate_up = gate_up.upload_matrix(&stream)?;
         let down = checkpoint.tensor_bf16(&format!("{prefix}.experts.down_proj"))?;
         assert_eq!(
             down.shape,
             [dims.experts(), dims.hidden(), dims.intermediate()]
         );
-        let down = DenseMatrix::upload(
-            down.data,
-            dims.experts() * dims.hidden(),
-            dims.intermediate(),
-            &stream,
-        )?;
+        let down = down.upload_matrix(&stream)?;
         let shared = load_expert(&checkpoint, layer, &stream, dims)?;
         let shared_gate = checkpoint.tensor_bf16(&format!("{prefix}.shared_expert_gate.weight"))?;
         assert_eq!(shared_gate.shape, [1, dims.hidden()]);
-        let shared_gate = DenseMatrix::upload(shared_gate.data, 1, dims.hidden(), &stream)?;
+        let shared_gate = shared_gate.upload_matrix(&stream)?;
         for step in 0..5 {
             let key = format!("step{step}/layer{layer}/moe");
             let input = refs.tensor(&format!("{key}/in"))?;

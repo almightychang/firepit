@@ -2,7 +2,7 @@ mod dense;
 mod expert;
 mod q8;
 
-pub use expert::expert_gemv;
+pub use expert::{expert_gemv, expert_gemv_view};
 
 use crate::sink::Sink;
 use cutile::tensor::{Partition, Tensor, TensorView};

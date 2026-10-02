@@ -8,8 +8,3 @@ error: cannot construct `Batch<'_>` with struct literal syntax due to private fi
   |                                                  private field
   |
   = note: ...and other private field `engine` that was not provided
-help: you might have meant to use the `from_checked` associated function
-  |
-2 - fn make(session: &mut Session) { let _ = Batch { sessions: vec![session], tokens: vec![1], original_rows: vec![0] }; }
-2 + fn make(session: &mut Session) { let _ = Batch::from_checked(_, _); }
-  |

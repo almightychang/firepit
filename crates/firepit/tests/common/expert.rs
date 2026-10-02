@@ -28,31 +28,23 @@ pub(super) fn load_expert(
     let name = |projection| {
         format!("model.language_model.layers.{layer}.mlp.shared_expert.{projection}_proj.weight")
     };
-    let gate = checkpoint.tensor_bf16(&name("gate"))?;
-    let up = checkpoint.tensor_bf16(&name("up"))?;
-    let down = checkpoint.tensor_bf16(&name("down"))?;
-    assert_eq!(gate.shape, [dims.shared_intermediate(), dims.hidden()]);
-    assert_eq!(up.shape, [dims.shared_intermediate(), dims.hidden()]);
-    assert_eq!(down.shape, [dims.hidden(), dims.shared_intermediate()]);
-    let mut gate_up_host = gate.data;
-    gate_up_host.extend(up.data);
-    let gate_up = DenseMatrix::upload(
-        gate_up_host.clone(),
-        2 * dims.shared_intermediate(),
-        dims.hidden(),
-        stream,
-    )?;
-    let down_matrix = DenseMatrix::upload(
-        down.data.clone(),
-        dims.hidden(),
+    let gate_up = checkpoint.stacked_bf16(
+        &name("gate"),
+        &name("up"),
         dims.shared_intermediate(),
-        stream,
+        dims.hidden(),
     )?;
+    let down = checkpoint.tensor_bf16(&name("down"))?;
+    assert_eq!(down.shape, [dims.hidden(), dims.shared_intermediate()]);
+    let gate_up_host = gate_up.data.clone();
+    let gate_up = gate_up.upload_matrix(stream)?;
+    let down_host = down.data.clone();
+    let down_matrix = down.upload_matrix(stream)?;
     Ok(Expert {
         gate_up,
         down: down_matrix,
         gate_up_host,
-        down_host: down.data,
+        down_host,
     })
 }
 

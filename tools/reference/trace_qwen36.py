@@ -193,7 +193,7 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
         attn = model.model.layers[3].self_attn
         hooks += [
             attn.register_forward_pre_hook(attn_input, with_kwargs=True),
-            attn.q_proj.register_forward_hook(projection("q_proj", 16)),
+            attn.q_proj.register_forward_hook(projection("q_proj", model.config.num_attention_heads)),
             attn.v_proj.register_forward_hook(projection("v_proj", 2)),
             attn.q_norm.register_forward_hook(normalized("q")),
             attn.k_norm.register_forward_hook(normalized("k")),
@@ -203,8 +203,9 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
         ]
     with torch.no_grad():
         positions = torch.tensor([0, 1, 2, 3, 4, 100, 4095, 65535, 262143])
-        position_ids = positions[None, None, :].expand(3, 1, -1)
-        cos, sin = model.model.rotary_emb(torch.zeros(1, len(positions), 2048), position_ids)
+        position_axes = len(model.config.rope_parameters["mrope_section"])
+        position_ids = positions[None, None, :].expand(position_axes, 1, -1)
+        cos, sin = model.model.rotary_emb(torch.zeros(1, len(positions), model.config.hidden_size), position_ids)
         records["rope/positions"] = positions.to(torch.float32)
         records["rope/cos"] = cos[0].clone()
         records["rope/sin"] = sin[0].clone()
@@ -250,6 +251,8 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
             exit_norm = norm(out.hidden_states[0])
             records[f"step{step}/exit_norm"] = exit_norm[0, 0].clone()
             records[f"step{step}/logits"] = model.lm_head(exit_norm)[0, 0].clone()
+            prefix_norm = norm(out.hidden_states[-1])
+            records[f"step{step}/prefix_logits"] = model.lm_head(prefix_norm)[0, 0].clone()
     for hook in hooks:
         hook.remove()
     qwen_module.torch_recurrent_gated_delta_rule = recurrent
