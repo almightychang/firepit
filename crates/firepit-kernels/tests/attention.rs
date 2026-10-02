@@ -78,6 +78,55 @@ fn oracle(
     out
 }
 
+// Score error E (Higham–Mary on q·k) perturbs softmax weights by at most (e^{2E} − 1)·a;
+// the online rescaling adds about two roundings per position to the weighted sum;
+// weights below the f32 normal range flush to zero, which bounds the absolute floor.
+fn allowance(
+    dims: &AttentionDims,
+    q: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    len: usize,
+    scale: f32,
+) -> Vec<f64> {
+    let u = f32::EPSILON as f64 / 2.0;
+    let d = dims.head_dim();
+    let kv = dims.kv_heads();
+    let group = dims.q_heads() / kv;
+    let mut out = vec![0.0f64; dims.q_heads() * d];
+    for h in 0..dims.q_heads() {
+        let kh = h / group;
+        let row = |t: usize| (t * kv + kh) * d;
+        let dot = |t: usize, f: fn(f64) -> f64| -> f64 {
+            (0..d)
+                .map(|i| f(q[h * d + i] as f64 * keys[row(t) + i] as f64))
+                .sum::<f64>()
+                * scale as f64
+        };
+        let scores: Vec<f64> = (0..len).map(|t| dot(t, |x| x)).collect();
+        let score_error = (0..len)
+            .map(|t| check::gamma_tilde(d) * dot(t, f64::abs) + 4.0 * u)
+            .fold(0.0, f64::max);
+        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let weights: Vec<f64> = scores.iter().map(|&s| (s - max).exp()).collect();
+        let denom: f64 = weights.iter().sum();
+        let factor = check::gamma_tilde(2 * len + 2) + (2.0 * score_error).exp_m1() + 8.0 * u;
+        let largest_value = (0..len)
+            .flat_map(|t| values[row(t)..row(t) + d].iter())
+            .fold(0.0f64, |m, &v| m.max((v as f64).abs()));
+        let underflow = len as f64 * f32::MIN_POSITIVE as f64 * largest_value;
+        for i in 0..d {
+            out[h * d + i] = underflow;
+        }
+        for t in 0..len {
+            for i in 0..d {
+                out[h * d + i] += factor * weights[t] / denom * (values[row(t) + i] as f64).abs();
+            }
+        }
+    }
+    out
+}
+
 fn gpu_gate(
     stream: &Arc<Stream>,
     values: &[f32],
@@ -121,7 +170,14 @@ fn attention_matches_f64_oracle() {
                 let actual = gpu_attention(&stream, &dims, &q, &keys, &values, len, dims.scale())
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 let expected = oracle(&dims, &q, &keys, &values, len, dims.scale());
-                prop_assert!(check::max_relative(&actual, &expected) < 2e-4);
+                let allowed = allowance(&dims, &q, &keys, &values, len, dims.scale());
+                let excess = actual
+                    .iter()
+                    .zip(&expected)
+                    .zip(&allowed)
+                    .map(|((&a, &e), &b)| (a as f64 - e).abs() / b.max(f64::MIN_POSITIVE))
+                    .fold(0.0, f64::max);
+                prop_assert!(excess <= 1.0, "excess {excess}");
                 Ok(())
             },
         )
