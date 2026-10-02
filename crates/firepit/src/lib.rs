@@ -1,6 +1,7 @@
 mod checkpoint;
 mod config;
 mod engine;
+mod execute;
 mod model;
 mod plan;
 mod session;
