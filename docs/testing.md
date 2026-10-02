@@ -30,3 +30,16 @@ Q8 GEMV는 블록 합 뒤 scale 곱이 한 번 더 들어가므로 n = K + 2로 
 GEMV는 oracle 비교와 선형성·배치 독립·가중치 행 치환을 검사한다. RMSNorm은 oracle 비교와 배치 독립·scale 성질을 검사한다. SwiGLU는 f64 oracle PBT와 SiLU 구간·극단값·NaN sweep로 확인한다. RoPE는 위치 0~262143의 f64 oracle PBT, 크기·상대 위치 보존, 위치 0 항등을 검사한다. Attention은 길이 1~256의 f64 oracle PBT, 순서·상수 값·점수 평행이동 불변, gate 극단값과 HF 5 step을 검사한다. MoE는 top-k·expert GEMV·결합의 f64 oracle PBT, expert 번호 치환·하위 점수 변경·가중치 합 성질, HF 4개 지점 × 5 step × 4 layer를 검사한다. GDN conv는 채널 수와 커널 길이를 바꾸는 f64 oracle PBT, 토큰별 처리와 전체 causal conv 비교, 마지막 입력 state 확인, HF layer 0~2 × 5 step 비교, tap 순서 반전과 state 미갱신 대조를 검사한다. GDN delta rule은 다중 step f64 oracle PBT, β=0 감쇠, 직교 key 저장·회수, value 열 타일 불변, gate 극단 sweep, HF core·state·norm·Δx 비교, l2norm·head 매핑·norm weight 규약 대조를 검사한다. 모델 규약은 ignored HF reference 테스트로, 테스트 민감도는 gate/up 순서 교환, RoPE의 인접 짝짓기·전체 차원 회전, attention의 scale 누락·modulo GQA, MoE의 재정규화 누락·top-(k−1) 대조 실험으로 확인한다.
 
 기본 검증: `scripts/dev.sh test --workspace`. 실제 모델 정답 비교: `scripts/dev.sh test -p firepit --test reference -- --ignored`.
+
+## 판정 기준 현황
+
+| 커널 | 판정 | 근거 |
+|---|---|---|
+| GEMV(dense, Q8), expert GEMV, MoE 결합 | Higham–Mary 내적 상한 | 정리 3.1 |
+| GDN conv | 내적 상한 × max|SiLU'| + 활성화 반올림 | 정리 3.1 + 1차 전파 |
+| attention | q·k 점수 오차 E → softmax 가중치 (e^{2E}−1)·a, 가중합 상한, f32 underflow 하한 | 정리 3.1 + 1차 전파 |
+| rope | 2항 내적 상한 | 정리 3.1 |
+| rms_norm, swiglu, top-k 가중치 | 상대·절대 오차 | 상쇄가 없는 연산(제곱합, 원소별 곱, [0,1] 확률)이라 출력 대비 오차가 원리적으로 맞다 |
+| GDN delta rule | 상대 3e-4 (경험값) | **미해결.** 엄밀한 상한은 커널의 실제 연산 순서(FMA, l2norm 방식, softplus 급수, 하드웨어 exp 근사)를 따라가는 오차 모델이 필요하다. 연산 모델 없이 세운 추정 상한은 1.01~1.05배로 넘었다. 5000건 깊은 실행에서 경험값 판정은 통과 |
+
+상쇄 때문에 출력 대비 상대오차가 거짓 실패를 낸 사례: SwiGLU 결합, MoE 결합, GDN conv, attention(정답이 f32 표현 범위 밖, 1e-61). 모두 커널 오류가 아니었다.

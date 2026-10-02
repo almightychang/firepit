@@ -37,6 +37,14 @@ fn gpu(
 }
 
 fn oracle(input: &[f32], positions: &[usize], dims: &RopeDims) -> Vec<f64> {
+    rotate(input, positions, dims, |term| term)
+}
+
+fn magnitude(input: &[f32], positions: &[usize], dims: &RopeDims) -> Vec<f64> {
+    rotate(input, positions, dims, f64::abs)
+}
+
+fn rotate(input: &[f32], positions: &[usize], dims: &RopeDims, term: fn(f64) -> f64) -> Vec<f64> {
     let (heads, head_dim, rotary_dim) = (dims.heads(), dims.head_dim(), dims.rotary_dim());
     let (cos, sin) = frequencies(positions, dims);
     let half = rotary_dim / 2;
@@ -48,15 +56,15 @@ fn oracle(input: &[f32], positions: &[usize], dims: &RopeDims) -> Vec<f64> {
             (0..head_dim)
                 .map(|i| {
                     if i >= rotary_dim {
-                        x[i] as f64
+                        term(x[i] as f64)
                     } else {
                         let other = if i < half {
                             x[i + half] as f64
                         } else {
                             x[i - half] as f64
                         };
-                        x[i] as f64 * cos[offset + i] as f64
-                            + if i < half { -other } else { other } * sin[offset + i] as f64
+                        term(x[i] as f64 * cos[offset + i] as f64)
+                            + term(if i < half { -other } else { other } * sin[offset + i] as f64)
                     }
                 })
                 .collect::<Vec<_>>()
@@ -90,7 +98,8 @@ fn rope_matches_f64_oracle() {
                 let actual = gpu(&stream, &input, &positions, &dims)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 let expected = oracle(&input, &positions, &dims);
-                prop_assert!(check::max_relative(&actual, &expected) < 3e-6);
+                let magnitude = magnitude(&input, &positions, &dims);
+                prop_assert!(check::inner_product_excess(&actual, &expected, &magnitude, 2) <= 1.0);
                 Ok(())
             },
         )
