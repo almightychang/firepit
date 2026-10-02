@@ -20,7 +20,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
     ✔ LayerDef 목록에서 가중치·state·plan 생성, unsafe 0 + 가드 테스트
     ✔ batch 1~4 (3은 4로 채움)
 
- E2. Qwen3.6-35B-A3B decode (실제 수학)                            ◐
+ E2. Qwen3.6-35B-A3B decode (실제 수학)                            ✔
     아래 "E2 공부 단위" 참고
 
  E3. prefill                                                      ○
@@ -73,7 +73,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 | 2.6 MoE | router, top-8 선택, expert 가중합 | MoE 블록 하나가 일치 | ✔ |
 | 2.7 GDN ① | causal conv1d, conv state | conv 출력 일치 | ✔ |
 | 2.8 GDN ② | gating(α, β), delta rule 상태 갱신, 출력 gate | GDN layer 하나가 여러 step에서 일치 | ✔ |
-| 2.9 전부 쌓기 | layer stack, tokenizer, greedy decode | 실제 문장 생성 | ◐ (2.9a layer stack 완료) |
+| 2.9 전부 쌓기 | layer stack, tokenizer, greedy decode | 실제 문장 생성 | ✔ (GB10에서 전체 모델 생성, [기록](research/measurements/qwen36-first-generation-gb10.md)) |
 
 순서는 쉬운 개념부터 쌓는다. 각 개념이 다음 개념의 전제가 된다. cuTile 표현력의 한계는 2.6(MoE, 간접 읽기)과 2.8(GDN)에서 만난다.
 
