@@ -4,3 +4,4 @@
 /vendor/
 /refs/
 /tools/reference/.venv/
+__pycache__/
