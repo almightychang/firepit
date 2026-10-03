@@ -31,6 +31,8 @@ GDN chunk ①은 `A=I+L`, `X=A⁻¹`, `B_U=βv`, `B_W=βk exp(cum)`로 둔다. �
 
 `intra`는 `QKᵀ` 내적 크기 `M_Q=exp(cum_i−cum_j)Σ_d|q_id k_jd|`에 `(e_d+e_n)M_Q`를 적용한다. 누적 gate의 오차가 지수로 전파되는 항은 `2γ̃_C(8)(Σ_{r≤i}|g_r|+Σ_{r≤j}|g_r|)M_Q`로 별도 더한다. `cum`은 `γ̃_C(8)|cum|+8u|cum|`로 판정한다. `tests/gdn_chunk.rs`의 f64 oracle이 성분별 크기를 계산하며, HF 기록 입력도 같은 기준을 쓴다.
 
+GDN chunk ②는 3.4의 실제 f32 `U/W/intra/cum`을 고정 입력으로 삼고 f64로 `Δ=U−WS`, `o=Q̃S+intra·Δ`, `S'=exp(cum_last)S+K̃ᵀΔ`를 계산한다. 각 내적의 크기 `M=Σ|ab|`에 `e_n M`을 적용한다. bf16 세 곱의 `e_n=3γ̃_n(8)+3u_b²`는 두 피연산자의 hi+lo 분할 잔차와 생략한 lo·lo 항을 각각 포함한다. 정규화와 지수의 오차에는 `γ̃_D(8)+16u`, 출력 반올림에는 `8u|결과|`를 더한다. `Δ`의 상한은 `e_D M_WS+|W|E_S+8u|Δ|`, 출력의 상한은 `e_D M_QS+e_C M_AΔ+|Q̃|E_S+|intra|E_Δ+8u|o|`, 다음 state의 상한은 `exp(cum_last)E_S+8u exp(cum_last)|S|+e_C M_KΔ+|K̃|ᵀE_Δ+8u|S'|`다. 이 성분별 상한을 chunk마다 전파한다. `u=2⁻²⁴`, `u_b=2⁻⁸`이다. decode 동치에는 이 상한과 기존 delta_step의 경험값 `3e-4(1+|기준값|)`을 합한다. decode 쪽 엄밀한 상한은 아직 미해결이다.
+
 Prefill attention은 Q·Kᵀ와 P·V 모두 f32 피연산자를 bf16 hi+lo로 나눠 hi·hi + hi·lo + lo·hi를 누적한다. `S_j = scale·Σ_i q_i k_{ji}`, `M_j = scale·Σ_i |q_i k_{ji}|`, `E_0 = max_j(γ̃_D M_j + 4u)`, `E_s = max_j((3γ̃_D+u_b²)M_j)`, `E = E_0+E_s`로 둔다. 출력 성분의 판정 상한은 `L·f32::MIN_POSITIVE·max|v| + [γ̃_(2L+2) + (e^(2E)−1) + 3γ̃_L + u_b² + 8u]·Σ_j a_j|v_j|`이다. `a_j`는 f64 softmax 가중치이며, `L`은 해당 쿼리가 볼 수 있는 cache 길이다. P·V 분할의 생략된 lo·lo와 세 MMA 누적 오차를 마지막 두 항에 더했다. Prefill과 decode의 행별 동치 판정은 각 경로 상한의 합을 쓴다.
 
 ## 층
@@ -49,6 +51,7 @@ GEMV는 oracle 비교와 선형성·배치 독립·가중치 행 치환을 검�
 | prefill attention | attention 상한에 두 bf16×3 내적의 분할·누적 오차를 더함 | 정리 3.1 + 1차 전파 |
 | rope | 2항 내적 상한 | 정리 3.1 |
 | rms_norm, swiglu, top-k 가중치 | 상대·절대 오차 | 상쇄가 없는 연산(제곱합, 원소별 곱, [0,1] 확률)이라 출력 대비 오차가 원리적으로 맞다 |
+| GDN chunk ② | bf16×3 내적의 성분별 상한을 chunk마다 state로 전파 | Higham–Mary + 분할 잔차 세 항 |
 | GDN delta rule | 상대 3e-4 (경험값) | **미해결.** 엄밀한 상한은 커널의 실제 연산 순서(FMA, l2norm 방식, softplus 급수, 하드웨어 exp 근사)를 따라가는 오차 모델이 필요하다. 연산 모델 없이 세운 추정 상한은 1.01~1.05배로 넘었다. 5000건 깊은 실행에서 경험값 판정은 통과 |
 
 상쇄 때문에 출력 대비 상대오차가 거짓 실패를 낸 사례: SwiGLU 결합, MoE 결합, GDN conv, attention(정답이 f32 표현 범위 밖, 1e-61). 모두 커널 오류가 아니었다.

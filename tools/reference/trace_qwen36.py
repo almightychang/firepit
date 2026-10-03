@@ -314,6 +314,18 @@ def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tenso
             gdn_qkv[layer] = output[0].clone()
             records[f"layer{layer}/gdn/qkv"] = output[0].clone()
         hooks.append(gdn.in_proj_qkv.register_forward_hook(record_qkv))
+        if layer < 3:
+            def record_z(_module, _args, output, layer=layer):
+                records[f"layer{layer}/gdn/z"] = output[0].clone()
+            def record_core(_module, args, layer=layer):
+                records[f"layer{layer}/gdn/core"] = args[0].reshape(len(tokens), -1, args[0].shape[-1]).clone()
+            def record_delta(_module, _args, output, layer=layer):
+                records[f"layer{layer}/gdn/delta"] = output[0].clone()
+            hooks.extend((
+                gdn.in_proj_z.register_forward_hook(record_z),
+                gdn.norm.register_forward_pre_hook(record_core),
+                gdn.out_proj.register_forward_hook(record_delta),
+            ))
     if len(model.model.layers) > 3:
         attn = model.model.layers[3].self_attn
         def normalized(name):

@@ -9,6 +9,10 @@ use firepit_kernels::attention::{
     causal_attention_prefill, online_attention, output_gate,
 };
 use firepit_kernels::gdn::{GdnDims, conv1d_silu, conv1d_silu_prefill, delta_step, gated_silu};
+use firepit_kernels::gdn_chunk::{
+    apply_inverse, first_phase_matrices, invert_diagonal, merge_inverse, second_phase,
+    second_phase_value_tile,
+};
 use firepit_kernels::gemm::{DEFAULT_GEMM_TILE, gemm};
 use firepit_kernels::gemv::expert_gemv;
 use firepit_kernels::gemv::gemv;
@@ -207,6 +211,247 @@ fn gdn_conv_prefill_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!("GDN conv prefill HF worst_excess={worst:.6}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Qwen3.6 weights and regenerated 150-token prefill reference"]
+fn gdn_prefill_layer_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
+    let model_dir = home("Models/qwen3.6-35b-a3b");
+    let dims = gdn_dims(&model_dir)?;
+    let weights = Checkpoint::open(&model_dir)?;
+    let refs = SafetensorsFile::open(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../refs/qwen36-prefix4-prefill.safetensors"),
+    )?;
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let sm_count =
+        cuda_core::simt::CudaContext::new(device.ordinal())?.multiprocessor_count()? as usize;
+    let channel_tile = firepit_kernels::tile::channel_tile(dims.conv_dim(), sm_count, 1);
+    let value_tile = second_phase_value_tile(dims.value_head_dim(), dims.value_heads(), sm_count);
+    let upload = |data: Vec<f32>, shape: &[usize]| {
+        api::copy_host_vec_to_device(&Arc::new(data))
+            .reshape(shape)
+            .sync_on(&stream)
+    };
+    let mut worst = [0.0f64; 3];
+    for layer in 0..3 {
+        let prefix = format!("layer{layer}/gdn");
+        let weight_prefix = format!("model.language_model.layers.{layer}.linear_attn");
+        let qkv = refs.tensor(&format!("{prefix}/qkv"))?;
+        let t = qkv.shape[0];
+        let chunk_size = 64usize;
+        let chunks = t.div_ceil(chunk_size);
+        let padded = chunks * chunk_size;
+        let (kh, vh, dk, dv) = (
+            dims.key_heads(),
+            dims.value_heads(),
+            dims.key_head_dim(),
+            dims.value_head_dim(),
+        );
+        let weight = weights.tensor(&format!("{weight_prefix}.conv1d.weight"))?;
+        let mut conv = api::zeros::<f32>(&[t, dims.conv_dim()]).sync_on(&stream)?;
+        let mut conv_state =
+            api::zeros::<f32>(&[1, dims.conv_dim(), dims.conv_kernel() - 1]).sync_on(&stream)?;
+        let qkv = upload(qkv.data, &[t, dims.conv_dim()])?;
+        let conv_weight = upload(weight.data, &[dims.conv_dim(), dims.conv_kernel()])?;
+        conv1d_silu_prefill(
+            (&mut conv).partition([t.next_power_of_two(), channel_tile]),
+            &qkv,
+            conv_state.partition([1, channel_tile, dims.conv_kernel().next_power_of_two()]),
+            &conv_weight,
+            dims.conv_kernel() as i32,
+        )
+        .generics({
+            let mut g = vec![t.next_power_of_two().to_string()];
+            g.extend(dims.conv_generics(channel_tile));
+            g
+        })
+        .sync_on(&stream)?;
+        let conv: Vec<f32> = conv.to_host_vec().sync_on(&stream)?;
+        let mut q = vec![0.0; padded * kh * dk];
+        let mut k = vec![0.0; padded * kh * dk];
+        let mut v = vec![0.0; padded * vh * dv];
+        for row in 0..t {
+            let base = row * dims.conv_dim();
+            q[row * kh * dk..(row + 1) * kh * dk].copy_from_slice(&conv[base..base + kh * dk]);
+            k[row * kh * dk..(row + 1) * kh * dk]
+                .copy_from_slice(&conv[base + kh * dk..base + 2 * kh * dk]);
+            v[row * vh * dv..(row + 1) * vh * dv]
+                .copy_from_slice(&conv[base + 2 * kh * dk..base + dims.conv_dim()]);
+        }
+        for (name, actual) in [("q", &q), ("k", &k), ("v", &v)] {
+            let expected = refs.tensor(&format!("{prefix}/{name}"))?;
+            let error = relative_max(
+                &actual[..expected.data.len()],
+                &expected.data.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+            );
+            assert!(error < 2e-5, "{prefix} conv {name} {error}");
+        }
+        let mut g = vec![0.0; padded * vh];
+        let mut beta = g.clone();
+        g[..t * vh].copy_from_slice(&refs.tensor(&format!("{prefix}/chunk/g"))?.data);
+        beta[..t * vh].copy_from_slice(&refs.tensor(&format!("{prefix}/chunk/beta"))?.data);
+        let q = upload(q, &[chunks, chunk_size, kh, dk])?;
+        let k = upload(k, &[chunks, chunk_size, kh, dk])?;
+        let v = upload(v, &[chunks, chunk_size, vh, dv])?;
+        let g = upload(g, &[chunks, chunk_size, vh])?;
+        let beta = upload(beta, &[chunks, chunk_size, vh])?;
+        let flat = chunks * vh;
+        let mut ut = api::zeros::<f32>(&[flat, chunk_size, chunk_size]).sync_on(&stream)?;
+        let mut intra = api::zeros::<f32>(&[flat, chunk_size, chunk_size]).sync_on(&stream)?;
+        let mut cum = api::zeros::<f32>(&[flat, chunk_size]).sync_on(&stream)?;
+        first_phase_matrices(
+            ut.partition([1, chunk_size, chunk_size]),
+            intra.partition([1, chunk_size, chunk_size]),
+            cum.partition([1, chunk_size]),
+            &q,
+            &k,
+            &g,
+            &beta,
+            chunk_size as i32,
+            dims.eps(),
+            dims.inv_sqrt_key_dim(),
+        )
+        .generics(vec![
+            chunk_size.to_string(),
+            dk.to_string(),
+            kh.to_string(),
+            vh.to_string(),
+        ])
+        .sync_on(&stream)?;
+        let block = 16usize;
+        let mut diagonal =
+            api::zeros::<f32>(&[flat * chunk_size / block, block, block]).sync_on(&stream)?;
+        invert_diagonal(diagonal.partition([1, block, block]), &ut)
+            .generics(vec![chunk_size.to_string(), block.to_string()])
+            .sync_on(&stream)?;
+        let mut inverse = api::zeros::<f32>(&[flat, chunk_size, chunk_size]).sync_on(&stream)?;
+        let mut scratch = api::zeros::<f32>(&[flat, chunk_size, chunk_size]).sync_on(&stream)?;
+        for row in 0..chunk_size / block {
+            merge_inverse(
+                scratch.partition([1, chunk_size, chunk_size]),
+                &inverse,
+                &ut,
+                &diagonal,
+                row as i32,
+            )
+            .generics(vec![chunk_size.to_string(), block.to_string()])
+            .sync_on(&stream)?;
+            std::mem::swap(&mut inverse, &mut scratch);
+        }
+        let mut u = api::zeros::<f32>(&[flat, chunk_size, dv]).sync_on(&stream)?;
+        let mut w = api::zeros::<f32>(&[flat, chunk_size, dk]).sync_on(&stream)?;
+        apply_inverse(
+            u.partition([1, chunk_size, dv]),
+            w.partition([1, chunk_size, dk]),
+            &inverse,
+            &cum,
+            &k,
+            &v,
+            &beta,
+            chunk_size as i32,
+            dims.eps(),
+        )
+        .generics(vec![
+            chunk_size.to_string(),
+            dk.to_string(),
+            dv.to_string(),
+            kh.to_string(),
+            vh.to_string(),
+        ])
+        .sync_on(&stream)?;
+        let mut state = api::zeros::<f32>(&[1, vh * dk, dv]).sync_on(&stream)?;
+        let mut core = api::zeros::<f32>(&[padded, vh, dv]).sync_on(&stream)?;
+        second_phase(
+            core.partition([padded.next_power_of_two(), 1, value_tile]),
+            state.partition([1, dk, value_tile]),
+            &u,
+            &w,
+            &intra,
+            &cum,
+            &q,
+            &k,
+            chunks as i32,
+            dims.eps(),
+            dims.inv_sqrt_key_dim(),
+        )
+        .generics(vec![
+            padded.next_power_of_two().to_string(),
+            chunk_size.to_string(),
+            dk.to_string(),
+            value_tile.to_string(),
+            kh.to_string(),
+            vh.to_string(),
+        ])
+        .sync_on(&stream)?;
+        let actual_state: Vec<f32> = state.to_host_vec().sync_on(&stream)?;
+        let hf_state = refs.tensor(&format!("layer{layer}/cache/recurrent"))?;
+        let state_error = relative_max(
+            &actual_state,
+            &hf_state.data.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+        );
+        worst[1] = worst[1].max(state_error);
+        assert!(state_error < 3e-4, "{prefix} state {state_error}");
+        let core: Vec<f32> = core.to_host_vec().sync_on(&stream)?;
+        let hf_core = refs.tensor(&format!("{prefix}/core"))?;
+        let core_error = relative_max(
+            &core[..t * vh * dv],
+            &hf_core.data.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+        );
+        worst[0] = worst[0].max(core_error);
+        assert!(core_error < 3e-4, "{prefix} core {core_error}");
+        let norm_weight = weights.tensor(&format!("{weight_prefix}.norm.weight"))?;
+        let gamma = upload(norm_weight.data, &[dv])?;
+        let norm_input = upload(core[..t * vh * dv].to_vec(), &[t * vh, dv])?;
+        let mut normalized = api::zeros::<f32>(&[t * vh, dv]).sync_on(&stream)?;
+        rms_norm(
+            normalized.partition([1, dv]),
+            &norm_input,
+            &gamma,
+            1.0 / dv as f32,
+            dims.eps(),
+        )
+        .generics(vec![dv.to_string()])
+        .sync_on(&stream)?;
+        let z = refs.tensor(&format!("{prefix}/z"))?;
+        let gate = upload(z.data, &[t * vh, dv])?;
+        let mut gated = api::zeros::<f32>(&[t * vh, dv]).sync_on(&stream)?;
+        gated_silu(gated.partition([1, dv]), &normalized, &gate)
+            .generics(vec![dv.to_string()])
+            .sync_on(&stream)?;
+        let mut gated: Vec<f32> = gated.to_host_vec().sync_on(&stream)?;
+        let projection = weights.tensor_bf16(&format!("{weight_prefix}.out_proj.weight"))?;
+        let matrix = projection.upload_matrix(&stream)?;
+        let tile = DEFAULT_GEMM_TILE;
+        let rows = t.div_ceil(tile.m) * tile.m;
+        gated.resize(rows * vh * dv, 0.0);
+        let x = upload(gated, &[rows, vh * dv])?;
+        let mut delta = api::zeros::<f32>(&[rows, dims.hidden()]).sync_on(&stream)?;
+        gemm(
+            &matrix,
+            &x.view(&[rows, vh * dv])?,
+            delta.partition([tile.m, tile.n]),
+            tile,
+        )
+        .submit(&mut Eager(&stream))?;
+        let delta: Vec<f32> = delta.to_host_vec().sync_on(&stream)?;
+        let hf_delta = refs.tensor(&format!("{prefix}/delta"))?;
+        let delta_error = relative_max(
+            &delta[..t * dims.hidden()],
+            &hf_delta.data.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+        );
+        worst[2] = worst[2].max(delta_error);
+        assert!(delta_error < 5e-4, "{prefix} delta {delta_error}");
+        println!(
+            "{prefix} T={t} core={core_error:.8e} state={state_error:.8e} delta={delta_error:.8e}"
+        );
+    }
+    println!(
+        "GDN prefill layer worst core={:.8e} state={:.8e} delta={:.8e}",
+        worst[0], worst[1], worst[2]
+    );
     Ok(())
 }
 

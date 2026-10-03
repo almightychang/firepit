@@ -4,8 +4,9 @@ use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::TileKernel;
+use firepit_kernels::gdn::delta_step;
 use firepit_kernels::gdn_chunk::{
-    apply_inverse, first_phase_matrices, invert_diagonal, merge_inverse,
+    apply_inverse, first_phase_matrices, invert_diagonal, merge_inverse, second_phase,
 };
 use proptest::prelude::*;
 use std::sync::Arc;
@@ -380,6 +381,441 @@ fn gpu(shape: Shape, x: &Inputs) -> Result<Outputs, Box<dyn std::error::Error>> 
         intra: intra.to_host_vec().sync_on(&stream)?,
         cum: cum.to_host_vec().sync_on(&stream)?,
     })
+}
+
+fn second_gpu(
+    shape: Shape,
+    x: &Inputs,
+    first: &Outputs,
+    initial: &[f32],
+    value_tile: usize,
+) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let (n, c, kh, vh, dk, dv) = (
+        shape.chunks,
+        shape.tile,
+        shape.kh,
+        shape.vh,
+        shape.dk,
+        shape.dv,
+    );
+    let upload = |data: &[f32], dims: &[usize]| {
+        api::copy_host_vec_to_device(&Arc::new(data.to_vec()))
+            .reshape(dims)
+            .sync_on(&stream)
+    };
+    let q = upload(&x.q, &[n, c, kh, dk])?;
+    let k = upload(&x.k, &[n, c, kh, dk])?;
+    let u = upload(&first.u, &[n * vh, c, dv])?;
+    let w = upload(&first.w, &[n * vh, c, dk])?;
+    let intra = upload(&first.intra, &[n * vh, c, c])?;
+    let cum = upload(&first.cum, &[n * vh, c])?;
+    let mut state = upload(initial, &[1, vh * dk, dv])?;
+    let mut out = api::zeros::<f32>(&[n * c, vh, dv]).sync_on(&stream)?;
+    second_phase(
+        (&mut out).partition([(n * c).next_power_of_two(), 1, value_tile]),
+        state.partition([1, dk, value_tile]),
+        &u,
+        &w,
+        &intra,
+        &cum,
+        &q,
+        &k,
+        n as i32,
+        1e-6,
+        1.0 / (dk as f32).sqrt(),
+    )
+    .generics(vec![
+        (n * c).next_power_of_two().to_string(),
+        c.to_string(),
+        dk.to_string(),
+        value_tile.to_string(),
+        kh.to_string(),
+        vh.to_string(),
+    ])
+    .sync_on(&stream)?;
+    Ok((
+        out.to_host_vec().sync_on(&stream)?,
+        state.to_host_vec().sync_on(&stream)?,
+    ))
+}
+
+#[test]
+fn second_phase_smoke() -> Result<(), Box<dyn std::error::Error>> {
+    let shape = Shape {
+        chunks: 2,
+        chunk: 5,
+        tile: 16,
+        block: 16,
+        kh: 1,
+        vh: 2,
+        dk: 32,
+        dv: 32,
+    };
+    let input = generated(shape, 9, 24, false);
+    let first = gpu(shape, &input)?;
+    let initial = vec![0.0; shape.vh * shape.dk * shape.dv];
+    let (out, state) = second_gpu(shape, &input, &first, &initial, 16)?;
+    assert!(out.iter().all(|x| x.is_finite()));
+    assert!(state.iter().any(|&x| x != 0.0));
+    Ok(())
+}
+
+struct SecondReference {
+    output: Vec<f64>,
+    state: Vec<f64>,
+    output_bound: Vec<f64>,
+    state_bound: Vec<f64>,
+}
+
+fn second_oracle_with_decay(
+    shape: Shape,
+    x: &Inputs,
+    first: &Outputs,
+    initial: &[f32],
+    omit_decay: bool,
+) -> SecondReference {
+    let (n, c, kh, vh, dk, dv) = (
+        shape.chunks,
+        shape.tile,
+        shape.kh,
+        shape.vh,
+        shape.dk,
+        shape.dv,
+    );
+    let unit = f32::EPSILON as f64 / 2.0;
+    let split = (1.0 / 256.0f64).powi(2);
+    let norm = common::check::gamma_tilde(dk) + 16.0 * unit;
+    let key_dot = 3.0 * common::check::gamma_tilde(c) + 3.0 * split + norm + 8.0 * unit;
+    let query_dot = 3.0 * common::check::gamma_tilde(dk) + 3.0 * split + norm + 8.0 * unit;
+    let w_dot = 3.0 * common::check::gamma_tilde(dk) + 3.0 * split;
+    let intra_dot = 3.0 * common::check::gamma_tilde(c) + 3.0 * split;
+    let mut result = SecondReference {
+        output: vec![0.0; n * c * vh * dv],
+        state: initial.iter().map(|&v| v as f64).collect(),
+        output_bound: vec![0.0; n * c * vh * dv],
+        state_bound: vec![0.0; vh * dk * dv],
+    };
+    for chunk in 0..n {
+        for head in 0..vh {
+            let flat = chunk * vh + head;
+            let key_head = head / (vh / kh);
+            let last = first.cum[flat * c + c - 1] as f64;
+            let decay = if omit_decay { 1.0 } else { last.exp() };
+            let mut q = vec![0.0f64; c * dk];
+            let mut k = vec![0.0f64; c * dk];
+            for row in 0..c {
+                let time = chunk * c + row;
+                let base = (time * kh + key_head) * dk;
+                let qnorm =
+                    ((0..dk).map(|d| (x.q[base + d] as f64).powi(2)).sum::<f64>() + 1e-6).sqrt();
+                let knorm =
+                    ((0..dk).map(|d| (x.k[base + d] as f64).powi(2)).sum::<f64>() + 1e-6).sqrt();
+                let cum = first.cum[flat * c + row] as f64;
+                for d in 0..dk {
+                    q[row * dk + d] = x.q[base + d] as f64 / qnorm / (dk as f64).sqrt() * cum.exp();
+                    k[row * dk + d] = x.k[base + d] as f64 / knorm * (last - cum).exp();
+                }
+            }
+            let mut delta = vec![0.0f64; c * dv];
+            let mut delta_bound = vec![0.0f64; c * dv];
+            for row in 0..c {
+                for d in 0..dv {
+                    let mut dot = 0.0;
+                    let mut magnitude = 0.0;
+                    let mut propagated = 0.0;
+                    for j in 0..dk {
+                        let weight = first.w[(flat * c + row) * dk + j] as f64;
+                        let state_index = (head * dk + j) * dv + d;
+                        dot += weight * result.state[state_index];
+                        magnitude += (weight * result.state[state_index]).abs();
+                        propagated += weight.abs() * result.state_bound[state_index];
+                    }
+                    let index = row * dv + d;
+                    delta[index] = first.u[(flat * c + row) * dv + d] as f64 - dot;
+                    delta_bound[index] =
+                        w_dot * magnitude + propagated + 8.0 * unit * delta[index].abs();
+                }
+            }
+            for row in 0..c {
+                for d in 0..dv {
+                    let mut inter = 0.0;
+                    let mut inter_magnitude = 0.0;
+                    let mut inter_propagated = 0.0;
+                    for j in 0..dk {
+                        let state_index = (head * dk + j) * dv + d;
+                        let product = q[row * dk + j] * result.state[state_index];
+                        inter += product;
+                        inter_magnitude += product.abs();
+                        inter_propagated += q[row * dk + j].abs() * result.state_bound[state_index];
+                    }
+                    let mut within = 0.0;
+                    let mut within_magnitude = 0.0;
+                    let mut within_propagated = 0.0;
+                    for j in 0..c {
+                        let a = first.intra[(flat * c + row) * c + j] as f64;
+                        let product = a * delta[j * dv + d];
+                        within += product;
+                        within_magnitude += product.abs();
+                        within_propagated += a.abs() * delta_bound[j * dv + d];
+                    }
+                    let index = ((chunk * c + row) * vh + head) * dv + d;
+                    result.output[index] = inter + within;
+                    result.output_bound[index] = query_dot * inter_magnitude
+                        + intra_dot * within_magnitude
+                        + inter_propagated
+                        + within_propagated
+                        + 8.0 * unit * result.output[index].abs();
+                }
+            }
+            for j in 0..dk {
+                for d in 0..dv {
+                    let index = (head * dk + j) * dv + d;
+                    let mut update = 0.0;
+                    let mut magnitude = 0.0;
+                    let mut propagated = 0.0;
+                    for row in 0..c {
+                        let weight = k[row * dk + j];
+                        let product = weight * delta[row * dv + d];
+                        update += product;
+                        magnitude += product.abs();
+                        propagated += weight.abs() * delta_bound[row * dv + d];
+                    }
+                    let next = decay * result.state[index] + update;
+                    result.state_bound[index] = decay * result.state_bound[index]
+                        + 8.0 * unit * decay * result.state[index].abs()
+                        + key_dot * magnitude
+                        + propagated
+                        + 8.0 * unit * next.abs();
+                    result.state[index] = next;
+                }
+            }
+        }
+    }
+    result
+}
+
+fn second_oracle(shape: Shape, x: &Inputs, first: &Outputs, initial: &[f32]) -> SecondReference {
+    second_oracle_with_decay(shape, x, first, initial, false)
+}
+
+fn second_excess(actual: &[f32], expected: &[f64], bound: &[f64]) -> f64 {
+    actual
+        .iter()
+        .zip(expected)
+        .zip(bound)
+        .map(|((&a, &e), &b)| (a as f64 - e).abs() / b.max(f64::MIN_POSITIVE))
+        .fold(0.0, f64::max)
+}
+
+#[test]
+fn second_phase_oracle_pbt() -> Result<(), Box<dyn std::error::Error>> {
+    let mut runner = common::runner(64, file!());
+    runner.run(
+        &(
+            1usize..97,
+            proptest::sample::select(vec![5usize, 16, 31, 64]),
+            1usize..3,
+            any::<u64>(),
+            any::<bool>(),
+            any::<bool>(),
+        ),
+        |(time, chunk, kh, seed, strong, nonzero)| {
+            let shape = Shape {
+                chunks: time.div_ceil(chunk),
+                chunk,
+                tile: chunk.next_power_of_two().max(16),
+                block: 16,
+                kh,
+                vh: kh * 2,
+                dk: 32,
+                dv: 32,
+            };
+            let input = generated(shape, time, seed, strong);
+            let first = gpu(shape, &input).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let mut initial = vec![0.0f32; shape.vh * shape.dk * shape.dv];
+            if nonzero {
+                for (i, value) in initial.iter_mut().enumerate() {
+                    *value = ((i * 17 % 61) as f32 - 30.0) / 97.0;
+                }
+            }
+            let expected = second_oracle(shape, &input, &first, &initial);
+            let (actual_output, actual_state) = second_gpu(shape, &input, &first, &initial, 16)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let output = second_excess(&actual_output, &expected.output, &expected.output_bound);
+            let state = second_excess(&actual_state, &expected.state, &expected.state_bound);
+            prop_assert!(
+                output <= 1.0 && state <= 1.0,
+                "output={output} state={state}"
+            );
+            Ok(())
+        },
+    )?;
+    Ok(())
+}
+
+fn decode_gpu(
+    shape: Shape,
+    input: &Inputs,
+    initial: &[f32],
+    time: usize,
+) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let (kh, vh, dk, dv) = (shape.kh, shape.vh, shape.dk, shape.dv);
+    let upload = |data: &[f32], dims: &[usize]| {
+        api::copy_host_vec_to_device(&Arc::new(data.to_vec()))
+            .reshape(dims)
+            .sync_on(&stream)
+    };
+    let mut state = upload(initial, &[vh, dk, dv])?;
+    let zeros = vec![0.0; vh];
+    let a_log = upload(&zeros, &[vh])?;
+    let dt_bias = upload(&zeros, &[vh])?;
+    let mut result = vec![0.0; time * vh * dv];
+    for t in 0..time {
+        let mut output = api::zeros::<f32>(&[vh, 1, dv]).sync_on(&stream)?;
+        let row = t / shape.chunk * shape.tile + t % shape.chunk;
+        let q = upload(&input.q[row * kh * dk..(row + 1) * kh * dk], &[kh, dk])?;
+        let k = upload(&input.k[row * kh * dk..(row + 1) * kh * dk], &[kh, dk])?;
+        let v = upload(&input.v[row * vh * dv..(row + 1) * vh * dv], &[vh, dv])?;
+        let b: Vec<f32> = input.beta[row * vh..(row + 1) * vh]
+            .iter()
+            .map(|&beta| (beta / (1.0 - beta)).ln())
+            .collect();
+        let a: Vec<f32> = input.g[row * vh..(row + 1) * vh]
+            .iter()
+            .map(|&g| (-g).exp_m1().ln())
+            .collect();
+        let b = upload(&b, &[vh])?;
+        let a = upload(&a, &[vh])?;
+        delta_step(
+            (&mut output).partition([1, 1, 16]),
+            state.partition([1, dk, 16]),
+            &q,
+            &k,
+            &v,
+            &b,
+            &a,
+            &a_log,
+            &dt_bias,
+            1e-6,
+            1.0 / (dk as f32).sqrt(),
+        )
+        .generics(vec![
+            kh.to_string(),
+            vh.to_string(),
+            dk.to_string(),
+            "16".into(),
+        ])
+        .sync_on(&stream)?;
+        let step: Vec<f32> = output.to_host_vec().sync_on(&stream)?;
+        result[t * vh * dv..(t + 1) * vh * dv].copy_from_slice(&step);
+    }
+    Ok((result, state.to_host_vec().sync_on(&stream)?))
+}
+
+#[test]
+fn second_phase_matches_delta_step() -> Result<(), Box<dyn std::error::Error>> {
+    for (chunk, time, seed, nonzero) in [(5usize, 13usize, 91, false), (16, 31, 719, true)] {
+        let shape = Shape {
+            chunks: time.div_ceil(chunk),
+            chunk,
+            tile: chunk.next_power_of_two().max(16),
+            block: 16,
+            kh: 2,
+            vh: 4,
+            dk: 32,
+            dv: 32,
+        };
+        let input = generated(shape, time, seed, false);
+        let first = gpu(shape, &input)?;
+        let mut initial = vec![0.0; shape.vh * shape.dk * shape.dv];
+        if nonzero {
+            for (i, value) in initial.iter_mut().enumerate() {
+                *value = ((i * 13 % 29) as f32 - 14.0) / 89.0;
+            }
+        }
+        let oracle = second_oracle(shape, &input, &first, &initial);
+        let (chunk_output, chunk_state) = second_gpu(shape, &input, &first, &initial, 16)?;
+        let (decode_output, decode_state) = decode_gpu(shape, &input, &initial, time)?;
+        let mut worst = 0.0f64;
+        for t in 0..time {
+            for h in 0..shape.vh {
+                for d in 0..shape.dv {
+                    let padded_time = t / shape.chunk * shape.tile + t % shape.chunk;
+                    let padded = (padded_time * shape.vh + h) * shape.dv + d;
+                    let dense = (t * shape.vh + h) * shape.dv + d;
+                    let allowance =
+                        oracle.output_bound[padded] + 3e-4 * (1.0 + oracle.output[padded].abs());
+                    let error = (chunk_output[padded] - decode_output[dense]).abs() as f64;
+                    worst = worst.max(error / allowance);
+                }
+            }
+        }
+        for ((&a, &b), (&e, &bound)) in chunk_state
+            .iter()
+            .zip(&decode_state)
+            .zip(oracle.state.iter().zip(&oracle.state_bound))
+        {
+            let allowance = bound + 3e-4 * (1.0 + e.abs());
+            worst = worst.max((a - b).abs() as f64 / allowance);
+        }
+        assert!(worst <= 1.0, "chunk={chunk} time={time} excess={worst}");
+    }
+    Ok(())
+}
+
+#[test]
+fn second_phase_omissions_are_detected() -> Result<(), Box<dyn std::error::Error>> {
+    let shape = Shape {
+        chunks: 3,
+        chunk: 16,
+        tile: 16,
+        block: 16,
+        kh: 1,
+        vh: 2,
+        dk: 32,
+        dv: 32,
+    };
+    let input = generated(shape, 48, 9217, false);
+    let first = gpu(shape, &input)?;
+    let initial: Vec<f32> = (0..shape.vh * shape.dk * shape.dv)
+        .map(|i| ((i * 17 % 41) as f32 - 20.0) / 53.0)
+        .collect();
+    let expected = second_oracle(shape, &input, &first, &initial);
+    let omitted_decay = second_oracle_with_decay(shape, &input, &first, &initial, true);
+    let omitted_w = Outputs {
+        u: first.u.clone(),
+        w: vec![0.0; first.w.len()],
+        intra: first.intra.clone(),
+        cum: first.cum.clone(),
+    };
+    let (wrong_output, wrong_state) = second_gpu(shape, &input, &omitted_w, &initial, 16)?;
+    assert!(second_excess(&wrong_output, &expected.output, &expected.output_bound) > 1.0);
+    assert!(second_excess(&wrong_state, &expected.state, &expected.state_bound) > 1.0);
+    assert!(
+        second_excess(
+            &omitted_decay
+                .output
+                .iter()
+                .map(|&x| x as f32)
+                .collect::<Vec<_>>(),
+            &expected.output,
+            &expected.output_bound,
+        ) > 1.0
+    );
+    assert!(
+        second_excess(
+            &omitted_decay
+                .state
+                .iter()
+                .map(|&x| x as f32)
+                .collect::<Vec<_>>(),
+            &expected.state,
+            &expected.state_bound,
+        ) > 1.0
+    );
+    Ok(())
 }
 
 #[test]

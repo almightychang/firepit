@@ -243,6 +243,120 @@ mod kernels {
         w_result = mma(x_lo, k_hi, w_result);
         w.store(w_result.reshape(shape![1, C, DK]));
     }
+
+    #[cutile::entry()]
+    pub fn second_phase<
+        const TP: i32,
+        const C: i32,
+        const DK: i32,
+        const VT: i32,
+        const KEY_HEADS: i32,
+        const VALUE_HEADS: i32,
+    >(
+        out: &mut Tensor<f32, { [TP, 1, VT] }>,
+        state: &mut Tensor<f32, { [1, DK, VT] }>,
+        u: &Tensor<f32, { [-1, C, -1] }>,
+        w: &Tensor<f32, { [-1, C, DK] }>,
+        intra: &Tensor<f32, { [-1, C, C] }>,
+        cum: &Tensor<f32, { [-1, C] }>,
+        query: &Tensor<f32, { [-1, C, KEY_HEADS, DK] }>,
+        key: &Tensor<f32, { [-1, C, KEY_HEADS, DK] }>,
+        chunks: i32,
+        eps: f32,
+        inv_sqrt_dk: f32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let head = pid.1;
+        let column = pid.2;
+        let key_head = head / (VALUE_HEADS / KEY_HEADS);
+        let mut s: Tile<f32, { [DK, VT] }> = state.load().reshape(shape![DK, VT]);
+        let zero_cv: Tile<f32, { [C, VT] }> = constant(0.0f32, shape![C, VT]);
+        let zero_kv: Tile<f32, { [DK, VT] }> = constant(0.0f32, shape![DK, VT]);
+        for chunk in 0i32..chunks {
+            let flat = chunk * VALUE_HEADS + head;
+            let q: Tile<f32, { [C, DK] }> = query
+                .partition(shape![1, C, 1, DK])
+                .load([chunk, 0, key_head, 0])
+                .reshape(shape![C, DK]);
+            let k: Tile<f32, { [C, DK] }> = key
+                .partition(shape![1, C, 1, DK])
+                .load([chunk, 0, key_head, 0])
+                .reshape(shape![C, DK]);
+            let q_norm: Tile<f32, { [C] }> = reduce_sum(q * q, 1);
+            let k_norm: Tile<f32, { [C] }> = reduce_sum(k * k, 1);
+            let q = q
+                * (rsqrt(q_norm + eps.broadcast(shape![C]), ftz::Disabled)
+                    * inv_sqrt_dk.broadcast(shape![C]))
+                .reshape(shape![C, 1])
+                .broadcast(shape![C, DK]);
+            let k = k * rsqrt(k_norm + eps.broadcast(shape![C]), ftz::Disabled)
+                .reshape(shape![C, 1])
+                .broadcast(shape![C, DK]);
+            let cumulative: Tile<f32, { [C] }> = cum
+                .partition(shape![1, C])
+                .load([flat, 0])
+                .reshape(shape![C]);
+            let last: Tile<f32, { [1] }> = extract(cumulative, [scalar_to_tile(C - 1i32)]);
+            let q = q * exp(cumulative)
+                .reshape(shape![C, 1])
+                .broadcast(shape![C, DK]);
+            let k = k * exp(last.broadcast(shape![C]) - cumulative)
+                .reshape(shape![C, 1])
+                .broadcast(shape![C, DK]);
+            let w_tile: Tile<f32, { [C, DK] }> = w
+                .partition(shape![1, C, DK])
+                .load([flat, 0, 0])
+                .reshape(shape![C, DK]);
+            let u_tile: Tile<f32, { [C, VT] }> = u
+                .partition(shape![1, C, VT])
+                .load([flat, 0, column])
+                .reshape(shape![C, VT]);
+            let a: Tile<f32, { [C, C] }> = intra
+                .partition(shape![1, C, C])
+                .load([flat, 0, 0])
+                .reshape(shape![C, C]);
+
+            let s_hi: Tile<bf16, { [DK, VT] }> = convert_tile(s);
+            let s_lo: Tile<bf16, { [DK, VT] }> = convert_tile(s - convert_tile(s_hi));
+            let w_hi: Tile<bf16, { [C, DK] }> = convert_tile(w_tile);
+            let w_lo: Tile<bf16, { [C, DK] }> = convert_tile(w_tile - convert_tile(w_hi));
+            let mut prediction = mma(w_hi, s_hi, zero_cv);
+            prediction = mma(w_hi, s_lo, prediction);
+            prediction = mma(w_lo, s_hi, prediction);
+            let delta = u_tile - prediction;
+
+            let d_hi: Tile<bf16, { [C, VT] }> = convert_tile(delta);
+            let d_lo: Tile<bf16, { [C, VT] }> = convert_tile(delta - convert_tile(d_hi));
+            let q_hi: Tile<bf16, { [C, DK] }> = convert_tile(q);
+            let q_lo: Tile<bf16, { [C, DK] }> = convert_tile(q - convert_tile(q_hi));
+            let mut inter = mma(q_hi, s_hi, zero_cv);
+            inter = mma(q_hi, s_lo, inter);
+            inter = mma(q_lo, s_hi, inter);
+            let a_hi: Tile<bf16, { [C, C] }> = convert_tile(a);
+            let a_lo: Tile<bf16, { [C, C] }> = convert_tile(a - convert_tile(a_hi));
+            let mut within = mma(a_hi, d_hi, zero_cv);
+            within = mma(a_hi, d_lo, within);
+            within = mma(a_lo, d_hi, within);
+            out.partition_mut(shape![C, 1, VT])
+                .store((inter + within).reshape(shape![C, 1, VT]), [chunk, 0, 0]);
+
+            let kt: Tile<f32, { [DK, C] }> = k.transpose();
+            let kt_hi: Tile<bf16, { [DK, C] }> = convert_tile(kt);
+            let kt_lo: Tile<bf16, { [DK, C] }> = convert_tile(kt - convert_tile(kt_hi));
+            let mut update = mma(kt_hi, d_hi, zero_kv);
+            update = mma(kt_hi, d_lo, update);
+            update = mma(kt_lo, d_hi, update);
+            s = s * exp(last).reshape(shape![1, 1]).broadcast(shape![DK, VT]) + update;
+        }
+        state.store(s.reshape(shape![1, DK, VT]));
+    }
 }
 
-pub use kernels::{apply_inverse, first_phase_matrices, invert_diagonal, merge_inverse};
+pub use kernels::{
+    apply_inverse, first_phase_matrices, invert_diagonal, merge_inverse, second_phase,
+};
+
+pub fn second_phase_value_tile(value_dim: usize, heads: usize, sm_count: usize) -> usize {
+    assert!(value_dim.is_power_of_two() && heads > 0 && sm_count > 0);
+    crate::tile::row_tile(value_dim, heads, sm_count, 1, 16.min(value_dim))
+}

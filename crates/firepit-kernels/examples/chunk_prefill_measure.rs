@@ -5,7 +5,8 @@ use cutile::bench::{BenchOptions, do_bench};
 use cutile::tensor::{PartitionMut, Tensor};
 use cutile::tile_kernel::TileKernel;
 use firepit_kernels::gdn_chunk::{
-    apply_inverse, first_phase_matrices, invert_diagonal, merge_inverse,
+    apply_inverse, first_phase_matrices, invert_diagonal, merge_inverse, second_phase,
+    second_phase_value_tile,
 };
 use std::error::Error;
 use std::sync::Arc;
@@ -32,12 +33,19 @@ struct Buffers {
     next_inverse: Tensor<f32>,
     u: Tensor<f32>,
     w: Tensor<f32>,
+    core: Tensor<f32>,
+    state: Tensor<f32>,
+    value_tile: usize,
 }
 
 impl Buffers {
     fn new(stream: &Arc<Stream>, time: usize) -> Result<Self, Box<dyn Error>> {
         let chunks = time.div_ceil(CHUNK);
         let flat = chunks * VALUE_HEADS;
+        let device = Device::new(0)?;
+        let sm_count =
+            cuda_core::simt::CudaContext::new(device.ordinal())?.multiprocessor_count()?;
+        let value_tile = second_phase_value_tile(DV, VALUE_HEADS, sm_count as usize);
         let upload = |data: Vec<f32>, shape: &[usize]| {
             api::copy_host_vec_to_device(&Arc::new(data))
                 .reshape(shape)
@@ -86,6 +94,9 @@ impl Buffers {
             next_inverse: api::zeros::<f32>(&[flat, CHUNK, CHUNK]).sync_on(stream)?,
             u: api::zeros::<f32>(&[flat, CHUNK, DV]).sync_on(stream)?,
             w: api::zeros::<f32>(&[flat, CHUNK, DK]).sync_on(stream)?,
+            core: api::zeros::<f32>(&[chunks * CHUNK, VALUE_HEADS, DV]).sync_on(stream)?,
+            state: api::zeros::<f32>(&[1, VALUE_HEADS * DK, DV]).sync_on(stream)?,
+            value_tile,
         })
     }
 
@@ -166,7 +177,39 @@ impl Buffers {
         self.first(stream)?;
         self.diagonal(stream)?;
         self.merge(stream)?;
-        self.apply(stream)
+        self.apply(stream)?;
+        self.second(stream)
+    }
+
+    fn second(&mut self, stream: &Arc<Stream>) -> Result<(), cutile::error::Error> {
+        second_phase(
+            (&mut self.core).partition([
+                (self.chunks * CHUNK).next_power_of_two(),
+                1,
+                self.value_tile,
+            ]),
+            (&mut self.state).partition([1, DK, self.value_tile]),
+            &self.u,
+            &self.w,
+            &self.intra,
+            &self.cum,
+            &self.q,
+            &self.k,
+            self.chunks as i32,
+            1e-6,
+            1.0 / (DK as f32).sqrt(),
+        )
+        .generics(vec![
+            (self.chunks * CHUNK).next_power_of_two().to_string(),
+            CHUNK.to_string(),
+            DK.to_string(),
+            self.value_tile.to_string(),
+            KEY_HEADS.to_string(),
+            VALUE_HEADS.to_string(),
+        ])
+        .sync_on(stream)
+        .map(|_| ())
+        .map_err(Into::into)
     }
 }
 
@@ -184,19 +227,23 @@ fn measure(stream: &Arc<Stream>, time: usize) -> Result<(), Box<dyn Error>> {
     let diagonal = do_bench(stream, &options, |stream| buffers.diagonal(stream))?;
     let merge = do_bench(stream, &options, |stream| buffers.merge(stream))?;
     let apply = do_bench(stream, &options, |stream| buffers.apply(stream))?;
+    let second = do_bench(stream, &options, |stream| buffers.second(stream))?;
     let total = do_bench(stream, &options, |stream| buffers.all(stream))?;
     println!(
-        "T={time} chunks={} Hv={VALUE_HEADS} Hk={KEY_HEADS} dk={DK} dv={DV} chunk={CHUNK} block={BLOCK} first_ms={:.6} diagonal_ms={:.6} merge_ms={:.6} apply_ms={:.6} total_ms={:.6} reps={}/{}/{}/{}/{}",
+        "T={time} chunks={} Hv={VALUE_HEADS} Hk={KEY_HEADS} dk={DK} dv={DV} chunk={CHUNK} block={BLOCK} value_tile={} first_ms={:.6} diagonal_ms={:.6} merge_ms={:.6} apply_ms={:.6} second_ms={:.6} total_ms={:.6} reps={}/{}/{}/{}/{}/{}",
         buffers.chunks,
+        buffers.value_tile,
         first.median_ms(),
         diagonal.median_ms(),
         merge.median_ms(),
         apply.median_ms(),
+        second.median_ms(),
         total.median_ms(),
         first.reps(),
         diagonal.reps(),
         merge.reps(),
         apply.reps(),
+        second.reps(),
         total.reps(),
     );
     Ok(())

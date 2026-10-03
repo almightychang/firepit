@@ -1,6 +1,6 @@
 # 로드맵
 
-갱신: 2026-10-02. ✔ 완료, ◐ 진행 중, ○ 미착수.
+갱신: 2026-10-03. ✔ 완료, ◐ 진행 중, ○ 미착수.
 
 firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이해하며 구현하는 공부 과정이기도 하다. 그래서 E2부터는 개념 하나를 한 덩이로 자른다.
 
@@ -88,13 +88,14 @@ E2와 같은 순서(개념 → 구현 → 정답 비교)에 성능 기준을 더
 | 3.2 causal attention | flash attention, 미래 가리기, KV cache 채우기 | attention layer 일치 | 실측 최대 대비 % | ✔ |
 | 3.3 GDN conv | 시퀀스 causal conv, 마지막 state | conv 출력과 state 일치 | 대역폭 대비 % | ✔ (GB10 5000토큰 layer당 2.35 ms, 대역폭의 약 70%) |
 | 3.4 GDN chunk ① | chunk 안 계산, FLA 블록 삼각 역행렬 | f64 oracle·HF 입력·decode 합성 | 성분별 반올림 상한, GB10 5000토큰 layer당 6.1 ms | ✔ |
-| 3.5 GDN chunk ② | chunk 사이 state 전달 | GDN layer 일치 | 실측 최대 대비 % | ○ |
+| 3.5 GDN chunk ② | chunk 사이 state 전달 | f64 oracle·decode 동치·HF 150토큰 GDN layer | RTX 5080 5000토큰 second phase 3.96 ms, 전체 chunk 5.74 ms | ✔ |
 | 3.6 MoE prefill | expert별로 토큰 모으기 | MoE 블록 일치 | 실측 최대 대비 % | ○ |
 | 3.7 조립 | 엔진 prefill 경로 | prefill(T) = decode T번 (logits, state) | 5000토큰 prompt 215초 → 5초 이내 (계산 하한 약 0.4초, [기준선](research/measurements/gemm-peak-gb10.md)) | ○ |
 
 E7 성능 단계에서 GEMM의 M·N·K와 GPU 특성에 따라 타일 크기를 자동 선택한다. E3.1은 호출자가 타일을 지정하며 기본값은 64×128×32이다.
 E3.2 attention의 현재 기본 BM×BN은 16×32이다. RTX 5080의 head_dim 256 release cubin에서 255 registers/thread, 1008-byte stack/thread와 `STL` spill을 확인했다. 타일 자동 선택과 spill 저감은 E7에서 다룬다.
 E3.3 conv prefill은 채널 타일별 block이 시간축을 순차 처리한다. f64 oracle, decode 반복, HF 150토큰 비교에서 출력과 마지막 state가 일치했다. 같은 GPU에서 다른 실험을 병행해 성능은 측정하지 않았다.
+E3.5는 value head와 state 열 타일별 block이 chunk를 순서대로 처리한다. 현재 열 타일은 `row_tile`을 이용해 SM 수와 head 수에서 선택한다. RTX 5080 모델 형상에서 32열이며 release cubin은 255 registers/thread, 2368-byte stack/thread와 `STL` spill이 있다. 타일·spill 개선은 E7에서 한다.
 
 ## 정답지 만들기 (2.0)
 
