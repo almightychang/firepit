@@ -276,6 +276,7 @@ def cache_records(cache) -> dict[str, torch.Tensor]:
 def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     records = {}
     hooks = []
+    attention = {}
     projections = (
         (0, "linear_attn", "in_proj_qkv"),
         (0, "linear_attn", "in_proj_z"),
@@ -290,10 +291,45 @@ def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tenso
             records[f"{key}/input"] = args[0][0].clone()
             records[f"{key}/output"] = output[0].clone()
         hooks.append(module.register_forward_hook(record))
+    if len(model.model.layers) > 3:
+        attn = model.model.layers[3].self_attn
+        def normalized(name):
+            def record(_module, _args, output):
+                attention[name] = output.clone()
+            return record
+        def rotary(_module, _args, output):
+            attention["cos"], attention["sin"] = (x.clone() for x in output)
+        def value(_module, _args, output):
+            heads = model.config.num_key_value_heads
+            records["layer3/attn/v"] = output[0].reshape(len(tokens), heads, -1).clone()
+        def gate(_module, _args, output):
+            heads = model.config.num_attention_heads
+            _, g = output[0].reshape(len(tokens), heads, -1).chunk(2, dim=-1)
+            records["layer3/attn/gate"] = g.reshape(len(tokens), -1).clone()
+        def output_input(_module, args):
+            records["layer3/attn/o_proj_in"] = args[0][0].clone()
+        def attn_output(_module, _args, output):
+            records["layer3/attn/delta"] = output[0][0].clone()
+        hooks += [
+            attn.q_norm.register_forward_hook(normalized("q")),
+            attn.k_norm.register_forward_hook(normalized("k")),
+            model.model.rotary_emb.register_forward_hook(rotary),
+            attn.v_proj.register_forward_hook(value),
+            attn.q_proj.register_forward_hook(gate),
+            attn.o_proj.register_forward_pre_hook(output_input),
+            attn.register_forward_hook(attn_output),
+        ]
     with torch.no_grad():
         out = model.model(
             input_ids=torch.tensor([tokens]), use_cache=True, output_hidden_states=True
         )
+        if attention:
+            q, k = apply_rotary_pos_emb(
+                attention["q"].transpose(1, 2), attention["k"].transpose(1, 2),
+                attention["cos"], attention["sin"],
+            )
+            records["layer3/attn/q"] = q[0].transpose(0, 1).contiguous()
+            records["layer3/attn/k"] = k[0].transpose(0, 1).contiguous()
         for layer, residual in enumerate(out.hidden_states):
             records[f"residual{layer}"] = residual[0].clone()
         records["logits"] = model.lm_head(norm(out.hidden_states[-1][:, -1:]))[0, 0].clone()

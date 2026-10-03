@@ -6,7 +6,10 @@ use cuda_core::Stream;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::TileKernel;
-use firepit_kernels::attention::{AttentionDims, cache_append, online_attention, output_gate};
+use firepit_kernels::attention::{
+    AttentionDims, DEFAULT_PREFILL_TILE, cache_append, cache_append_prefill,
+    causal_attention_prefill, online_attention, output_gate,
+};
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -40,6 +43,148 @@ fn gpu_attention(
         .generics(dims.attention_generics())
         .sync_on(stream)?;
     Ok(out.to_host_vec().sync_on(stream)?)
+}
+
+fn gpu_prefill(
+    stream: &Arc<Stream>,
+    dims: &AttentionDims,
+    q: &[f32],
+    prefix_k: &[f32],
+    prefix_v: &[f32],
+    new_k: &[f32],
+    new_v: &[f32],
+) -> Result<(Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
+    let (d, h, kv) = (dims.head_dim(), dims.q_heads(), dims.kv_heads());
+    let t = q.len() / (h * d);
+    let p0 = prefix_k.len() / (kv * d);
+    let query = api::copy_host_vec_to_device(&Arc::new(q.to_vec()))
+        .reshape(&[t, h, d])
+        .sync_on(stream)?;
+    let key = api::copy_host_vec_to_device(&Arc::new(new_k.to_vec()))
+        .reshape(&[t, kv, d])
+        .sync_on(stream)?;
+    let value = api::copy_host_vec_to_device(&Arc::new(new_v.to_vec()))
+        .reshape(&[t, kv, d])
+        .sync_on(stream)?;
+    let mut kc_host = prefix_k.to_vec();
+    let mut vc_host = prefix_v.to_vec();
+    kc_host.resize(dims.max_seq() * kv * d, 0.0);
+    vc_host.resize(dims.max_seq() * kv * d, 0.0);
+    let mut kc = api::copy_host_vec_to_device(&Arc::new(kc_host))
+        .reshape(&[dims.max_seq(), kv, d])
+        .sync_on(stream)?;
+    let mut vc = api::copy_host_vec_to_device(&Arc::new(vc_host))
+        .reshape(&[dims.max_seq(), kv, d])
+        .sync_on(stream)?;
+    cache_append_prefill(
+        cutile::tensor::IntoPartition::partition(
+            kc.slice_mut(&[p0..p0 + t, 0..kv, 0..d])?,
+            [1, 1, d],
+        ),
+        cutile::tensor::IntoPartition::partition(
+            vc.slice_mut(&[p0..p0 + t, 0..kv, 0..d])?,
+            [1, 1, d],
+        ),
+        &key,
+        &value,
+    )
+    .generics(dims.prefill_cache_generics())
+    .sync_on(stream)?;
+    let mut out = api::zeros::<f32>(&[t, h, d]).sync_on(stream)?;
+    causal_attention_prefill(
+        (&mut out).partition([DEFAULT_PREFILL_TILE.m, 1, d]),
+        &query,
+        &kc,
+        &vc,
+        p0 as i32,
+        dims.scale(),
+    )
+    .generics(dims.prefill_generics(DEFAULT_PREFILL_TILE))
+    .sync_on(stream)?;
+    let mut decode_rows = Vec::with_capacity(t * h * d);
+    for row in 0..t {
+        let q_row =
+            api::copy_host_vec_to_device(&Arc::new(q[row * h * d..(row + 1) * h * d].to_vec()))
+                .reshape(&[h, d])
+                .sync_on(stream)?;
+        let position =
+            api::copy_host_vec_to_device(&Arc::new(vec![(p0 + row) as i32])).sync_on(stream)?;
+        let mut decode = api::zeros::<f32>(&[h, d]).sync_on(stream)?;
+        online_attention(
+            (&mut decode).partition([1, d]),
+            &q_row,
+            &kc,
+            &vc,
+            &position,
+            dims.scale(),
+        )
+        .generics(dims.attention_generics())
+        .sync_on(stream)?;
+        decode_rows.extend(decode.to_host_vec().sync_on(stream)?);
+    }
+    Ok((
+        out.to_host_vec().sync_on(stream)?,
+        kc.to_host_vec().sync_on(stream)?,
+        vc.to_host_vec().sync_on(stream)?,
+        decode_rows,
+    ))
+}
+
+fn prefill_allowance(
+    dims: &AttentionDims,
+    q: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    len: usize,
+) -> Vec<f64> {
+    let mut bound = allowance(dims, q, keys, values, len, dims.scale());
+    let d = dims.head_dim();
+    let kv = dims.kv_heads();
+    let group = dims.q_heads() / kv;
+    let split = (1.0 / 256.0f64).powi(2);
+    for h in 0..dims.q_heads() {
+        let kh = h / group;
+        let scores: Vec<f64> = (0..len)
+            .map(|t| {
+                (0..d)
+                    .map(|i| q[h * d + i] as f64 * keys[(t * kv + kh) * d + i] as f64)
+                    .sum::<f64>()
+                    * dims.scale() as f64
+            })
+            .collect();
+        let score_split = (0..len)
+            .map(|t| {
+                (0..d)
+                    .map(|i| (q[h * d + i] as f64 * keys[(t * kv + kh) * d + i] as f64).abs())
+                    .sum::<f64>()
+                    * dims.scale() as f64
+                    * (split + 3.0 * check::gamma_tilde(d))
+            })
+            .fold(0.0f64, f64::max);
+        let score_round = (0..len)
+            .map(|t| {
+                (0..d)
+                    .map(|i| (q[h * d + i] as f64 * keys[(t * kv + kh) * d + i] as f64).abs())
+                    .sum::<f64>()
+                    * dims.scale() as f64
+                    * check::gamma_tilde(d)
+                    + 4.0 * f32::EPSILON as f64 / 2.0
+            })
+            .fold(0.0f64, f64::max);
+        let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let weights: Vec<f64> = scores.iter().map(|s| (s - max).exp()).collect();
+        let denom: f64 = weights.iter().sum();
+        let extra = (2.0 * (score_round + score_split)).exp_m1() - (2.0 * score_round).exp_m1()
+            + split
+            + 3.0 * check::gamma_tilde(len);
+        for t in 0..len {
+            for i in 0..d {
+                bound[h * d + i] +=
+                    extra * weights[t] / denom * (values[(t * kv + kh) * d + i] as f64).abs();
+            }
+        }
+    }
+    bound
 }
 
 fn oracle(
@@ -264,8 +409,8 @@ fn cache_append_writes_position_and_heads() -> Result<(), Box<dyn std::error::Er
             .sync_on(&stream)?;
         let pos = api::copy_host_vec_to_device(&Arc::new(vec![t as i32])).sync_on(&stream)?;
         cache_append(
-            k.partition([dims.max_seq(), 1, dims.head_dim()]),
-            v.partition([dims.max_seq(), 1, dims.head_dim()]),
+            (&mut k).partition([dims.max_seq(), 1, dims.head_dim()]),
+            (&mut v).partition([dims.max_seq(), 1, dims.head_dim()]),
             &key,
             &value,
             &pos,
@@ -283,5 +428,164 @@ fn cache_append_writes_position_and_heads() -> Result<(), Box<dyn std::error::Er
             assert_eq!(x, if t < 3 { -((t + 1) as f32) } else { 0.0 });
         }
     }
+    Ok(())
+}
+
+#[test]
+fn prefill_matches_small_oracle() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let dims = AttentionDims::new(16, 4, 2, 32)?;
+    let t = 4;
+    let q: Vec<f32> = (0..t * dims.q_heads() * dims.head_dim())
+        .map(|i| (i as f32 % 37.0 - 18.0) / 20.0)
+        .collect();
+    let k: Vec<f32> = (0..t * dims.kv_heads() * dims.head_dim())
+        .map(|i| (i as f32 % 29.0 - 14.0) / 15.0)
+        .collect();
+    let v: Vec<f32> = (0..t * dims.kv_heads() * dims.head_dim())
+        .map(|i| (i as f32 % 41.0 - 20.0) / 21.0)
+        .collect();
+    let q_device = api::copy_host_vec_to_device(&Arc::new(q.clone()))
+        .reshape(&[t, dims.q_heads(), dims.head_dim()])
+        .sync_on(&stream)?;
+    let k_device = api::copy_host_vec_to_device(&Arc::new(k.clone()))
+        .reshape(&[t, dims.kv_heads(), dims.head_dim()])
+        .sync_on(&stream)?;
+    let v_device = api::copy_host_vec_to_device(&Arc::new(v.clone()))
+        .reshape(&[t, dims.kv_heads(), dims.head_dim()])
+        .sync_on(&stream)?;
+    let mut kc =
+        api::zeros::<f32>(&[dims.max_seq(), dims.kv_heads(), dims.head_dim()]).sync_on(&stream)?;
+    let mut vc =
+        api::zeros::<f32>(&[dims.max_seq(), dims.kv_heads(), dims.head_dim()]).sync_on(&stream)?;
+    cache_append_prefill(
+        cutile::tensor::IntoPartition::partition(
+            kc.slice_mut(&[0..t, 0..dims.kv_heads(), 0..dims.head_dim()])?,
+            [1, 1, dims.head_dim()],
+        ),
+        cutile::tensor::IntoPartition::partition(
+            vc.slice_mut(&[0..t, 0..dims.kv_heads(), 0..dims.head_dim()])?,
+            [1, 1, dims.head_dim()],
+        ),
+        &k_device,
+        &v_device,
+    )
+    .generics(dims.prefill_cache_generics())
+    .sync_on(&stream)?;
+    let mut out = api::zeros::<f32>(&[t, dims.q_heads(), dims.head_dim()]).sync_on(&stream)?;
+    causal_attention_prefill(
+        (&mut out).partition([DEFAULT_PREFILL_TILE.m, 1, dims.head_dim()]),
+        &q_device,
+        &kc,
+        &vc,
+        0,
+        dims.scale(),
+    )
+    .generics(dims.prefill_generics(DEFAULT_PREFILL_TILE))
+    .sync_on(&stream)?;
+    let actual = out.to_host_vec().sync_on(&stream)?;
+    for row in 0..t {
+        let expected = oracle(
+            &dims,
+            &q[row * 128..(row + 1) * 128],
+            &k,
+            &v,
+            row + 1,
+            dims.scale(),
+        );
+        let allowed = allowance(
+            &dims,
+            &q[row * 128..(row + 1) * 128],
+            &k,
+            &v,
+            row + 1,
+            dims.scale(),
+        );
+        for i in 0..128 {
+            let error = (actual[row * 128 + i] as f64 - expected[i]).abs();
+            assert!(error <= allowed[i] + 0.002, "row={row} i={i} error={error}");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn prefill_oracle_and_decode_metamorphic() {
+    let stream = common::stream();
+    common::runner(32, file!())
+        .run(
+            &(
+                prop::sample::select(vec![(1usize, 1usize), (2, 1), (4, 2), (4, 4)]),
+                prop::sample::select(vec![32usize, 64, 256]),
+                prop::sample::select(vec![(0usize, 1usize), (0, 7), (3, 5), (17, 2), (32, 17)]),
+            )
+                .prop_flat_map(|((h, kv), d, (p0, t))| {
+                    (
+                        Just((h, kv, d, p0, t)),
+                        strategy::values(t * h * d),
+                        strategy::values((p0 + t) * kv * d),
+                        strategy::values((p0 + t) * kv * d),
+                    )
+                }),
+            |((h, kv, d, p0, t), q, keys, values)| {
+                let dims = AttentionDims::new((p0 + t).next_power_of_two(), h, kv, d).unwrap();
+                let split = p0 * kv * d;
+                let (actual, cache_k, cache_v, decode) = gpu_prefill(
+                    &stream,
+                    &dims,
+                    &q,
+                    &keys[..split],
+                    &values[..split],
+                    &keys[split..],
+                    &values[split..],
+                )
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                prop_assert_eq!(&cache_k[..keys.len()], &keys);
+                prop_assert_eq!(&cache_v[..values.len()], &values);
+                for row in 0..t {
+                    let q_row = &q[row * h * d..(row + 1) * h * d];
+                    let len = p0 + row + 1;
+                    let expected = oracle(&dims, q_row, &keys, &values, len, dims.scale());
+                    let allowed = prefill_allowance(&dims, q_row, &keys, &values, len);
+                    let decode_allowed = allowance(&dims, q_row, &keys, &values, len, dims.scale());
+                    for i in 0..h * d {
+                        let a = actual[row * h * d + i] as f64;
+                        let e = expected[i];
+                        let b = allowed[i];
+                        prop_assert!(
+                            (a - e).abs() <= b,
+                            "oracle row={row} i={i} error={} bound={b}",
+                            (a - e).abs()
+                        );
+                        prop_assert!(
+                            (a - decode[row * h * d + i] as f64).abs() <= b + decode_allowed[i],
+                            "decode row={row} i={i} error={} bound={}",
+                            (a - decode[row * h * d + i] as f64).abs(),
+                            b + decode_allowed[i]
+                        );
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn prefill_mask_and_gqa_contrasts() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let dims = AttentionDims::new(4, 4, 2, 32)?;
+    let q = vec![0.0f32; 4 * 4 * 32];
+    let k = vec![0.0f32; 4 * 2 * 32];
+    let v: Vec<f32> = (0..4)
+        .flat_map(|t| (0..2).flat_map(move |h| std::iter::repeat_n((10 * h + t) as f32, 32)))
+        .collect();
+    let (actual, _, _, _) = gpu_prefill(&stream, &dims, &q, &[], &[], &k, &v)?;
+    let no_mask = (0..4).map(|t| v[t * 64]).sum::<f32>() / 4.0;
+    let modulo_gqa = v[32];
+    assert!((actual[0] - no_mask).abs() > 1.0);
+    assert!((actual[32] - modulo_gqa).abs() > 1.0);
+    assert!((actual[0] - v[0]).abs() < 1e-4);
+    assert!((actual[32] - v[0]).abs() < 1e-4);
     Ok(())
 }

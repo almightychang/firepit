@@ -4,7 +4,10 @@ use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, Tensor, ToHostVec};
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit::{Checkpoint, SafetensorsFile};
-use firepit_kernels::attention::{AttentionDims, cache_append, online_attention, output_gate};
+use firepit_kernels::attention::{
+    AttentionDims, DEFAULT_PREFILL_TILE, cache_append, cache_append_prefill,
+    causal_attention_prefill, online_attention, output_gate,
+};
 use firepit_kernels::gdn::{GdnDims, conv1d_silu, delta_step, gated_silu};
 use firepit_kernels::gemm::{DEFAULT_GEMM_TILE, gemm};
 use firepit_kernels::gemv::expert_gemv;
@@ -1100,6 +1103,130 @@ fn attention_decode_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
     );
     assert!(worst_input < 1e-5 && worst_delta < 1e-5);
     assert!(wrong_scale > 1e-5 && wrong_gqa > 1e-5);
+    Ok(())
+}
+
+#[test]
+#[ignore = "needs Qwen3.6 weights and regenerated 150-token prefill reference"]
+fn attention_prefill_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
+    let model_dir = home("Models/qwen3.6-35b-a3b");
+    let config: serde_json::Value =
+        serde_json::from_reader(std::fs::File::open(model_dir.join("config.json"))?)?;
+    let text = &config["text_config"];
+    let parse = |key: &str| -> Result<usize, Box<dyn std::error::Error>> {
+        Ok(text[key].as_u64().ok_or(format!("missing {key}"))? as usize)
+    };
+    let refs = SafetensorsFile::open(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../refs/qwen36-prefix4-prefill.safetensors"),
+    )?;
+    let q = refs.tensor("layer3/attn/q")?;
+    let k = refs.tensor("layer3/attn/k")?;
+    let v = refs.tensor("layer3/attn/v")?;
+    let gate = refs.tensor("layer3/attn/gate")?;
+    let expected = refs.tensor("layer3/attn/o_proj_in")?;
+    let expected_delta = refs.tensor("layer3/attn/delta")?;
+    let t = q.shape[0];
+    let dims = AttentionDims::new(
+        t,
+        parse("num_attention_heads")?,
+        parse("num_key_value_heads")?,
+        parse("head_dim")?,
+    )?;
+    assert_eq!(q.shape, [t, dims.q_heads(), dims.head_dim()]);
+    assert_eq!(k.shape, [t, dims.kv_heads(), dims.head_dim()]);
+    assert_eq!(v.shape, k.shape);
+    assert_eq!(gate.shape, [t, dims.q_heads() * dims.head_dim()]);
+    assert_eq!(expected.shape, gate.shape);
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let q_device = api::copy_host_vec_to_device(&Arc::new(q.data.clone()))
+        .reshape(&q.shape)
+        .sync_on(&stream)?;
+    let k_device = api::copy_host_vec_to_device(&Arc::new(k.data.clone()))
+        .reshape(&k.shape)
+        .sync_on(&stream)?;
+    let v_device = api::copy_host_vec_to_device(&Arc::new(v.data.clone()))
+        .reshape(&v.shape)
+        .sync_on(&stream)?;
+    let g_device = api::copy_host_vec_to_device(&Arc::new(gate.data.clone()))
+        .reshape(&[t * dims.q_heads(), dims.head_dim()])
+        .sync_on(&stream)?;
+    let mut kc = api::zeros::<f32>(&k.shape).sync_on(&stream)?;
+    let mut vc = api::zeros::<f32>(&v.shape).sync_on(&stream)?;
+    cache_append_prefill(
+        cutile::tensor::IntoPartition::partition(
+            kc.slice_mut(&[0..t, 0..dims.kv_heads(), 0..dims.head_dim()])?,
+            [1, 1, dims.head_dim()],
+        ),
+        cutile::tensor::IntoPartition::partition(
+            vc.slice_mut(&[0..t, 0..dims.kv_heads(), 0..dims.head_dim()])?,
+            [1, 1, dims.head_dim()],
+        ),
+        &k_device,
+        &v_device,
+    )
+    .generics(dims.prefill_cache_generics())
+    .sync_on(&stream)?;
+    let mut attention = api::zeros::<f32>(&q.shape).sync_on(&stream)?;
+    causal_attention_prefill(
+        (&mut attention).partition([DEFAULT_PREFILL_TILE.m, 1, dims.head_dim()]),
+        &q_device,
+        &kc,
+        &vc,
+        0,
+        dims.scale(),
+    )
+    .generics(dims.prefill_generics(DEFAULT_PREFILL_TILE))
+    .sync_on(&stream)?;
+    let mut gated = api::zeros::<f32>(&[t * dims.q_heads(), dims.head_dim()]).sync_on(&stream)?;
+    output_gate(
+        (&mut gated).partition([1, dims.head_dim()]),
+        &attention.view(&[t * dims.q_heads(), dims.head_dim()])?,
+        &g_device,
+    )
+    .generics(dims.gate_generics())
+    .sync_on(&stream)?;
+    let actual: Vec<f32> = gated.to_host_vec().sync_on(&stream)?;
+    let relative = relative_max(
+        &actual,
+        &expected.data.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+    );
+    println!("attention prefill HF T={t} o_proj_in max_relative={relative:.8e}");
+    assert!(relative < 1e-5);
+    let weights = Checkpoint::open(model_dir)?;
+    let projection =
+        weights.tensor_bf16("model.language_model.layers.3.self_attn.o_proj.weight")?;
+    let hidden = parse("hidden_size")?;
+    assert_eq!(projection.shape, [hidden, dims.q_heads() * dims.head_dim()]);
+    assert_eq!(expected_delta.shape, [t, hidden]);
+    let tile = DEFAULT_GEMM_TILE;
+    let padded = t.div_ceil(tile.m) * tile.m;
+    let mut input = actual;
+    input.resize(padded * dims.q_heads() * dims.head_dim(), 0.0);
+    let input = api::copy_host_vec_to_device(&Arc::new(input))
+        .reshape(&[padded, dims.q_heads() * dims.head_dim()])
+        .sync_on(&stream)?;
+    let matrix = projection.upload_matrix(&stream)?;
+    let mut delta = api::zeros::<f32>(&[padded, hidden]).sync_on(&stream)?;
+    gemm(
+        &matrix,
+        &input.view(&[padded, dims.q_heads() * dims.head_dim()])?,
+        (&mut delta).partition([tile.m, tile.n]),
+        tile,
+    )
+    .submit(&mut Eager(&stream))?;
+    let output: Vec<f32> = delta.to_host_vec().sync_on(&stream)?;
+    let delta_relative = relative_max(
+        &output[..t * hidden],
+        &expected_delta
+            .data
+            .iter()
+            .map(|&x| x as f64)
+            .collect::<Vec<_>>(),
+    );
+    println!("attention prefill HF o_proj delta max_relative={delta_relative:.8e}");
+    assert!(delta_relative < 2e-5);
     Ok(())
 }
 
