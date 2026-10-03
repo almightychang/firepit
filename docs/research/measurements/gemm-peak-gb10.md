@@ -61,3 +61,18 @@ f32 X를 커널 안에서 bf16 hi/lo로 나눠 mma 두 번. 단위 TFLOPS.
 - M이 커질수록 떨어지는 것은 같은 W 타일을 여러 block이 다른 시점에 읽어 L2 재사용이 줄기 때문으로 추정한다 (block 순서를 바꿔 확인하지 않았다).
 - 개선 방향: 더 큰 타일(산술 강도 증가), block 순서 재배치(swizzle)로 L2 재사용, 또는 정밀도 a(X를 bf16 하나로, X 바이트 절반). E4/E7 항목.
 - 5000토큰 prefill의 GEMM 부분은 약 30 TFLOP ÷ 약 15 TFLOPS ≈ 2초로 추정된다. 3.7 목표(5초 이내)에는 들어온다.
+
+## causal attention prefill (E3.2, `22f9c89`, bf16×3, BM×BN 16×32, release)
+
+H=16, Hkv=2, D=256, p0=0. TFLOPS는 유효 연산량 2·H·D·T² 기준.
+
+| T | GB10 ms | GB10 TFLOPS | 5080 ms | 5080 TFLOPS |
+|---:|---:|---:|---:|---:|
+| 512 | 0.72 | 3.0 | 0.34 | 6.3 |
+| 1024 | 2.93 | 2.9 | 1.14 | 7.5 |
+| 2048 | 11.02 | 3.1 | 4.14 | 8.3 |
+| 4096 | 43.02 | 3.2 | 15.82 | 8.7 |
+
+- head_dim 256에서 레지스터 255개와 stack 1008 B, spill(STL)이 확인됐다. 타일과 spill 개선은 E7.
+- 5000토큰이면 layer당 약 64 ms × attention layer 10개 ≈ 0.6초 (T² 외삽 추정). 3.7 목표(5초)에 들어온다.
+- cuTile에서 f32 `mma`는 TF32 tensor core가 아니라 SIMT FMUL/FADD로 lowering된다 (vendor 예제와 같은 연산을 sm_120a에서 확인). f32 행렬 곱에 tensor core를 쓰려면 bf16 분할 같은 방법이 필요하다.
