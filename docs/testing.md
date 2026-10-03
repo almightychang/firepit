@@ -25,6 +25,8 @@ N. J. Higham and T. Mary, "A New Approach to Probabilistic Rounding Error Analys
 
 Q8 GEMV는 블록 합 뒤 scale 곱이 한 번 더 들어가므로 n = K + 2로 판정한다. RMSNorm과 SwiGLU는 상쇄가 없는 원소별 연산이라 상대오차로 판정한다.
 
+bf16 hi+lo GEMM은 잔차가 bf16 정상 범위인 유한 입력에서 `hi = RN_bf16(x)`, `lo = RN_bf16(x−hi)`를 사용한다. `|x−hi| ≤ u_b|x|`이고 Sterbenz 보조정리로 `x−hi`가 정확하므로 `|x−(hi+lo)| ≤ u_b²|x|` (`u_b=2⁻⁸`). 따라서 f64 oracle 판정은 `(γ̃_K(8)+u_b²)Σ|w_k x_k|`이다. GEMM 행과 GEMV의 차이는 두 경로의 상한 합으로 판정한다.
+
 ## 층
 
 GEMV는 oracle 비교와 선형성·배치 독립·가중치 행 치환을 검사한다. RMSNorm은 oracle 비교와 배치 독립·scale 성질을 검사한다. SwiGLU는 f64 oracle PBT와 SiLU 구간·극단값·NaN sweep로 확인한다. RoPE는 위치 0~262143의 f64 oracle PBT, 크기·상대 위치 보존, 위치 0 항등을 검사한다. Attention은 길이 1~256의 f64 oracle PBT, 순서·상수 값·점수 평행이동 불변, gate 극단값과 HF 5 step을 검사한다. MoE는 top-k·expert GEMV·결합의 f64 oracle PBT, expert 번호 치환·하위 점수 변경·가중치 합 성질, HF 4개 지점 × 5 step × 4 layer를 검사한다. GDN conv는 채널 수와 커널 길이를 바꾸는 f64 oracle PBT, 토큰별 처리와 전체 causal conv 비교, 마지막 입력 state 확인, HF layer 0~2 × 5 step 비교, tap 순서 반전과 state 미갱신 대조를 검사한다. GDN delta rule은 다중 step f64 oracle PBT, β=0 감쇠, 직교 key 저장·회수, value 열 타일 불변, gate 극단 sweep, HF core·state·norm·Δx 비교, l2norm·head 매핑·norm weight 규약 대조를 검사한다. 모델 규약은 ignored HF reference 테스트로, 테스트 민감도는 gate/up 순서 교환, RoPE의 인접 짝짓기·전체 차원 회전, attention의 scale 누락·modulo GQA, MoE의 재정규화 누락·top-(k−1) 대조 실험으로 확인한다.

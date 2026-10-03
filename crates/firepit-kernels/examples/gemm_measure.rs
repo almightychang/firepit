@@ -1,8 +1,11 @@
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
 use cutile::api::{self, DeviceOpReshape};
-use cutile::tensor::{Tensor, ToHostVec};
+use cutile::tensor::{PartitionMut, Tensor, ToHostVec};
 use cutile::tile_kernel::{PartitionOp, TileKernel};
+use firepit_kernels::gemm::{DEFAULT_GEMM_TILE, GemmTile, gemm};
+use firepit_kernels::sink::Eager;
+use firepit_kernels::weights::DenseMatrix;
 use half::bf16;
 use std::error::Error;
 use std::sync::Arc;
@@ -115,8 +118,62 @@ fn run(
     Ok(())
 }
 
+fn run_split(
+    m: usize,
+    n: usize,
+    k: usize,
+    repeats: usize,
+    tile: GemmTile,
+) -> Result<(), Box<dyn Error>> {
+    if repeats == 0 || m % tile.m != 0 || n % tile.n != 0 || k % tile.k != 0 {
+        return Err("shape must be divisible by tile and repeats must be positive".into());
+    }
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let a: Vec<f32> = (0..m * k)
+        .map(|i| ((i * 13 % 31) as f32 - 15.0) / 16.0)
+        .collect();
+    let b: Vec<bf16> = (0..n * k)
+        .map(|i| bf16::from_f32(((i * 7 % 29) as f32 - 14.0) / 16.0))
+        .collect();
+    let x = api::copy_host_vec_to_device(&Arc::new(a))
+        .reshape(&[m, k])
+        .sync_on(&stream)?;
+    let w = DenseMatrix::upload(b, n, k, &stream)?;
+    let mut y = api::zeros::<f32>(&[m, n]).sync_on(&stream)?;
+    let view = x.view(&[m, k])?;
+    gemm(&w, &view, (&mut y).partition([tile.m, tile.n]), tile).submit(&mut Eager(&stream))?;
+    let start = Instant::now();
+    for _ in 0..repeats {
+        gemm(&w, &view, (&mut y).partition([tile.m, tile.n]), tile).submit(&mut Eager(&stream))?;
+    }
+    let ms = start.elapsed().as_secs_f64() * 1e3 / repeats as f64;
+    let tflops = 2.0 * m as f64 * n as f64 * k as f64 / (ms * 1e9);
+    println!(
+        "split M={m} N={n} K={k} BM={} BN={} BK={} ms={ms:.4} TFLOPS={tflops:.3}",
+        tile.m, tile.n, tile.k
+    );
+    Ok(())
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|s| s == "--split") {
+        if args.len() != 5 {
+            return Err("usage: gemm_measure --split M N K repeats".into());
+        }
+        let values: Vec<usize> = args[1..]
+            .iter()
+            .map(|s| s.parse())
+            .collect::<Result<_, _>>()?;
+        return run_split(
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+            DEFAULT_GEMM_TILE,
+        );
+    }
     if args.first().is_some_and(|s| s == "--check") {
         let bm = args.get(1).map_or(Ok(32), |s| s.parse())?;
         let bn = args.get(2).map_or(Ok(64), |s| s.parse())?;

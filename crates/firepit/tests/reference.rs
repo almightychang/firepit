@@ -6,6 +6,7 @@ use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit::{Checkpoint, SafetensorsFile};
 use firepit_kernels::attention::{AttentionDims, cache_append, online_attention, output_gate};
 use firepit_kernels::gdn::{GdnDims, conv1d_silu, delta_step, gated_silu};
+use firepit_kernels::gemm::{DEFAULT_GEMM_TILE, gemm};
 use firepit_kernels::gemv::expert_gemv;
 use firepit_kernels::gemv::gemv;
 use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile};
@@ -17,6 +18,71 @@ use firepit_kernels::weights::{DenseMatrix, Q8_BLOCK, Weight};
 use half::bf16;
 use std::path::PathBuf;
 use std::sync::Arc;
+
+#[test]
+#[ignore = "needs Qwen3.6 weights and regenerated 150-token prefill reference"]
+fn gemm_prefill_projections_match_hf() -> Result<(), Box<dyn std::error::Error>> {
+    let model_dir = home("Models/qwen3.6-35b-a3b");
+    let weights = Checkpoint::open(&model_dir)?;
+    let refs = SafetensorsFile::open(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../refs/qwen36-prefix4-prefill.safetensors"),
+    )?;
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let tile = DEFAULT_GEMM_TILE;
+    for (layer, block, name) in [
+        (0, "linear_attn", "in_proj_qkv"),
+        (0, "linear_attn", "in_proj_z"),
+        (3, "self_attn", "q_proj"),
+    ] {
+        let key = format!("layer{layer}/{name}");
+        let input = refs.tensor(&format!("{key}/input"))?;
+        let expected = refs.tensor(&format!("{key}/output"))?;
+        let host = weights.tensor_bf16(&format!(
+            "model.language_model.layers.{layer}.{block}.{name}.weight"
+        ))?;
+        let (m, k, n) = (input.shape[0], input.shape[1], host.shape[0]);
+        assert_eq!(expected.shape, [m, n]);
+        assert_eq!(host.shape[1], k);
+        let padded = m.div_ceil(tile.m) * tile.m;
+        let mut data = input.data.clone();
+        data.resize(padded * k, 0.0);
+        let x = api::copy_host_vec_to_device(&Arc::new(data))
+            .reshape(&[padded, k])
+            .sync_on(&stream)?;
+        let matrix = host.clone().upload_matrix(&stream)?;
+        let mut y = api::zeros::<f32>(&[padded, n]).sync_on(&stream)?;
+        gemm(
+            &matrix,
+            &x.view(&[padded, k])?,
+            (&mut y).partition([tile.m, tile.n]),
+            tile,
+        )
+        .submit(&mut Eager(&stream))?;
+        let actual: Vec<f32> = y.to_host_vec().sync_on(&stream)?;
+        let gamma = check::gamma_tilde(k);
+        let split = (1.0 / 256.0f64).powi(2);
+        let mut worst = 0.0f64;
+        for row in 0..m {
+            for col in 0..n {
+                let magnitude: f64 = (0..k)
+                    .map(|p| {
+                        (host.data[col * k + p].to_f32() as f64 * input.data[row * k + p] as f64)
+                            .abs()
+                    })
+                    .sum();
+                let error =
+                    (actual[row * n + col] as f64 - expected.data[row * n + col] as f64).abs();
+                let excess = error / ((2.0 * gamma + split) * magnitude).max(f64::MIN_POSITIVE);
+                worst = worst.max(excess);
+            }
+        }
+        println!("{key} M={m} N={n} K={k} HF excess={worst:.6}");
+        assert!(worst <= 1.0, "{key} HF excess {worst}");
+    }
+    Ok(())
+}
 
 fn gdn_dims(model_dir: &std::path::Path) -> Result<GdnDims, Box<dyn std::error::Error>> {
     let config: serde_json::Value =

@@ -92,6 +92,8 @@ E2와 같은 순서(개념 → 구현 → 정답 비교)에 성능 기준을 더
 | 3.6 MoE prefill | expert별로 토큰 모으기 | MoE 블록 일치 | 실측 최대 대비 % | ○ |
 | 3.7 조립 | 엔진 prefill 경로 | prefill(T) = decode T번 (logits, state) | 5000토큰 prompt 215초 → 5초 이내 (계산 하한 약 0.4초, [기준선](research/measurements/gemm-peak-gb10.md)) | ○ |
 
+E7 성능 단계에서 GEMM의 M·N·K와 GPU 특성에 따라 타일 크기를 자동 선택한다. E3.1은 호출자가 타일을 지정하며 기본값은 64×128×32이다.
+
 ## 정답지 만들기 (2.0)
 
 ```bash

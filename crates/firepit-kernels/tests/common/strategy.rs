@@ -76,6 +76,28 @@ pub fn dense_case() -> impl Strategy<Value = DenseCase> {
         })
 }
 
+pub fn gemm_case() -> impl Strategy<Value = DenseCase> {
+    (
+        prop::sample::select(vec![128usize, 256]),
+        prop::sample::select(vec![128usize, 256, 512]),
+        prop::sample::select(vec![1usize, 3, 64, 65, 150]),
+    )
+        .prop_flat_map(|(rows, cols, batch)| {
+            (
+                Just((rows, cols, batch)),
+                values(rows * cols),
+                values(batch * cols),
+            )
+        })
+        .prop_map(|((rows, cols, batch), weights, input)| DenseCase {
+            rows,
+            cols,
+            batch,
+            weights,
+            input,
+        })
+}
+
 pub fn q8_case() -> impl Strategy<Value = Q8Case> {
     (
         1usize..=64,

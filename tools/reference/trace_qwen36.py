@@ -275,6 +275,21 @@ def cache_records(cache) -> dict[str, torch.Tensor]:
 
 def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
     records = {}
+    hooks = []
+    projections = (
+        (0, "linear_attn", "in_proj_qkv"),
+        (0, "linear_attn", "in_proj_z"),
+        (3, "self_attn", "q_proj"),
+    )
+    for layer, block_name, name in projections:
+        if layer >= len(model.model.layers):
+            continue
+        module = getattr(getattr(model.model.layers[layer], block_name), name)
+        key = f"layer{layer}/{name}"
+        def record(_module, args, output, key=key):
+            records[f"{key}/input"] = args[0][0].clone()
+            records[f"{key}/output"] = output[0].clone()
+        hooks.append(module.register_forward_hook(record))
     with torch.no_grad():
         out = model.model(
             input_ids=torch.tensor([tokens]), use_cache=True, output_hidden_states=True
@@ -283,6 +298,8 @@ def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tenso
             records[f"residual{layer}"] = residual[0].clone()
         records["logits"] = model.lm_head(norm(out.hidden_states[-1][:, -1:]))[0, 0].clone()
         records.update(cache_records(out.past_key_values))
+        for hook in hooks:
+            hook.remove()
 
         decode_cache = None
         maximum = {"residual": 0.0, "logits": 0.0, "state": 0.0}
