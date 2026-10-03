@@ -76,3 +76,16 @@ H=16, Hkv=2, D=256, p0=0. TFLOPS는 유효 연산량 2·H·D·T² 기준.
 - head_dim 256에서 레지스터 255개와 stack 1008 B, spill(STL)이 확인됐다. 타일과 spill 개선은 E7.
 - 5000토큰이면 layer당 약 64 ms × attention layer 10개 ≈ 0.6초 (T² 외삽 추정). 3.7 목표(5초)에 들어온다.
 - cuTile에서 f32 `mma`는 TF32 tensor core가 아니라 SIMT FMUL/FADD로 lowering된다 (vendor 예제와 같은 연산을 sm_120a에서 확인). f32 행렬 곱에 tensor core를 쓰려면 bf16 분할 같은 방법이 필요하다.
+
+## GDN conv prefill (E3.3, `a1af889`, release, conv_dim 8192, K 4)
+
+| T | GB10 ms | GB10 유효 GB/s | 5080 ms | 5080 유효 GB/s |
+|---:|---:|---:|---:|---:|
+| 512 | 0.27 | 125 | 0.41 | 83 |
+| 2048 | 0.98 | 137 | 1.61 | 83 |
+| 5000 | 2.35 | 139 | 3.92 | 84 |
+| 8192 | 4.26 | 126 | 6.42 | 84 |
+
+- GB10 채널 타일 128(block 64개), 5080 64(block 128개). 시간 방향은 block 안에서 순차.
+- GB10은 대역폭(약 200 GB/s)의 약 70%. 5000토큰이면 GDN 30층 합계 약 71 ms.
+- 출력 partition 시간 tile이 `next_power_of_two(T)`여도 레지스터 배열·spill은 생기지 않는다(T=5000과 8192의 cubin이 같음).
