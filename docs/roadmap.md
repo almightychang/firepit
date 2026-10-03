@@ -88,7 +88,7 @@ E2와 같은 순서(개념 → 구현 → 정답 비교)에 성능 기준을 더
 | 3.2 causal attention | flash attention, 미래 가리기, KV cache 채우기 | attention layer 일치 | 실측 최대 대비 % | ✔ |
 | 3.3 GDN conv | 시퀀스 causal conv, 마지막 state | conv 출력과 state 일치 | 대역폭 대비 % | ✔ (GB10 5000토큰 layer당 2.35 ms, 대역폭의 약 70%) |
 | 3.4 GDN chunk ① | chunk 안 계산, FLA 블록 삼각 역행렬 | f64 oracle·HF 입력·decode 합성 | 성분별 반올림 상한, GB10 5000토큰 layer당 6.1 ms | ✔ |
-| 3.5 GDN chunk ② | chunk 사이 state 전달 | f64 oracle·decode 동치·HF 150토큰 GDN layer | RTX 5080 5000토큰 second phase 3.96 ms, 전체 chunk 5.74 ms | ✔ |
+| 3.5 GDN chunk ② | chunk 사이 state 전달 | f64 oracle·decode 동치·HF 150토큰 GDN layer | RTX 5080 5000토큰 second phase 3.96 ms, 전체 chunk 5.74 ms | ✔ (HF GDN layer 끝-끝 일치, GB10 5000토큰 chunk 전체 layer당 21 ms) |
 | 3.6 MoE prefill | expert별로 토큰 모으기 | MoE 블록 일치 | 실측 최대 대비 % | ○ |
 | 3.7 조립 | 엔진 prefill 경로 | prefill(T) = decode T번 (logits, state) | 5000토큰 prompt 215초 → 5초 이내 (계산 하한 약 0.4초, [기준선](research/measurements/gemm-peak-gb10.md)) | ○ |
 
