@@ -56,6 +56,7 @@ fn gpu_step(
     state: &[f32],
     weight: &[f32],
     kernel: usize,
+    tile: usize,
 ) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
     let channels = input.len();
     let x = api::copy_host_vec_to_device(&Arc::new(input.to_vec())).sync_on(stream)?;
@@ -67,13 +68,16 @@ fn gpu_step(
         .sync_on(stream)?;
     let mut out = api::zeros::<f32>(&[channels]).sync_on(stream)?;
     conv1d_silu(
-        (&mut out).partition([1]),
+        (&mut out).partition([tile]),
         &x,
-        s.partition([1, (kernel - 1).next_power_of_two()]),
+        s.partition([tile, kernel.next_power_of_two()]),
         &w,
         kernel as i32,
     )
-    .generics(vec![(kernel - 1).next_power_of_two().to_string()])
+    .generics(vec![
+        tile.to_string(),
+        kernel.next_power_of_two().to_string(),
+    ])
     .sync_on(stream)?;
     Ok((
         out.to_host_vec().sync_on(stream)?,
@@ -89,20 +93,23 @@ fn conv_matches_f64_oracle() {
             &(
                 prop::sample::select(vec![32usize, 64, 96, 128]),
                 prop::sample::select(vec![2usize, 3, 4, 7]),
+                prop::sample::select(vec![1usize, 2, 4, 8, 16, 32]),
             )
-                .prop_flat_map(|(channels, kernel)| {
+                .prop_flat_map(|(channels, kernel, tile)| {
                     (
-                        Just((channels, kernel)),
+                        Just((channels, kernel, tile)),
                         strategy::values(channels),
                         strategy::values(channels * (kernel - 1)),
                         strategy::values(channels * kernel),
                     )
                 }),
-            |((channels, kernel), input, state, weight)| {
-                let (got, updated) = gpu_step(&stream, &input, &state, &weight, kernel)
+            |((channels, kernel, tile), input, state, weight)| {
+                let (got, updated) = gpu_step(&stream, &input, &state, &weight, kernel, tile)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 let expected = oracle(&input, &state, &weight, channels, kernel);
                 let magnitude = magnitude(&input, &state, &weight, channels, kernel);
+                prop_assert!(got.iter().all(|x| x.is_finite()));
+                prop_assert!(updated.iter().all(|x| x.is_finite()));
                 prop_assert!(
                     check::activated_inner_product_excess(
                         &got,
@@ -142,7 +149,7 @@ fn token_steps_match_full_causal_conv() -> Result<(), Box<dyn std::error::Error>
         .collect();
     let mut state = vec![0.0; channels * (kernel - 1)];
     for t in 0..steps {
-        let (got, next) = gpu_step(&stream, &inputs[t], &state, &weight, kernel)?;
+        let (got, next) = gpu_step(&stream, &inputs[t], &state, &weight, kernel, 64)?;
         let full: Vec<f64> = (0..channels)
             .map(|c| {
                 let sum: f64 = (0..kernel)
@@ -183,6 +190,38 @@ fn token_steps_match_full_causal_conv() -> Result<(), Box<dyn std::error::Error>
 }
 
 #[test]
+fn conv_channel_tiles_match() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let channels = 128;
+    for kernel in [3, 4] {
+        let input: Vec<f32> = (0..channels).map(|i| (i % 17) as f32 / 8.0).collect();
+        let state: Vec<f32> = (0..channels * (kernel - 1))
+            .map(|i| (i % 11) as f32 / 7.0)
+            .collect();
+        let weight: Vec<f32> = (0..channels * kernel)
+            .map(|i| (i % 13) as f32 / 9.0)
+            .collect();
+        let expected = oracle(&input, &state, &weight, channels, kernel);
+        let magnitude = magnitude(&input, &state, &weight, channels, kernel);
+        let (_, expected_state) = gpu_step(&stream, &input, &state, &weight, kernel, 1)?;
+        for tile in [64, 128] {
+            let actual = gpu_step(&stream, &input, &state, &weight, kernel, tile)?;
+            assert!(
+                check::activated_inner_product_excess(
+                    &actual.0,
+                    &expected,
+                    &magnitude,
+                    kernel,
+                    SILU_MAX_SLOPE,
+                ) <= 1.0
+            );
+            assert_eq!(actual.1, expected_state);
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn detects_reversed_taps_and_stale_state() -> Result<(), Box<dyn std::error::Error>> {
     let stream = common::stream();
     let channels = 32;
@@ -191,14 +230,14 @@ fn detects_reversed_taps_and_stale_state() -> Result<(), Box<dyn std::error::Err
     let input1: Vec<f32> = (0..channels).map(|i| i as f32 / 32.0 - 0.3).collect();
     let weight: Vec<f32> = (0..channels).flat_map(|_| [0.1, 0.4, -0.2, 0.8]).collect();
     let zero = vec![0.0; channels * (kernel - 1)];
-    let (first, state) = gpu_step(&stream, &input0, &zero, &weight, kernel)?;
+    let (first, state) = gpu_step(&stream, &input0, &zero, &weight, kernel, 4)?;
     let reversed: Vec<f32> = weight
         .chunks(kernel)
         .flat_map(|row| row.iter().rev().copied())
         .collect();
-    let (wrong_taps, _) = gpu_step(&stream, &input0, &zero, &reversed, kernel)?;
-    let (second, _) = gpu_step(&stream, &input1, &state, &weight, kernel)?;
-    let (stale, _) = gpu_step(&stream, &input1, &zero, &weight, kernel)?;
+    let (wrong_taps, _) = gpu_step(&stream, &input0, &zero, &reversed, kernel, 4)?;
+    let (second, _) = gpu_step(&stream, &input1, &state, &weight, kernel, 4)?;
+    let (stale, _) = gpu_step(&stream, &input1, &zero, &weight, kernel, 4)?;
     assert!(check::max_abs(&first, &wrong_taps) > 0.01);
     assert!(check::max_abs(&second, &stale) > 0.01);
     println!(

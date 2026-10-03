@@ -3,43 +3,63 @@ mod kernels {
     use cutile::core::*;
 
     #[cutile::entry()]
-    pub fn conv1d_silu<const STATE_TILE: i32>(
-        out: &mut Tensor<f32, { [1] }>,
+    pub fn conv1d_silu<const CHANNEL_TILE: i32, const KERNEL_TILE: i32>(
+        out: &mut Tensor<f32, { [CHANNEL_TILE] }>,
         input: &Tensor<f32, { [-1] }>,
-        state: &mut Tensor<f32, { [1, STATE_TILE] }>,
+        state: &mut Tensor<f32, { [CHANNEL_TILE, KERNEL_TILE] }>,
         weight: &Tensor<f32, { [-1, -1] }>,
         kernel_size: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
-        let previous: Tile<f32, { [1, STATE_TILE] }> = state.load();
-        let taps = weight.partition(shape![1, 1]);
-        let mut sum: Tile<f32, { [1] }> = constant(0.0f32, shape![1]);
-        for tap in 0i32..(kernel_size - 1i32) {
-            let past: Tile<f32, { [1, 1] }> =
-                extract(previous, [scalar_to_tile(0i32), scalar_to_tile(tap)]);
-            let coefficient: Tile<f32, { [1, 1] }> = taps.load([pid.0, tap]);
-            sum = sum + (past * coefficient).reshape(shape![1]);
-        }
-        let current: Tile<f32, { [1] }> = input.partition(shape![1]).load([pid.0]);
-        let coefficient: Tile<f32, { [1, 1] }> = taps.load([pid.0, kernel_size - 1i32]);
-        sum = sum + current * coefficient.reshape(shape![1]);
-        let one: Tile<f32, { [1] }> = constant(1.0f32, shape![1]);
-        let negative: Tile<f32, { [1] }> = constant(-1.0f32, shape![1]);
+        let previous: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> = state.load();
+        let coefficients: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> = weight
+            .partition(shape![CHANNEL_TILE, KERNEL_TILE])
+            .load([pid.0, 0]);
+        let current: Tile<f32, { [CHANNEL_TILE] }> =
+            input.partition(shape![CHANNEL_TILE]).load([pid.0]);
+        let positions: Tile<i32, { [KERNEL_TILE] }> = iota(shape![KERNEL_TILE]);
+        let columns: Tile<i32, { [1, KERNEL_TILE] }> = positions.reshape(shape![1, KERNEL_TILE]);
+        let current_column: Tile<bool, { [CHANNEL_TILE, KERNEL_TILE] }> = eq_tile(
+            columns.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+            (kernel_size - 1i32).broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+        );
+        let window = select(
+            current_column,
+            current
+                .reshape(shape![CHANNEL_TILE, 1])
+                .broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+            previous,
+        );
+        let valid_columns: Tile<bool, { [CHANNEL_TILE, KERNEL_TILE] }> = lt_tile(
+            columns.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+            kernel_size.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+        );
+        let zero: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> =
+            constant(0.0f32, shape![CHANNEL_TILE, KERNEL_TILE]);
+        let window = select(valid_columns, window, zero);
+        let sum: Tile<f32, { [CHANNEL_TILE] }> = reduce_sum(window * coefficients, 1);
+        let sum: Tile<f32, { [CHANNEL_TILE] }> = sum.reshape(shape![CHANNEL_TILE]);
+        let one: Tile<f32, { [CHANNEL_TILE] }> = constant(1.0f32, shape![CHANNEL_TILE]);
+        let negative: Tile<f32, { [CHANNEL_TILE] }> = constant(-1.0f32, shape![CHANNEL_TILE]);
         out.store(sum / (one + exp(sum * negative)));
 
-        let positions: Tile<i32, { [STATE_TILE] }> = iota(shape![STATE_TILE]);
-        let slots: Tile<i32, { [1, STATE_TILE] }> = positions.reshape(shape![1, STATE_TILE]);
-        let mut shifted: Tile<f32, { [1, STATE_TILE] }> = current
-            .reshape(shape![1, 1])
-            .broadcast(shape![1, STATE_TILE]);
+        let slots: Tile<i32, { [CHANNEL_TILE, KERNEL_TILE] }> =
+            columns.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]);
+        let mut shifted: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> = current
+            .reshape(shape![CHANNEL_TILE, 1])
+            .broadcast(shape![CHANNEL_TILE, KERNEL_TILE]);
         for slot in 0i32..(kernel_size - 2i32) {
-            let next: Tile<f32, { [1, 1] }> = extract(
+            let next: Tile<f32, { [CHANNEL_TILE, 1] }> = extract(
                 previous,
                 [scalar_to_tile(0i32), scalar_to_tile(slot + 1i32)],
             );
-            let at_slot: Tile<bool, { [1, STATE_TILE] }> =
-                eq_tile(slots, slot.broadcast(shape![1, STATE_TILE]));
-            shifted = select(at_slot, next.broadcast(shape![1, STATE_TILE]), shifted);
+            let at_slot: Tile<bool, { [CHANNEL_TILE, KERNEL_TILE] }> =
+                eq_tile(slots, slot.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]));
+            shifted = select(
+                at_slot,
+                next.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+                shifted,
+            );
         }
         state.store(shifted);
     }
@@ -234,8 +254,11 @@ impl GdnDims {
     pub fn inv_sqrt_key_dim(self) -> f32 {
         1.0 / (self.key_head_dim as f32).sqrt()
     }
-    pub fn conv_generics(self) -> Vec<String> {
-        vec![(self.conv_kernel - 1).next_power_of_two().to_string()]
+    pub fn conv_generics(self, channel_tile: usize) -> Vec<String> {
+        vec![
+            channel_tile.to_string(),
+            self.conv_kernel.next_power_of_two().to_string(),
+        ]
     }
     pub fn delta_generics(self, value_tile: usize) -> Vec<String> {
         vec![

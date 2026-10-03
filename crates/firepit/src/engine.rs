@@ -10,7 +10,7 @@ use cuda_core::Device;
 use cutile::api::{self, DeviceOpReshape};
 use firepit_kernels::rope;
 use firepit_kernels::sink::{Eager, Graph};
-use firepit_kernels::tile::{MIN_ROW_TILE, row_tile};
+use firepit_kernels::tile::{MIN_ROW_TILE, channel_tile, row_tile};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,6 +28,7 @@ pub struct Engine {
     stream: Stream,
     id: u64,
     gdn_value_tile: usize,
+    gdn_conv_tile: usize,
     plans: HashMap<usize, CachedPlan>,
     #[cfg(test)]
     fail_after_gpu_work: bool,
@@ -48,11 +49,13 @@ impl Engine {
             TARGET_BLOCKS_PER_SM,
             MIN_ROW_TILE,
         );
+        let gdn_conv_tile = channel_tile(g.conv_dim(), sm, TARGET_BLOCKS_PER_SM);
         Ok(Self {
             model,
             stream: device.new_stream()?,
             id: NEXT_ENGINE.fetch_add(1, Ordering::Relaxed),
             gdn_value_tile,
+            gdn_conv_tile,
             plans: HashMap::new(),
             #[cfg(test)]
             fail_after_gpu_work: false,
@@ -119,7 +122,13 @@ impl Engine {
                 size,
                 CachedPlan {
                     instances,
-                    plan: StepPlan::new(&self.model, size, self.gdn_value_tile, &self.stream)?,
+                    plan: StepPlan::new(
+                        &self.model,
+                        size,
+                        self.gdn_value_tile,
+                        self.gdn_conv_tile,
+                        &self.stream,
+                    )?,
                 },
             );
         }

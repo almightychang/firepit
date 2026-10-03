@@ -126,11 +126,11 @@ fn gdn_projection_and_conv_match_hf() -> Result<(), Box<dyn std::error::Error>> 
             conv1d_silu(
                 (&mut output).partition([1]),
                 &qkv_gpu,
-                state.partition([1, (dims.conv_kernel() - 1).next_power_of_two()]),
+                state.partition([1, dims.conv_kernel().next_power_of_two()]),
                 &conv_w,
                 dims.conv_kernel() as i32,
             )
-            .generics(dims.conv_generics())
+            .generics(dims.conv_generics(1))
             .sync_on(&stream)?;
             let _query = output.slice(&[0..dims.key_dim()])?;
             let _key = output.slice(&[dims.key_dim()..2 * dims.key_dim()])?;

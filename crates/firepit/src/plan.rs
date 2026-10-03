@@ -238,6 +238,7 @@ pub struct StepPlan {
     pub selections: Vec<Vec<ExpertSelection>>,
     pub graph: Option<CudaGraph<()>>,
     pub gdn_value_tile: usize,
+    pub gdn_conv_tile: usize,
 }
 
 impl StepPlan {
@@ -245,6 +246,7 @@ impl StepPlan {
         model: &Model,
         batch: usize,
         gdn_value_tile: usize,
+        gdn_conv_tile: usize,
         stream: &Stream,
     ) -> Result<Self> {
         let mut ops = vec![Op::Embed {
@@ -426,6 +428,7 @@ impl StepPlan {
             selections,
             graph: None,
             gdn_value_tile,
+            gdn_conv_tile,
         })
     }
 

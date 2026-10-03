@@ -246,6 +246,8 @@ pub(crate) fn run(
                         _ => unreachable!(),
                     };
                     let (source, target) = input_output(&mut plan.buffers, Slot::Qkv, Slot::Conv);
+                    let tile = plan.gdn_conv_tile;
+                    let kernel_tile = g.conv_kernel().next_power_of_two();
                     for (b, session) in sessions.iter_mut().enumerate() {
                         let source_row = source.slice(&[b..b + 1, 0..g.conv_dim()])?;
                         let x = source_row.view(&[g.conv_dim()])?;
@@ -255,13 +257,13 @@ pub(crate) fn run(
                         };
                         sink.run(
                             gdn::conv1d_silu(
-                                y.partition([1]),
+                                y.partition([tile]),
                                 &x,
-                                conv.partition([1, (g.conv_kernel() - 1).next_power_of_two()]),
+                                conv.partition([tile, kernel_tile]),
                                 &w.conv,
                                 g.conv_kernel() as i32,
                             )
-                            .generics(g.conv_generics()),
+                            .generics(g.conv_generics(tile)),
                         )?;
                     }
                 }
