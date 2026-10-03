@@ -38,6 +38,7 @@
 - 빌드와 테스트는 컨테이너에서: `scripts/dev.sh test --workspace`. 실제 모델 비교: `scripts/dev.sh test -p firepit --test reference -- --ignored`.
 - 포맷은 호스트에서 `cargo fmt --all` (컨테이너에서는 동작하지 않는다).
 - 정답지 재생성: `cd tools/reference && uv run python trace_qwen36.py --model ~/Models/qwen3.6-35b-a3b --out ../../refs/qwen36-prefix4.safetensors`.
+- 성능 측정은 반드시 release 빌드(`--release`)로 한다. debug 빌드는 host 오버헤드가 커서 커널 시간을 수십 배 부풀린다.
 - 호스트 shell은 zsh noclobber다. 파일을 덮어쓸 때는 `>|`를 쓴다.
 
 ## 커밋
