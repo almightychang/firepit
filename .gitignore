@@ -1,7 +1,31 @@
+# Rust 빌드 산출물 (호스트, CUDA 13 컨테이너, candle 비교용)
 /target/
 /target-c13/
 /target-candle/
+
+# 로컬에서 받거나 만드는 것 (README의 빌드 준비, roadmap의 정답지 재현 절차 참고)
 /vendor/
 /refs/
+
+# Python (정답지 도구)
 /tools/reference/.venv/
 __pycache__/
+*.pyc
+
+# 프로파일과 JIT 산출물
+*.nsys-rep
+*.ncu-rep
+*.qdrep
+*.sqlite
+*.cubin
+
+# 편집기와 OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+
+# 비밀값
+.env
+.env.*
