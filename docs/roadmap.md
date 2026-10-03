@@ -98,6 +98,8 @@ E2와 같은 순서(개념 → 구현 → 정답 비교)에 성능 기준을 더
 # 앞쪽 4개 layer에 필요한 shard 4개 (약 10.9 GB)만 ~/Models/qwen3.6-35b-a3b 에 받는다
 cd tools/reference
 uv run python trace_qwen36.py --model ~/Models/qwen3.6-35b-a3b --out ../../refs/qwen36-prefix4.safetensors
+# E3.0: separate 150-token prefill reference and HF decode consistency check
+uv run python trace_qwen36.py --model ~/Models/qwen3.6-35b-a3b --prefill --out ../../refs/qwen36-prefix4-prefill.safetensors
 cd ../..
 scripts/dev.sh test -p firepit --test reference -- --ignored
 ```

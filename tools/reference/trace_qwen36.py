@@ -260,18 +260,81 @@ def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
     return records
 
 
+def cache_records(cache) -> dict[str, torch.Tensor]:
+    records = {}
+    for layer, state in enumerate(cache.layers):
+        prefix = f"layer{layer}/cache"
+        if hasattr(state, "conv_states"):
+            records[f"{prefix}/conv"] = state.conv_states[0][0].clone()
+            records[f"{prefix}/recurrent"] = state.recurrent_states[0][0].clone()
+        else:
+            records[f"{prefix}/k"] = state.keys[0].clone()
+            records[f"{prefix}/v"] = state.values[0].clone()
+    return records
+
+
+def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tensor], dict[str, float]]:
+    records = {}
+    with torch.no_grad():
+        out = model.model(
+            input_ids=torch.tensor([tokens]), use_cache=True, output_hidden_states=True
+        )
+        for layer, residual in enumerate(out.hidden_states):
+            records[f"residual{layer}"] = residual[0].clone()
+        records["logits"] = model.lm_head(norm(out.hidden_states[-1][:, -1:]))[0, 0].clone()
+        records.update(cache_records(out.past_key_values))
+
+        decode_cache = None
+        maximum = {"residual": 0.0, "logits": 0.0, "state": 0.0}
+        state_maximum = {}
+        for position, token in enumerate(tokens):
+            step = model.model(
+                input_ids=torch.tensor([[token]]), past_key_values=decode_cache,
+                use_cache=True, output_hidden_states=True,
+            )
+            decode_cache = step.past_key_values
+            for layer, residual in enumerate(step.hidden_states):
+                key = f"residual{layer}"
+                maximum["residual"] = max(
+                    maximum["residual"],
+                    (records[key][position] - residual[0, 0]).abs().max().item(),
+                )
+        logits = model.lm_head(norm(step.hidden_states[-1]))[0, 0]
+        maximum["logits"] = (records["logits"] - logits).abs().max().item()
+        for key, value in cache_records(decode_cache).items():
+            state_maximum[key] = (records[key] - value).abs().max().item()
+            maximum["state"] = max(maximum["state"], state_maximum[key])
+        maximum["state_by_key"] = state_maximum
+    return records, maximum
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--prompt", default="The capital of France is")
+    parser.add_argument("--prefill", action="store_true")
     args = parser.parse_args()
 
-    tokens = AutoTokenizer.from_pretrained(args.model)(args.prompt)["input_ids"]
+    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    if args.prefill:
+        source = args.prompt * 100
+        tokens = tokenizer(source, add_special_tokens=False)["input_ids"][:150]
+        if len(tokens) != 150:
+            raise SystemExit(f"prompt produced only {len(tokens)} tokens")
+    else:
+        tokens = tokenizer(args.prompt)["input_ids"]
     model, norm = load_prefix(args.model, args.layers)
-    records = trace(model, norm, tokens)
+    if args.prefill:
+        records, maximum = trace_prefill(model, norm, tokens)
+        print(f"HF prefill vs decode max abs: {maximum}", flush=True)
+    else:
+        records = trace(model, norm, tokens)
     metadata = {"model": MODEL_ID, "layers": str(args.layers), "prompt": args.prompt, "tokens": json.dumps(tokens)}
+    if args.prefill:
+        metadata["mode"] = "prefill"
+        metadata["max_abs"] = json.dumps(maximum)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     save_file(records, args.out, metadata=metadata)
     print(f"tokens={tokens} records={len(records)} -> {args.out}")
