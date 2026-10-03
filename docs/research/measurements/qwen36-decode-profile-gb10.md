@@ -20,7 +20,7 @@
 
 ## batch 1 step 분해
 
-step당 커널 943개 (계획과 일치: embedding 1 + GDN layer 23 op × 30 + attention layer 25 op × 10 + 2). 커널 이름이 모두 `full_entry`라서 실행 순서를 plan op 순서에 맞춰 분류했고, grid 크기로 대응을 확인했다.
+step당 커널 943개 (계획과 일치: embedding 1 + GDN layer 23 op × 30 + attention layer 25 op × 10 + 2). 실행 순서를 plan op 순서에 맞춰 분류했고, grid 크기와 커널 이름(`dense_gemv_kernel_entry`, `conv1d_silu_entry` 등)으로 대응을 확인했다. (정정 2026-10-03: 처음에 "커널 이름이 모두 `full_entry`"라고 적었으나 틀렸다. `full_entry`는 graph 밖에서 버퍼를 0으로 채우는 cuTile 커널이고, graph 내부를 추적하지 않은 첫 측정에서 이것만 보였다.)
 
 | 분류 | ms | % | 읽는 GB | GB/s |
 |---|---:|---:|---:|---:|
