@@ -278,6 +278,20 @@ def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tenso
     hooks = []
     attention = {}
     gdn_qkv = {}
+    chunk = qwen_module.torch_chunk_gated_delta_rule
+    gdn_calls = [0]
+
+    def record_chunk(query, key, value, **kwargs):
+        layer = gdn_calls[0]
+        gdn_calls[0] += 1
+        if layer < 3:
+            prefix = f"layer{layer}/gdn/chunk"
+            for name, tensor in (("q", query), ("k", key), ("v", value),
+                                 ("g", kwargs["g"]), ("beta", kwargs["beta"])):
+                records[f"{prefix}/{name}"] = tensor[0].contiguous().clone()
+        return chunk(query, key, value, **kwargs)
+
+    qwen_module.torch_chunk_gated_delta_rule = record_chunk
     projections = (
         (0, "linear_attn", "in_proj_qkv"),
         (0, "linear_attn", "in_proj_z"),
@@ -359,6 +373,7 @@ def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tenso
         records.update(cache_records(out.past_key_values))
         for hook in hooks:
             hook.remove()
+        qwen_module.torch_chunk_gated_delta_rule = chunk
 
         decode_cache = None
         maximum = {"residual": 0.0, "logits": 0.0, "state": 0.0}

@@ -27,6 +27,10 @@ Q8 GEMV는 블록 합 뒤 scale 곱이 한 번 더 들어가므로 n = K + 2로 
 
 bf16 hi+lo GEMM은 잔차가 bf16 정상 범위인 유한 입력에서 `hi = RN_bf16(x)`, `lo = RN_bf16(x−hi)`를 사용한다. `|x−hi| ≤ u_b|x|`이고 Sterbenz 보조정리로 `x−hi`가 정확하므로 `|x−(hi+lo)| ≤ u_b²|x|` (`u_b=2⁻⁸`). 따라서 f64 oracle 판정은 `(γ̃_K(8)+u_b²)Σ|w_k x_k|`이다. GEMM 행과 GEMV의 차이는 두 경로의 상한 합으로 판정한다.
 
+GDN chunk ①은 `A=I+L`, `X=A⁻¹`, `B_U=βv`, `B_W=βk exp(cum)`로 둔다. 오차 전파의 크기 기준은 각 성분의 `R=|X||B|`, `S=|X|(|L|+M_L)|Y|`이다. 여기서 `Y`는 정답 U 또는 W, `M_L[i,j]=β_i exp(cum_i−cum_j) Σ_d|k_id k_jd|` (`j<i`)이다. `M_L`은 L 생성 내적이 상쇄될 때도 입력 오차를 포착한다. 구현의 판정은 U에 `e_s R+(e_d+e_n)S+8u|U|`, W에 `(e_s+e_n)R+(e_d+e_n)S+8u|W|`를 쓴다. `e_d=3γ̃_D(8)+u_b²`, `e_m=3γ̃_C(8)+u_b²`, `e_n=γ̃_D(8)+γ̃_C(8)+16u`, `e_s=(2C/B+3)e_m`, `u=2⁻²⁴`, B는 대각 블록 크기다. `e_s`는 B 블록 안의 앞에서부터 대입과 C/B 블록 행의 세 번 분할 MMA 누적을 각 단계에 합한 보수적 계수다. 차이는 f32 최소 정상값을 분모 하한으로 둔다.
+
+`intra`는 `QKᵀ` 내적 크기 `M_Q=exp(cum_i−cum_j)Σ_d|q_id k_jd|`에 `(e_d+e_n)M_Q`를 적용한다. 누적 gate의 오차가 지수로 전파되는 항은 `2γ̃_C(8)(Σ_{r≤i}|g_r|+Σ_{r≤j}|g_r|)M_Q`로 별도 더한다. `cum`은 `γ̃_C(8)|cum|+8u|cum|`로 판정한다. `tests/gdn_chunk.rs`의 f64 oracle이 성분별 크기를 계산하며, HF 기록 입력도 같은 기준을 쓴다.
+
 Prefill attention은 Q·Kᵀ와 P·V 모두 f32 피연산자를 bf16 hi+lo로 나눠 hi·hi + hi·lo + lo·hi를 누적한다. `S_j = scale·Σ_i q_i k_{ji}`, `M_j = scale·Σ_i |q_i k_{ji}|`, `E_0 = max_j(γ̃_D M_j + 4u)`, `E_s = max_j((3γ̃_D+u_b²)M_j)`, `E = E_0+E_s`로 둔다. 출력 성분의 판정 상한은 `L·f32::MIN_POSITIVE·max|v| + [γ̃_(2L+2) + (e^(2E)−1) + 3γ̃_L + u_b² + 8u]·Σ_j a_j|v_j|`이다. `a_j`는 f64 softmax 가중치이며, `L`은 해당 쿼리가 볼 수 있는 cache 길이다. P·V 분할의 생략된 lo·lo와 세 MMA 누적 오차를 마지막 두 항에 더했다. Prefill과 decode의 행별 동치 판정은 각 경로 상한의 합을 쓴다.
 
 ## 층

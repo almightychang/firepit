@@ -2,6 +2,7 @@ pub mod attention;
 pub mod elementwise;
 pub mod embedding;
 pub mod gdn;
+pub mod gdn_chunk;
 pub mod gemm;
 pub mod gemv;
 pub mod moe;

@@ -538,6 +538,7 @@ dependencies = [
  "cutile",
  "half",
  "proptest",
+ "safetensors",
 ]
 
 [[package]]
