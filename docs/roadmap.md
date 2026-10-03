@@ -83,14 +83,14 @@ E2와 같은 순서(개념 → 구현 → 정답 비교)에 성능 기준을 더
 
 | 덩이 | 배우는 것 | 정확성 기준 | 성능 기준 | 상태 |
 |---|---|---|---|---|
-| 3.0 정답지와 입구 | prompt 전체를 한 번에 넣는 HF forward, prefill 입구, 계산 하한 | HF로 T토큰 중간값 기록 | GB10 GEMM 실측 최대 처리량(cuTile, PyTorch/cuBLAS) | ○ |
+| 3.0 정답지와 입구 | prompt 전체를 한 번에 넣는 HF forward, prefill 입구, 계산 하한 | HF로 T토큰 중간값 기록 | GB10 GEMM 실측 최대 처리량(cuTile, PyTorch/cuBLAS) | ✔ |
 | 3.1 GEMM | 행렬 × 행렬, tensor core, 정밀도 | projection이 HF와 일치 | 실측 최대 대비 % | ○ |
 | 3.2 causal attention | flash attention, 미래 가리기, KV cache 채우기 | attention layer 일치 | 실측 최대 대비 % | ○ |
 | 3.3 GDN conv | 시퀀스 causal conv, 마지막 state | conv 출력과 state 일치 | 대역폭 대비 % | ○ |
 | 3.4 GDN chunk ① | chunk 안 계산, WY 표현 | chunk 하나 일치 | 실측 최대 대비 % | ○ |
 | 3.5 GDN chunk ② | chunk 사이 state 전달 | GDN layer 일치 | 실측 최대 대비 % | ○ |
 | 3.6 MoE prefill | expert별로 토큰 모으기 | MoE 블록 일치 | 실측 최대 대비 % | ○ |
-| 3.7 조립 | 엔진 prefill 경로 | prefill(T) = decode T번 (logits, state) | 5000토큰 prompt 215초 → 목표(3.0에서 확정) | ○ |
+| 3.7 조립 | 엔진 prefill 경로 | prefill(T) = decode T번 (logits, state) | 5000토큰 prompt 215초 → 5초 이내 (계산 하한 약 0.4초, [기준선](research/measurements/gemm-peak-gb10.md)) | ○ |
 
 ## 정답지 만들기 (2.0)
 
