@@ -23,11 +23,11 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
  E2. Qwen3.6-35B-A3B decode (실제 수학)                            ✔
     아래 "E2 공부 단위" 참고
 
- E3. prefill                                                      ○
-    ○ GDN chunked (WY), attention prefill, prompt 처리 경로
+ E3. prefill                                                      ◐
+    아래 "E3 공부 단위" 참고. 동기: 5071토큰 prompt를 decode 경로로 215초
 
- E4. 성능 (GB10)                                                  ○
-    ○ Spark 측정 (GPU pod 승인 필요) · ds4 대비 decode t/s
+ E4. 성능 (GB10)                                                  ◐
+    ✔ Spark 측정 → GDN conv 타일화로 decode 12 → 30.6 tok/s (대역폭 하한의 92%)
     ○ dense 양자화 포맷 결정 (Q8_0 / FP8 / NVFP4)
     ○ GEMV 합치기 · quantize/RMSNorm fusion · hot path 할당 제거
 
@@ -76,6 +76,21 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 | 2.9 전부 쌓기 | layer stack, tokenizer, greedy decode | 실제 문장 생성 | ✔ (GB10에서 전체 모델 생성, [기록](research/measurements/qwen36-first-generation-gb10.md)) |
 
 순서는 쉬운 개념부터 쌓는다. 각 개념이 다음 개념의 전제가 된다. cuTile 표현력의 한계는 2.6(MoE, 간접 읽기)과 2.8(GDN)에서 만난다.
+
+## E3 공부 단위
+
+E2와 같은 순서(개념 → 구현 → 정답 비교)에 성능 기준을 더한다. prefill은 같은 수식을 다른 계산 순서로 하는 것이라 결과가 decode와 같아야 하고, 목적이 성능이라 얼마나 빨라졌는지도 끝났다는 기준에 들어간다. 성능 목표는 3.0에서 GB10의 실측 최대 처리량을 잰 뒤 "하한의 몇 %"로 정한다.
+
+| 덩이 | 배우는 것 | 정확성 기준 | 성능 기준 | 상태 |
+|---|---|---|---|---|
+| 3.0 정답지와 입구 | prompt 전체를 한 번에 넣는 HF forward, prefill 입구, 계산 하한 | HF로 T토큰 중간값 기록 | GB10 GEMM 실측 최대 처리량(cuTile, PyTorch/cuBLAS) | ○ |
+| 3.1 GEMM | 행렬 × 행렬, tensor core, 정밀도 | projection이 HF와 일치 | 실측 최대 대비 % | ○ |
+| 3.2 causal attention | flash attention, 미래 가리기, KV cache 채우기 | attention layer 일치 | 실측 최대 대비 % | ○ |
+| 3.3 GDN conv | 시퀀스 causal conv, 마지막 state | conv 출력과 state 일치 | 대역폭 대비 % | ○ |
+| 3.4 GDN chunk ① | chunk 안 계산, WY 표현 | chunk 하나 일치 | 실측 최대 대비 % | ○ |
+| 3.5 GDN chunk ② | chunk 사이 state 전달 | GDN layer 일치 | 실측 최대 대비 % | ○ |
+| 3.6 MoE prefill | expert별로 토큰 모으기 | MoE 블록 일치 | 실측 최대 대비 % | ○ |
+| 3.7 조립 | 엔진 prefill 경로 | prefill(T) = decode T번 (logits, state) | 5000토큰 prompt 215초 → 목표(3.0에서 확정) | ○ |
 
 ## 정답지 만들기 (2.0)
 
