@@ -65,6 +65,77 @@ mod kernels {
     }
 
     #[cutile::entry()]
+    pub fn conv1d_silu_prefill<
+        const SEQUENCE_TILE: i32,
+        const CHANNEL_TILE: i32,
+        const KERNEL_TILE: i32,
+    >(
+        out: &mut Tensor<f32, { [SEQUENCE_TILE, CHANNEL_TILE] }>,
+        input: &Tensor<f32, { [-1, -1] }>,
+        state: &mut Tensor<f32, { [1, CHANNEL_TILE, KERNEL_TILE] }>,
+        weight: &Tensor<f32, { [-1, -1] }>,
+        kernel_size: i32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let coefficients: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> = weight
+            .partition(shape![CHANNEL_TILE, KERNEL_TILE])
+            .load([pid.1, 0]);
+        let positions: Tile<i32, { [KERNEL_TILE] }> = iota(shape![KERNEL_TILE]);
+        let slots: Tile<i32, { [CHANNEL_TILE, KERNEL_TILE] }> = positions
+            .reshape(shape![1, KERNEL_TILE])
+            .broadcast(shape![CHANNEL_TILE, KERNEL_TILE]);
+        let current_column = eq_tile(
+            slots,
+            (kernel_size - 1i32).broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+        );
+        let valid_columns = lt_tile(
+            slots,
+            kernel_size.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+        );
+        let zero: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> =
+            constant(0.0f32, shape![CHANNEL_TILE, KERNEL_TILE]);
+        let one: Tile<f32, { [CHANNEL_TILE] }> = constant(1.0f32, shape![CHANNEL_TILE]);
+        let negative: Tile<f32, { [CHANNEL_TILE] }> = constant(-1.0f32, shape![CHANNEL_TILE]);
+        let mut previous: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> =
+            state.load().reshape(shape![CHANNEL_TILE, KERNEL_TILE]);
+        for time in 0i32..input.shape()[0] {
+            let current: Tile<f32, { [CHANNEL_TILE] }> = input
+                .partition(shape![1, CHANNEL_TILE])
+                .load([time, pid.1])
+                .reshape(shape![CHANNEL_TILE]);
+            let current = current
+                .reshape(shape![CHANNEL_TILE, 1])
+                .broadcast(shape![CHANNEL_TILE, KERNEL_TILE]);
+            let window = select(
+                valid_columns,
+                select(current_column, current, previous),
+                zero,
+            );
+            let sum: Tile<f32, { [CHANNEL_TILE] }> = reduce_sum(window * coefficients, 1);
+            let sum = sum.reshape(shape![CHANNEL_TILE]);
+            let activated = sum / (one + exp(sum * negative));
+            out.partition_mut(shape![1, CHANNEL_TILE])
+                .store(activated.reshape(shape![1, CHANNEL_TILE]), [time, 0]);
+
+            let mut shifted = current;
+            for slot in 0i32..(kernel_size - 2i32) {
+                let next: Tile<f32, { [CHANNEL_TILE, 1] }> = extract(
+                    previous,
+                    [scalar_to_tile(0i32), scalar_to_tile(slot + 1i32)],
+                );
+                let at_slot = eq_tile(slots, slot.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]));
+                shifted = select(
+                    at_slot,
+                    next.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+                    shifted,
+                );
+            }
+            previous = shifted;
+        }
+        state.store(previous.reshape(shape![1, CHANNEL_TILE, KERNEL_TILE]));
+    }
+
+    #[cutile::entry()]
     pub fn delta_step<const KEY_HEADS: i32, const VALUE_HEADS: i32, const DK: i32, const T: i32>(
         out: &mut Tensor<f32, { [1, 1, T] }>,
         state: &mut Tensor<f32, { [1, DK, T] }>,
@@ -142,7 +213,7 @@ mod kernels {
     }
 }
 
-pub use kernels::{conv1d_silu, delta_step, gated_silu};
+pub use kernels::{conv1d_silu, conv1d_silu_prefill, delta_step, gated_silu};
 
 use crate::weights::Q8_BLOCK;
 

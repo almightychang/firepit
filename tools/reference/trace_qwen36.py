@@ -277,6 +277,7 @@ def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tenso
     records = {}
     hooks = []
     attention = {}
+    gdn_qkv = {}
     projections = (
         (0, "linear_attn", "in_proj_qkv"),
         (0, "linear_attn", "in_proj_z"),
@@ -291,6 +292,14 @@ def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tenso
             records[f"{key}/input"] = args[0][0].clone()
             records[f"{key}/output"] = output[0].clone()
         hooks.append(module.register_forward_hook(record))
+    for layer, block in enumerate(model.model.layers):
+        if block.block_type != "linear_attention":
+            continue
+        gdn = block.linear_attn
+        def record_qkv(_module, _args, output, layer=layer):
+            gdn_qkv[layer] = output[0].clone()
+            records[f"layer{layer}/gdn/qkv"] = output[0].clone()
+        hooks.append(gdn.in_proj_qkv.register_forward_hook(record_qkv))
     if len(model.model.layers) > 3:
         attn = model.model.layers[3].self_attn
         def normalized(name):
@@ -323,6 +332,20 @@ def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tenso
         out = model.model(
             input_ids=torch.tensor([tokens]), use_cache=True, output_hidden_states=True
         )
+        for layer, qkv in gdn_qkv.items():
+            gdn = model.model.layers[layer].linear_attn
+            conv = causal_conv1d_fn(
+                qkv.transpose(0, 1).unsqueeze(0),
+                gdn.conv1d.weight.squeeze(1),
+                gdn.conv1d.bias,
+                activation=gdn.activation,
+            )[0].transpose(0, 1).contiguous()
+            q, k, v = torch.split(conv, [gdn.key_dim, gdn.key_dim, gdn.value_dim], dim=-1)
+            prefix = f"layer{layer}/gdn"
+            records[f"{prefix}/q"] = q.clone()
+            records[f"{prefix}/k"] = k.clone()
+            records[f"{prefix}/v"] = v.clone()
+            records[f"{prefix}/conv_state"] = out.past_key_values.layers[layer].conv_states[0][0].clone()
         if attention:
             q, k = apply_rotary_pos_emb(
                 attention["q"].transpose(1, 2), attention["k"].transpose(1, 2),

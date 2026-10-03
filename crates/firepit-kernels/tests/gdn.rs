@@ -5,7 +5,7 @@ use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::TileKernel;
-use firepit_kernels::gdn::{GdnDims, conv1d_silu};
+use firepit_kernels::gdn::{GdnDims, conv1d_silu, conv1d_silu_prefill};
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -83,6 +83,187 @@ fn gpu_step(
         out.to_host_vec().sync_on(stream)?,
         s.to_host_vec().sync_on(stream)?,
     ))
+}
+
+fn gpu_prefill(
+    stream: &Arc<cuda_core::Stream>,
+    input: &[f32],
+    state: &[f32],
+    weight: &[f32],
+    channels: usize,
+    kernel: usize,
+    tile: usize,
+) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
+    let steps = input.len() / channels;
+    let x = api::copy_host_vec_to_device(&Arc::new(input.to_vec()))
+        .reshape(&[steps, channels])
+        .sync_on(stream)?;
+    let mut s = api::copy_host_vec_to_device(&Arc::new(state.to_vec()))
+        .reshape(&[1, channels, kernel - 1])
+        .sync_on(stream)?;
+    let w = api::copy_host_vec_to_device(&Arc::new(weight.to_vec()))
+        .reshape(&[channels, kernel])
+        .sync_on(stream)?;
+    let mut out = api::zeros::<f32>(&[steps, channels]).sync_on(stream)?;
+    conv1d_silu_prefill(
+        (&mut out).partition([steps.next_power_of_two(), tile]),
+        &x,
+        s.partition([1, tile, kernel.next_power_of_two()]),
+        &w,
+        kernel as i32,
+    )
+    .generics(vec![
+        steps.next_power_of_two().to_string(),
+        tile.to_string(),
+        kernel.next_power_of_two().to_string(),
+    ])
+    .sync_on(stream)?;
+    Ok((
+        out.to_host_vec().sync_on(stream)?,
+        s.to_host_vec().sync_on(stream)?,
+    ))
+}
+
+fn sequence_oracle(
+    input: &[f32],
+    state: &[f32],
+    weight: &[f32],
+    channels: usize,
+    kernel: usize,
+) -> (Vec<f64>, Vec<f64>, Vec<f32>) {
+    let mut state = state.to_vec();
+    let mut expected = Vec::with_capacity(input.len());
+    let mut magnitudes = Vec::with_capacity(input.len());
+    for row in input.chunks_exact(channels) {
+        expected.extend(oracle(row, &state, weight, channels, kernel));
+        magnitudes.extend(magnitude(row, &state, weight, channels, kernel));
+        for channel in 0..channels {
+            let base = channel * (kernel - 1);
+            state.copy_within(base + 1..base + kernel - 1, base);
+            state[base + kernel - 2] = row[channel];
+        }
+    }
+    (expected, magnitudes, state)
+}
+
+#[test]
+fn prefill_matches_f64_oracle() {
+    let stream = common::stream();
+    common::runner(64, file!())
+        .run(
+            &(
+                prop::sample::select(vec![32usize, 64, 96]),
+                prop::sample::select(vec![2usize, 3, 4, 7]),
+                prop::sample::select(vec![1usize, 2, 5, 9]),
+                prop::sample::select(vec![1usize, 4, 16]),
+            )
+                .prop_flat_map(|(channels, kernel, steps, tile)| {
+                    (
+                        Just((channels, kernel, steps, tile)),
+                        strategy::values(steps * channels),
+                        strategy::values(channels * (kernel - 1)),
+                        strategy::values(channels * kernel),
+                    )
+                }),
+            |((channels, kernel, _steps, tile), input, state, weight)| {
+                let (got, updated) =
+                    gpu_prefill(&stream, &input, &state, &weight, channels, kernel, tile)
+                        .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let (expected, magnitudes, expected_state) =
+                    sequence_oracle(&input, &state, &weight, channels, kernel);
+                prop_assert!(got.iter().all(|x| x.is_finite()));
+                prop_assert!(
+                    check::activated_inner_product_excess(
+                        &got,
+                        &expected,
+                        &magnitudes,
+                        kernel,
+                        SILU_MAX_SLOPE,
+                    ) <= 1.0
+                );
+                prop_assert_eq!(updated, expected_state);
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn prefill_matches_repeated_decode() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    for (channels, kernel, steps, tile) in
+        [(32, 4, 1, 4), (64, 7, 2, 16), (96, 4, 9, 1), (32, 2, 13, 4)]
+    {
+        let input: Vec<f32> = (0..steps * channels)
+            .map(|i| ((i * 17 % 37) as f32 - 18.0) / 11.0)
+            .collect();
+        let state: Vec<f32> = (0..channels * (kernel - 1))
+            .map(|i| ((i * 7 % 23) as f32 - 11.0) / 13.0)
+            .collect();
+        let weight: Vec<f32> = (0..channels * kernel)
+            .map(|i| ((i * 13 % 29) as f32 - 14.0) / 17.0)
+            .collect();
+        let (prefill, final_state) =
+            gpu_prefill(&stream, &input, &state, &weight, channels, kernel, tile)?;
+        let mut decode = Vec::with_capacity(input.len());
+        let mut decode_state = state.clone();
+        for row in input.chunks_exact(channels) {
+            let (output, next) = gpu_step(&stream, row, &decode_state, &weight, kernel, tile)?;
+            decode.extend(output);
+            decode_state = next;
+        }
+        let (_, magnitudes, _) = sequence_oracle(&input, &state, &weight, channels, kernel);
+        let decode_f64: Vec<f64> = decode.iter().map(|&x| x as f64).collect();
+        let excess = check::activated_inner_product_excess(
+            &prefill,
+            &decode_f64,
+            &magnitudes.iter().map(|x| x * 2.0).collect::<Vec<_>>(),
+            kernel,
+            SILU_MAX_SLOPE,
+        );
+        assert!(excess <= 1.0, "prefill/decode excess={excess}");
+        assert_eq!(final_state, decode_state);
+    }
+    Ok(())
+}
+
+#[test]
+fn prefill_detects_ignored_previous_state() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let (channels, kernel, steps) = (32, 4, 2);
+    let input = vec![0.25; channels * steps];
+    let state = vec![0.5; channels * (kernel - 1)];
+    let weight = vec![0.75; channels * kernel];
+    let (correct, _) = gpu_prefill(&stream, &input, &state, &weight, channels, kernel, 4)?;
+    let (ignored, _) = gpu_prefill(
+        &stream,
+        &input,
+        &vec![0.0; state.len()],
+        &weight,
+        channels,
+        kernel,
+        4,
+    )?;
+    let (expected, magnitudes, _) = sequence_oracle(&input, &state, &weight, channels, kernel);
+    assert!(
+        check::activated_inner_product_excess(
+            &correct,
+            &expected,
+            &magnitudes,
+            kernel,
+            SILU_MAX_SLOPE,
+        ) <= 1.0
+    );
+    assert!(
+        check::activated_inner_product_excess(
+            &ignored,
+            &expected,
+            &magnitudes,
+            kernel,
+            SILU_MAX_SLOPE,
+        ) > 1.0
+    );
+    Ok(())
 }
 
 #[test]

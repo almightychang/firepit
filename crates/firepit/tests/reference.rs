@@ -8,7 +8,7 @@ use firepit_kernels::attention::{
     AttentionDims, DEFAULT_PREFILL_TILE, cache_append, cache_append_prefill,
     causal_attention_prefill, online_attention, output_gate,
 };
-use firepit_kernels::gdn::{GdnDims, conv1d_silu, delta_step, gated_silu};
+use firepit_kernels::gdn::{GdnDims, conv1d_silu, conv1d_silu_prefill, delta_step, gated_silu};
 use firepit_kernels::gemm::{DEFAULT_GEMM_TILE, gemm};
 use firepit_kernels::gemv::expert_gemv;
 use firepit_kernels::gemv::gemv;
@@ -105,6 +105,109 @@ fn gdn_dims(model_dir: &std::path::Path) -> Result<GdnDims, Box<dyn std::error::
             .as_f64()
             .ok_or("missing rms_norm_eps")? as f32,
     )?)
+}
+
+#[test]
+#[ignore = "needs Qwen3.6 weights and regenerated 150-token prefill reference"]
+fn gdn_conv_prefill_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
+    let model_dir = home("Models/qwen3.6-35b-a3b");
+    let dims = gdn_dims(&model_dir)?;
+    let weights = Checkpoint::open(&model_dir)?;
+    let refs = SafetensorsFile::open(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../refs/qwen36-prefix4-prefill.safetensors"),
+    )?;
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let channels = dims.conv_dim();
+    let kernel = dims.conv_kernel();
+    let sm_count = cuda_core::simt::CudaContext::new(device.ordinal())?.multiprocessor_count()?;
+    let tile = firepit_kernels::tile::channel_tile(channels, sm_count as usize, 1);
+    let mut worst = 0.0f64;
+    for layer in 0..3 {
+        let prefix = format!("layer{layer}/gdn");
+        let input = refs.tensor(&format!("{prefix}/qkv"))?;
+        let t = input.shape[0];
+        assert_eq!(input.shape, [t, channels]);
+        let weight = weights.tensor(&format!(
+            "model.language_model.layers.{layer}.linear_attn.conv1d.weight"
+        ))?;
+        assert_eq!(weight.shape, [channels, 1, kernel]);
+        let x = api::copy_host_vec_to_device(&Arc::new(input.data.clone()))
+            .reshape(&[t, channels])
+            .sync_on(&stream)?;
+        let w = api::copy_host_vec_to_device(&Arc::new(weight.data.clone()))
+            .reshape(&[channels, kernel])
+            .sync_on(&stream)?;
+        let mut state = api::zeros::<f32>(&[1, channels, kernel - 1]).sync_on(&stream)?;
+        let mut output = api::zeros::<f32>(&[t, channels]).sync_on(&stream)?;
+        conv1d_silu_prefill(
+            (&mut output).partition([t.next_power_of_two(), tile]),
+            &x,
+            state.partition([1, tile, kernel.next_power_of_two()]),
+            &w,
+            kernel as i32,
+        )
+        .generics({
+            let mut generics = vec![t.next_power_of_two().to_string()];
+            generics.extend(dims.conv_generics(tile));
+            generics
+        })
+        .sync_on(&stream)?;
+        let actual: Vec<f32> = output.to_host_vec().sync_on(&stream)?;
+        let mut expected = vec![0.0; t * channels];
+        for (part, start, width) in [
+            ("q", 0, dims.key_dim()),
+            ("k", dims.key_dim(), dims.key_dim()),
+            ("v", 2 * dims.key_dim(), dims.value_dim()),
+        ] {
+            let values = refs.tensor(&format!("{prefix}/{part}"))?;
+            assert_eq!(values.shape, [t, width]);
+            for row in 0..t {
+                expected[row * channels + start..row * channels + start + width]
+                    .copy_from_slice(&values.data[row * width..(row + 1) * width]);
+            }
+        }
+        let mut previous = vec![0.0f32; channels * (kernel - 1)];
+        let mut magnitudes = Vec::with_capacity(actual.len());
+        for row in input.data.chunks_exact(channels) {
+            for channel in 0..channels {
+                let state_row = channel * (kernel - 1);
+                let taps = channel * kernel;
+                let magnitude: f64 = (0..kernel - 1)
+                    .map(|slot| {
+                        (previous[state_row + slot] as f64 * weight.data[taps + slot] as f64).abs()
+                    })
+                    .sum::<f64>()
+                    + (row[channel] as f64 * weight.data[taps + kernel - 1] as f64).abs();
+                magnitudes.push(magnitude);
+                previous.copy_within(state_row + 1..state_row + kernel - 1, state_row);
+                previous[state_row + kernel - 2] = row[channel];
+            }
+        }
+        let expected_f64: Vec<f64> = expected.iter().map(|&x| x as f64).collect();
+        let excess = check::activated_inner_product_excess(
+            &actual,
+            &expected_f64,
+            &magnitudes.iter().map(|x| x * 2.0).collect::<Vec<_>>(),
+            kernel,
+            1.1,
+        );
+        worst = worst.max(excess);
+        assert!(excess <= 1.0, "layer{layer} conv excess={excess}");
+        let final_state = state.to_host_vec().sync_on(&stream)?;
+        assert_eq!(final_state, previous);
+        let hf_state = refs.tensor(&format!("{prefix}/conv_state"))?;
+        assert_eq!(hf_state.shape, [channels, kernel]);
+        for channel in 0..channels {
+            assert_eq!(
+                &final_state[channel * (kernel - 1)..(channel + 1) * (kernel - 1)],
+                &hf_state.data[channel * kernel + 1..(channel + 1) * kernel]
+            );
+        }
+    }
+    println!("GDN conv prefill HF worst_excess={worst:.6}");
+    Ok(())
 }
 
 #[test]
