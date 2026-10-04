@@ -44,7 +44,8 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
     ○ GDN delta rule value 열 타일: 현재 32열을 장치와 head 차원에 맞춰 선택
     ○ GEMV 행 타일(BN): DEFAULT_GEMV_TILE 고정값 → row_tile 같은 SM 채우기 규칙
     ○ 행이 적은 행렬(MoE expert 등)이 SM을 못 채우면 split-K
-    ○ MoE grouped GEMM은 현재 모든 expert에 BM=16을 쓰고 expert별 마지막 타일을 패딩한다. expert 행 수에 따라 BM=64/16 등으로 달리 골라 패딩과 CTA 수를 함께 줄이고, 행별 gather의 register spill을 줄인다.
+    ○ MoE grouped GEMM의 BM=32 기본값은 5080 T=5000 실험에서 BM=16보다 빠른 선택이다. expert별 행 수와 GPU에 맞춰 BM을 고르면 패딩과 CTA 수를 함께 줄일 수 있다.
+    ○ MoE grouped GEMM의 X를 N block마다 다시 읽는 비용(게이트/업은 BN=128에서 8번)을 BN 확대나 한 block의 여러 N 타일로 줄이는 방안, cuTile gather load를 이용해 gather와 GEMM을 합치는 방안을 검토한다.
     ○ GEMV 열 타일(NB): batch·레지스터 압박에 따라 autotune 또는 규칙
     ○ TARGET_BLOCKS_PER_SM, MIN_ROW_TILE, MAX_BATCH_SESSIONS 근거 재검토
     ○ GDN prefill chunk 크기와 역행렬 대각 block 크기(현재 64/16)를 장치와 모델 형상에 따라 선택
@@ -98,7 +99,7 @@ E7 성능 단계에서 GEMM의 M·N·K와 GPU 특성에 따라 타일 크기를 
 E3.2 attention의 현재 기본 BM×BN은 16×32이다. RTX 5080의 head_dim 256 release cubin에서 255 registers/thread, 1008-byte stack/thread와 `STL` spill을 확인했다. 타일 자동 선택과 spill 저감은 E7에서 다룬다.
 E3.3 conv prefill은 채널 타일별 block이 시간축을 순차 처리한다. f64 oracle, decode 반복, HF 150토큰 비교에서 출력과 마지막 state가 일치했다. 같은 GPU에서 다른 실험을 병행해 성능은 측정하지 않았다.
 E3.5는 value head와 state 열 타일별 block이 chunk를 순서대로 처리한다. 현재 열 타일은 `row_tile`을 이용해 SM 수와 head 수에서 선택한다. RTX 5080 모델 형상에서 32열이며 release cubin은 255 registers/thread, 2368-byte stack/thread와 `STL` spill이 있다. 타일·spill 개선은 E7에서 한다.
-E3.6은 RTX 5080 T=5000에서 expert별 1264행을 패딩했다. grouped GEMM release cubin은 255 registers/thread, 2240-byte stack/thread와 `STL`/`LDL` spill이 있어 E7에서 gather 방식과 BM 선택을 함께 다룬다.
+E3.6의 행별 조립 커널은 RTX 5080 T=5000에서 255 registers/thread, 2240-byte stack/thread와 `STL`/`LDL` spill이 있었다. 분리형 실험에서 gather와 BM=32·BN=128·BK=32를 적용하자 같은 5080에서 gate/up 총시간이 36.38→6.27 ms, down이 13.56→2.72 ms로 줄었다. GB10의 [엔진 prefill 측정](research/measurements/gemm-peak-gb10.md)에서도 기존 grouped GEMM이 T=5000 시간의 57%를 차지했다. BM=32를 기본값으로 쓰되 GB10에서 패딩과 점유율을 재확인하고, 장치별 타일 선택은 E7에서 다룬다.
 
 ## 정답지 만들기 (2.0)
 

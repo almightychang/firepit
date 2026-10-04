@@ -11,7 +11,7 @@ use cutile::tensor::{IntoPartition, PartitionMut, Reshape, Tensor};
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit_kernels::attention::DEFAULT_PREFILL_TILE;
 use firepit_kernels::gemm::{
-    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, GroupInput, gemm, grouped_gemm,
+    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, gemm, grouped_gemm,
 };
 use firepit_kernels::gemv::gemv;
 use firepit_kernels::moe::PrefillPlan as MoePrefillPlan;
@@ -88,6 +88,7 @@ pub enum PrefillOp {
     CausalAttention { layer: usize },
     TopK,
     HostSort,
+    Gather,
     ExpertGateUp { layer: usize },
     ExpertDown { layer: usize },
     Combine,
@@ -113,6 +114,7 @@ impl PrefillOp {
             Self::CausalAttention { .. } => "causal_attention",
             Self::TopK => "moe_top_k",
             Self::HostSort => "moe_host_sort",
+            Self::Gather => "moe_gather",
             Self::ExpertGateUp { .. } | Self::ExpertDown { .. } => "moe_grouped_gemm",
             Self::Combine => "moe_combine",
         }
@@ -168,6 +170,7 @@ pub struct PrefillPlan {
     conv_spare: Option<Tensor<f32>>,
     recurrent_spare: Option<Tensor<f32>>,
     moe: Option<MoePrefillPlan>,
+    moe_sorted: Option<Tensor<f32>>,
     top_ids: Tensor<i32>,
     top_weights: Tensor<f32>,
     len: usize,
@@ -208,6 +211,7 @@ impl PrefillPlan {
                 Op::TopK { .. } => {
                     ops.push(PrefillOp::TopK);
                     ops.push(PrefillOp::HostSort);
+                    ops.push(PrefillOp::Gather);
                 }
                 Op::ExpertGateUp { layer } => ops.push(PrefillOp::ExpertGateUp { layer }),
                 Op::ExpertDown { layer } => ops.push(PrefillOp::ExpertDown { layer }),
@@ -266,6 +270,7 @@ impl PrefillPlan {
             conv_spare,
             recurrent_spare,
             moe: None,
+            moe_sorted: None,
             top_ids,
             top_weights,
             len,
@@ -838,20 +843,31 @@ fn run_special(
                 };
                 plan.buffers[slot.index()] = api::zeros::<f32>(&[count, width]).sync_on(stream)?;
             }
+            plan.moe_sorted = Some(api::zeros::<f32>(&[count, d.hidden()]).sync_on(stream)?);
             plan.moe = Some(layout);
+        }
+        PrefillOp::Gather => {
+            let layout = plan.moe.as_ref().ok_or("missing MoE layout")?;
+            let x = plan.buffers[Slot::Normed.index()].slice(&[0..len, 0..d.hidden()])?;
+            let sorted = plan.moe_sorted.as_mut().ok_or("missing sorted MoE input")?;
+            sink.run(moe::gather_prefill(
+                sorted.partition([1, DEFAULT_GROUPED_GEMM_TILE.k]),
+                &x,
+                layout,
+                DEFAULT_GROUPED_GEMM_TILE.k,
+            ))?;
         }
         PrefillOp::ExpertGateUp { layer } => {
             let layout = plan.moe.as_ref().ok_or("missing MoE layout")?;
-            let (source, target) = input_output(&mut plan.buffers, Slot::Normed, Slot::ExpertUp);
-            let x = source.slice(&[0..len, 0..d.hidden()])?;
+            let x = plan.moe_sorted.as_ref().ok_or("missing sorted MoE input")?;
+            let target = &mut plan.buffers[Slot::ExpertUp.index()];
             let tile = gemm_tile(d.hidden(), 2 * m.intermediate(), true);
             grouped_gemm(
                 &model.layers[layer].moe.gate_up,
-                &x,
+                &x.view(&[layout.layout().padded_rows(), d.hidden()])?,
                 target.partition([tile.m, tile.n]),
                 layout,
                 2 * m.intermediate(),
-                GroupInput::Tokens,
                 tile,
             )
             .submit(sink)?;
@@ -868,7 +884,6 @@ fn run_special(
                 target.partition([tile.m, tile.n]),
                 layout,
                 d.hidden(),
-                GroupInput::Padded,
                 tile,
             )
             .submit(sink)?;

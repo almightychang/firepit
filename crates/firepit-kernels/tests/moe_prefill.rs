@@ -6,11 +6,11 @@ use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
-use firepit_kernels::gemm::{GemmTile, GroupInput, gemm, grouped_gemm};
+use firepit_kernels::gemm::{GemmTile, gemm, grouped_gemm};
 use firepit_kernels::gemv::{GemvTile, expert_gemv, gemv};
 use firepit_kernels::moe::{
     ExpertSelection, MoeDims, PrefillLayout, PrefillPlan, combine, combine_prefill,
-    combine_prefill_view,
+    combine_prefill_view, gather_prefill,
 };
 use firepit_kernels::sink::Eager;
 use firepit_kernels::weights::{DenseMatrix, Weight};
@@ -37,14 +37,21 @@ fn padded_expert_gemm_smoke() -> Result<(), Box<dyn std::error::Error>> {
         .sync_on(&stream)?;
     let gate_up = DenseMatrix::upload(vec![bf16::from_f32(1.0); 2 * 64 * 32], 2 * 64, 32, &stream)?;
     let down = DenseMatrix::upload(vec![bf16::from_f32(1.0); 2 * 32 * 32], 2 * 32, 32, &stream)?;
+    let mut sorted = api::zeros::<f32>(&[32, 32]).sync_on(&stream)?;
+    gather_prefill(
+        sorted.partition([1, tile.k]),
+        &x.view(&[2, 32])?,
+        &plan,
+        tile.k,
+    )
+    .sync_on(&stream)?;
     let mut projected = api::zeros::<f32>(&[32, 64]).sync_on(&stream)?;
     grouped_gemm(
         &gate_up,
-        &x.view(&[2, 32])?,
+        &sorted.view(&[32, 32])?,
         projected.partition([16, 32]),
         &plan,
         64,
-        GroupInput::Tokens,
         tile,
     )
     .submit(&mut Eager(&stream))?;
@@ -62,7 +69,6 @@ fn padded_expert_gemm_smoke() -> Result<(), Box<dyn std::error::Error>> {
         routed.partition([16, 32]),
         &plan,
         32,
-        GroupInput::Padded,
         tile,
     )
     .submit(&mut Eager(&stream))?;
@@ -162,14 +168,21 @@ fn prefill_matches_tokenwise_decode() -> Result<(), Box<dyn std::error::Error>> 
         .reshape(&[tokens, hidden])
         .sync_on(&stream)?;
     let rows = plan.layout().padded_rows();
+    let mut sorted = api::zeros::<f32>(&[rows, hidden]).sync_on(&stream)?;
+    gather_prefill(
+        sorted.partition([1, tile.k]),
+        &exact_x.view(&[tokens, hidden])?,
+        &plan,
+        tile.k,
+    )
+    .sync_on(&stream)?;
     let mut projected = api::zeros::<f32>(&[rows, 2 * intermediate]).sync_on(&stream)?;
     grouped_gemm(
         &expert_gate,
-        &exact_x.view(&[tokens, hidden])?,
+        &sorted.view(&[rows, hidden])?,
         projected.partition([tile.m, tile.n]),
         &plan,
         2 * intermediate,
-        GroupInput::Tokens,
         tile,
     )
     .submit(&mut Eager(&stream))?;
@@ -184,7 +197,6 @@ fn prefill_matches_tokenwise_decode() -> Result<(), Box<dyn std::error::Error>> 
         routed.partition([tile.m, tile.n]),
         &plan,
         hidden,
-        GroupInput::Padded,
         tile,
     )
     .submit(&mut Eager(&stream))?;
@@ -413,6 +425,66 @@ fn layout_oracle_pbt() {
 }
 
 #[test]
+fn gather_prefill_oracle_pbt() {
+    let stream = common::stream();
+    let cases = (
+        1usize..=17,
+        1usize..=4,
+        any::<bool>(),
+        prop::sample::select(vec![16usize, 32]),
+    )
+        .prop_flat_map(|(tokens, k, skew, tile_rows)| {
+            (
+                Just((tokens, k, skew, tile_rows)),
+                strategy::values(tokens * 32),
+            )
+        });
+    common::runner(64, file!())
+        .run(&cases, |((tokens, k, skew, tile_rows), input)| {
+            let fail = |e: Box<dyn std::error::Error>| TestCaseError::fail(e.to_string());
+            let dims =
+                MoeDims::new(32, 32, 32, 4, k).map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let ids: Vec<i32> = (0..tokens)
+                .flat_map(|token| {
+                    (0..k).map(move |slot| ((if skew { 0 } else { token }) + slot) as i32 % 4)
+                })
+                .collect();
+            let plan = PrefillPlan::parse(&ids, &vec![1.0; ids.len()], &dims, tile_rows, &stream)
+                .map_err(fail)?;
+            let x = api::copy_host_vec_to_device(&Arc::new(input.clone()))
+                .reshape(&[tokens, 32])
+                .sync_on(&stream)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let mut sorted = api::zeros::<f32>(&[plan.layout().padded_rows(), 32])
+                .sync_on(&stream)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            gather_prefill(
+                sorted.partition([1, 32]),
+                &x.view(&[tokens, 32])
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?,
+                &plan,
+                32,
+            )
+            .sync_on(&stream)
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let actual: Vec<f32> = sorted
+                .to_host_vec()
+                .sync_on(&stream)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            for (row, &token) in plan.layout().token_rows().iter().enumerate() {
+                let expected = if token < 0 {
+                    vec![0.0; 32]
+                } else {
+                    input[token as usize * 32..(token as usize + 1) * 32].to_vec()
+                };
+                prop_assert_eq!(&actual[row * 32..(row + 1) * 32], &expected);
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn top_k_prefill_matches_decode() -> Result<(), Box<dyn std::error::Error>> {
     let stream = common::stream();
     let dims = MoeDims::new(32, 32, 32, 5, 3)?;
@@ -495,18 +567,30 @@ fn grouped_gemm_and_combine_oracle_pbt() {
                 let down_weight = DenseMatrix::upload(down_values, 4 * 32, 32, &stream)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 let padded = plan.layout().padded_rows();
+                let mut sorted = api::zeros::<f32>(&[padded, 32])
+                    .sync_on(&stream)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                gather_prefill(
+                    sorted.partition([1, tile.k]),
+                    &x_gpu
+                        .view(&[tokens, 32])
+                        .map_err(|e| TestCaseError::fail(e.to_string()))?,
+                    &plan,
+                    tile.k,
+                )
+                .sync_on(&stream)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 let mut projected = api::zeros::<f32>(&[padded, 64])
                     .sync_on(&stream)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 grouped_gemm(
                     &gate_weight,
-                    &x_gpu
-                        .view(&[tokens, 32])
+                    &sorted
+                        .view(&[padded, 32])
                         .map_err(|e| TestCaseError::fail(e.to_string()))?,
                     projected.partition([16, 32]),
                     &plan,
                     64,
-                    GroupInput::Tokens,
                     tile,
                 )
                 .submit(&mut Eager(&stream))
@@ -564,7 +648,6 @@ fn grouped_gemm_and_combine_oracle_pbt() {
                     routed.partition([16, 32]),
                     &plan,
                     32,
-                    GroupInput::Padded,
                     tile,
                 )
                 .submit(&mut Eager(&stream))

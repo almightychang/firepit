@@ -14,13 +14,14 @@ use firepit_kernels::gdn_chunk::{
     second_phase_value_tile,
 };
 use firepit_kernels::gemm::{
-    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, GroupInput, gemm, grouped_gemm,
+    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, gemm, grouped_gemm,
 };
 use firepit_kernels::gemv::expert_gemv;
 use firepit_kernels::gemv::gemv;
 use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile};
 use firepit_kernels::moe::{
     ExpertSelection, MoeDims, PrefillPlan, combine, combine_prefill, combine_prefill_view,
+    gather_prefill,
 };
 use firepit_kernels::norm::rms_norm;
 use firepit_kernels::rope::{RopeDims, frequencies, generics as rope_generics, rope};
@@ -1630,14 +1631,21 @@ fn routed_prefill(
 ) -> Result<Tensor<f32>, Box<dyn std::error::Error>> {
     let rows = plan.layout().padded_rows();
     let tile = DEFAULT_GROUPED_GEMM_TILE;
+    let mut sorted = api::zeros::<f32>(&[rows, dims.hidden()]).sync_on(stream)?;
+    gather_prefill(
+        sorted.partition([1, tile.k]),
+        &x.view(&[plan.layout().tokens(), dims.hidden()])?,
+        plan,
+        tile.k,
+    )
+    .sync_on(stream)?;
     let mut projected = api::zeros::<f32>(&[rows, 2 * dims.intermediate()]).sync_on(stream)?;
     grouped_gemm(
         gate_up,
-        &x.view(&[plan.layout().tokens(), dims.hidden()])?,
+        &sorted.view(&[rows, dims.hidden()])?,
         projected.partition([tile.m, tile.n]),
         plan,
         2 * dims.intermediate(),
-        GroupInput::Tokens,
         tile,
     )
     .submit(&mut Eager(stream))?;
@@ -1652,7 +1660,6 @@ fn routed_prefill(
         routed.partition([tile.m, tile.n]),
         plan,
         dims.hidden(),
-        GroupInput::Padded,
         tile,
     )
     .submit(&mut Eager(stream))?;

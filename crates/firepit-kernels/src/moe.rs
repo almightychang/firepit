@@ -59,6 +59,27 @@ mod kernels {
     }
 
     #[cutile::entry()]
+    pub fn gather_prefill_kernel<const BK: i32, const K: i32>(
+        sorted: &mut Tensor<f32, { [1, BK] }>,
+        x: &Tensor<f32, { [-1, K] }>,
+        token_rows: &Tensor<i32, { [-1] }>,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let token: i32 = tile_to_scalar(
+            token_rows
+                .partition(shape![1])
+                .load([pid.0])
+                .reshape(shape![]),
+        );
+        let value: Tile<f32, { [1, BK] }> = if token >= 0i32 {
+            x.partition(shape![1, BK]).load([token, pid.1])
+        } else {
+            constant(0.0f32, shape![1, BK])
+        };
+        sorted.store(value);
+    }
+
+    #[cutile::entry()]
     pub fn combine_prefill_kernel<const H: i32>(
         out: &mut Tensor<f32, { [1, H] }>,
         routed: &Tensor<f32, { [-1, H] }>,
@@ -576,15 +597,43 @@ impl PrefillPlan {
     pub fn weights(&self) -> &Tensor<f32> {
         &self.weights
     }
-    pub(crate) fn token_rows(&self) -> &Tensor<i32> {
-        &self.token_rows
-    }
     pub(crate) fn tile_experts(&self) -> &Tensor<i32> {
         &self.tile_experts
     }
     pub(crate) fn dims(&self) -> MoeDims {
         self.dims
     }
+}
+
+pub fn gather_prefill<'a>(
+    sorted: Partition<&'a mut Tensor<f32>>,
+    x: &'a TensorView<'a, f32>,
+    plan: &'a PrefillPlan,
+    tile_cols: usize,
+) -> impl DeviceOp<
+    Output = (
+        Partition<&'a mut Tensor<f32>>,
+        &'a TensorView<'a, f32>,
+        &'a Tensor<i32>,
+    ),
+> + GraphNode
++ 'a {
+    assert_eq!(sorted.partition_shape, vec![1, tile_cols]);
+    assert_eq!(
+        x.shape(),
+        &[plan.layout.tokens as i32, plan.dims.hidden as i32]
+    );
+    assert_eq!(
+        sorted.grid().expect("valid output grid"),
+        (
+            plan.layout.padded_rows() as u32,
+            (plan.dims.hidden / tile_cols) as u32,
+            1,
+        )
+    );
+    assert_eq!(plan.dims.hidden % tile_cols, 0);
+    kernels::gather_prefill_kernel(sorted, x, &plan.token_rows)
+        .generics(vec![tile_cols.to_string(), plan.dims.hidden.to_string()])
 }
 
 pub fn combine_prefill<'a>(

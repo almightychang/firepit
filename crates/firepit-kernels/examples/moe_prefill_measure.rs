@@ -4,10 +4,10 @@ use cutile::api::{self, DeviceOpReshape};
 use cutile::bench::{BenchOptions, do_bench};
 use cutile::tensor::PartitionMut;
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
-use firepit_kernels::gemm::{
-    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GroupInput, gemm, grouped_gemm,
+use firepit_kernels::gemm::{DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, gemm, grouped_gemm};
+use firepit_kernels::moe::{
+    MoeDims, PrefillLayout, PrefillPlan, combine_prefill, gather_prefill, top_k_prefill,
 };
-use firepit_kernels::moe::{MoeDims, PrefillLayout, PrefillPlan, combine_prefill, top_k_prefill};
 use firepit_kernels::sink::Eager;
 use firepit_kernels::weights::DenseMatrix;
 use half::bf16;
@@ -110,15 +110,27 @@ fn measure(stream: &Arc<Stream>, dims: MoeDims, tokens: usize) -> Result<(), Box
     let sort_ms = sort_times[sort_times.len() / 2];
     let plan = PrefillPlan::parse(&flat_ids, &flat_scores, &dims, tile.m, stream)?;
     let rows = plan.layout().padded_rows();
+    let mut sorted = api::zeros::<f32>(&[rows, h]).sync_on(stream)?;
+    let gather_ms = do_bench(stream, &BenchOptions::default(), |stream| {
+        gather_prefill(
+            sorted.partition([1, tile.k]),
+            &x.slice(&[0..tokens, 0..h])?,
+            &plan,
+            tile.k,
+        )
+        .sync_on(stream)
+        .map(|_| ())
+        .map_err(Into::into)
+    })?
+    .median_ms();
     let mut projected = api::zeros::<f32>(&[rows, 2 * i]).sync_on(stream)?;
     let gate_up_ms = do_bench(stream, &BenchOptions::default(), |stream| {
         grouped_gemm(
             &gate_up,
-            &x.slice(&[0..tokens, 0..h])?,
+            &sorted.view(&[rows, h])?,
             projected.partition([tile.m, tile.n]),
             &plan,
             2 * i,
-            GroupInput::Tokens,
             tile,
         )
         .submit(&mut Eager(stream))
@@ -142,7 +154,6 @@ fn measure(stream: &Arc<Stream>, dims: MoeDims, tokens: usize) -> Result<(), Box
             routed.partition([tile.m, tile.n]),
             &plan,
             h,
-            GroupInput::Padded,
             tile,
         )
         .submit(&mut Eager(stream))
@@ -160,7 +171,7 @@ fn measure(stream: &Arc<Stream>, dims: MoeDims, tokens: usize) -> Result<(), Box
     })?
     .median_ms();
     println!(
-        "T={tokens} padded_rows={rows} wasted_rows={} router_ms={router_ms:.6} top_k_ms={top_ms:.6} host_sort_ms={sort_ms:.6} gate_up_ms={gate_up_ms:.6} swiglu_ms={activation_ms:.6} down_ms={down_ms:.6} combine_ms={combine_ms:.6}",
+        "T={tokens} padded_rows={rows} wasted_rows={} router_ms={router_ms:.6} top_k_ms={top_ms:.6} host_sort_ms={sort_ms:.6} gather_ms={gather_ms:.6} gate_up_ms={gate_up_ms:.6} swiglu_ms={activation_ms:.6} down_ms={down_ms:.6} combine_ms={combine_ms:.6}",
         plan.layout().padding_rows()
     );
     Ok(())
