@@ -117,3 +117,17 @@ Hv 32, d_k = d_v = 128, chunk 64. GB10 열 타일 64(block 64개), 5080 32. 단�
 
 - 2단계는 chunk 순서대로라 block이 64개뿐이고 레지스터 255개·stack 2368 B로 spill이 있다. 5000토큰 GDN 30층 합계 약 0.63초(GB10).
 - 개선 방향(E7): 열 타일을 줄여 block 수 늘리기, spill 줄이기.
+
+## 엔진 prefill 전체 (E3.7, `382167d`, release)
+
+GB10 pod, 전체 Qwen3.6-35B-A3B bf16, `examples/bench --prefill-lengths`. 길이마다 한 번 실행해 JIT를 준비한 뒤 두 번째 호출의 wall time.
+
+| T | wall time | 토큰/초 |
+|---:|---:|---:|
+| 512 | 0.84 s | 610 |
+| 2048 | 3.19 s | 642 |
+| 5000 | 8.70 s | 574 |
+
+- decode 경로로 5071토큰 prompt를 처리한 215 s 대비 약 25배. E3 목표(5000토큰 5 s 이내)에는 못 미친다.
+- `generate`로 prefill 후 decode를 이어 생성한 토큰 열은 decode 경로만 쓴 이전 실행과 같았다("The capital of France is" 32토큰, 5071토큰 prompt 2토큰).
+- op 종류별 분해는 계측 설계 뒤에 잰다. 부품 측정으로 추정한 합(GEMM 약 2 s, attention 0.6 s, conv 0.07 s, GDN chunk 0.63 s)에 MoE가 더해진 값으로 보이며, MoE grouped GEMM이 남은 차이의 주된 후보다(추정).
