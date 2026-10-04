@@ -148,3 +148,20 @@ GB10, 전체 모델, JIT 준비 뒤 두 번째 호출. wall 8.72 s, launch별 GP
 
 - MoE grouped GEMM: 실제 행 40000(5000×8), H=2048, I=512, 40층 → 약 10.1 TFLOP ÷ 4.86 s ≈ 2.1 TFLOPS. 같은 기기 split GEMM(9~19 TFLOPS)의 1/5~1/9. 5080에서 확인한 레지스터 spill(스레드당 2240 B)과 행 단위 gather가 후보 원인이다.
 - grouped GEMM이 split GEMM 수준(약 13 TFLOPS)에 오면 약 0.8 s → 전체 약 4.6 s(추정).
+
+## MoE grouped GEMM 원인 분리 실험 (T=5000, 실제 행 40000, 커널만 do_bench)
+
+현행(V0)은 K 단계마다 BM개 행을 한 행씩 load하고 행마다 `[BM,BK]` 전체에 `select`해서 타일을 조립한다. V1/2는 별도 gather 커널로 정렬·패딩 순서의 X를 먼저 만들고 GEMM은 `[BM,BK]` 타일을 한 번에 load한다. V3는 같은 행 수의 dense GEMM(상한 참고). 모든 변형이 f64 oracle 판정을 통과했다. 단위 ms(gate/up은 gather 포함).
+
+| 변형 | BM×BN | 5080 gate/up | 5080 down | GB10 gate/up | GB10 down |
+|---|---|---:|---:|---:|---:|
+| V0 현행 | 16×128 | 36.4 | 13.6 | 89.2 | 33.2 |
+| V1 gather 분리 | 16×128 | 6.9 | 3.3 | 25.5 | 12.8 |
+| V2 | 32×128 | 6.3 | 2.7 | 25.5 | 12.1 |
+| V2 | 64×128 | 6.8 | 3.0 | 28.1 | 13.9 |
+| V3 dense 참고 | 64×128 | 5.8 | 3.2 | 25.1 | 11.5 |
+
+- 원인은 행 단위 타일 조립(H1)이다. spill(스레드당 2240 B → 64 B)도 같이 사라져 둘의 기여는 분리하지 못했다.
+- GB10에서 bulk load 변형은 dense GEMM 상한(V3)과 같은 수준이다. layer당 122 ms → 약 38 ms, 40층 4.9 s → 약 1.5 s. 전체 prefill 추정 8.7 s → 약 5.4 s.
+- X를 bf16 하나로(mma 1번) 바꿔도 GB10에서 1~2%만 빨라졌다. 정확도 손실에 비해 이득이 없다.
+- 한 커널에 `[BM,BN]` 출력과 `[1,BK]` scratch 출력을 함께 두면 `launch grid (1, 8, 1) does not match the inferred partition grid (16, 64, 1)`. gather를 별도 launch로 떼면 해결된다.
