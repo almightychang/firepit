@@ -37,6 +37,23 @@ pub struct SessionStateSnapshot {
     pub values: Vec<f32>,
 }
 
+#[cfg(feature = "testing")]
+#[derive(Default)]
+pub struct RoutingLayerTrace {
+    pub router_logits: Vec<Vec<f32>>,
+    pub selected: Vec<Vec<i32>>,
+    pub hidden: Vec<Vec<f32>>,
+}
+
+#[cfg(feature = "testing")]
+impl RoutingLayerTrace {
+    pub fn append(&mut self, other: Self) {
+        self.router_logits.extend(other.router_logits);
+        self.selected.extend(other.selected);
+        self.hidden.extend(other.hidden);
+    }
+}
+
 struct CachedPlan {
     instances: Vec<u64>,
     plan: StepPlan,
@@ -156,6 +173,29 @@ impl Engine {
                 &mut hidden,
             )?;
             Ok(hidden)
+        })
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn prefill_routing_trace(
+        &mut self,
+        session: &mut Session,
+        tokens: &[u32],
+    ) -> Result<(Vec<f32>, Vec<RoutingLayerTrace>)> {
+        self.prefill_with(session, tokens, |model, plan, session, stream| {
+            prefill::run_routing_observed(model, plan, session, stream)
+        })
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn step_eager_routing_trace(
+        &mut self,
+        session: &mut Session,
+        token: u32,
+    ) -> Result<(Vec<f32>, Vec<RoutingLayerTrace>)> {
+        let batch = self.batch([(session, token)])?;
+        self.step_with(batch, |model, plan, sessions, stream| {
+            crate::execute::run_routing_observed(model, plan, sessions, stream)
         })
     }
 

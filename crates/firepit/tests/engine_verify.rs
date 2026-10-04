@@ -1,5 +1,8 @@
 use cuda_core::Device;
-use firepit::{Engine, LoadOptions, Model, SafetensorsFile, SessionId, VerificationFault};
+use firepit::{
+    Engine, LoadOptions, Model, RoutingLayerTrace, SafetensorsFile, SessionId,
+    SessionStateSnapshot, VerificationFault,
+};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -134,6 +137,174 @@ fn compare_states(
             &b.values,
         );
     }
+    Ok(())
+}
+
+fn relative_l2<'a>(pairs: impl IntoIterator<Item = (&'a f32, &'a f32)>) -> f64 {
+    let (error, norm) = pairs.into_iter().fold((0.0, 0.0), |(error, norm), (a, b)| {
+        let diff = *a as f64 - *b as f64;
+        (error + diff * diff, norm + (*b as f64) * (*b as f64))
+    });
+    error.sqrt() / norm.sqrt().max(f64::MIN_POSITIVE)
+}
+
+fn margin(logits: &[f32], k: usize) -> f32 {
+    assert!(k < logits.len());
+    let ranks = top(logits, k + 1);
+    logits[ranks[k - 1]] - logits[ranks[k]]
+}
+
+fn sorted_ids(ids: &[i32]) -> Vec<i32> {
+    let mut ids = ids.to_vec();
+    ids.sort_unstable();
+    ids
+}
+
+fn print_routing_comparison(
+    label: &str,
+    left: &[RoutingLayerTrace],
+    right: &[RoutingLayerTrace],
+    left_state: &[SessionStateSnapshot],
+    right_state: &[SessionStateSnapshot],
+) {
+    assert_eq!(left.len(), right.len());
+    assert_eq!(left_state.len(), right_state.len());
+    assert_eq!(left_state.len(), 2 * left.len());
+    println!(
+        "{label}: layer | flips | flip_margin_min | flip_margin_max | all_margin_min | state_max_rel_l2 | next_input_rel_l2 | state_parts"
+    );
+    let mut first = None;
+    for (layer, (a, b)) in left.iter().zip(right).enumerate() {
+        assert_eq!(a.router_logits.len(), b.router_logits.len());
+        assert_eq!(a.selected.len(), b.selected.len());
+        assert_eq!(a.hidden.len(), b.hidden.len());
+        assert_eq!(a.router_logits.len(), a.selected.len());
+        assert_eq!(a.router_logits.len(), a.hidden.len());
+        let mut flips = 0;
+        let mut flip_min = f32::INFINITY;
+        let mut flip_max = f32::NEG_INFINITY;
+        let mut all_min = f32::INFINITY;
+        for token in 0..a.selected.len() {
+            assert_eq!(a.router_logits[token].len(), b.router_logits[token].len());
+            assert_eq!(a.selected[token].len(), b.selected[token].len());
+            assert_eq!(a.hidden[token].len(), b.hidden[token].len());
+            let a_margin = margin(&a.router_logits[token], a.selected[token].len());
+            let b_margin = margin(&b.router_logits[token], b.selected[token].len());
+            all_min = all_min.min(a_margin).min(b_margin);
+            if sorted_ids(&a.selected[token]) != sorted_ids(&b.selected[token]) {
+                flips += 1;
+                flip_min = flip_min.min(a_margin).min(b_margin);
+                flip_max = flip_max.max(a_margin).max(b_margin);
+                if first.is_none() {
+                    let router_max_abs = a.router_logits[token]
+                        .iter()
+                        .zip(&b.router_logits[token])
+                        .map(|(x, y)| (x - y).abs())
+                        .fold(0.0f32, f32::max);
+                    first = Some((
+                        layer,
+                        token,
+                        router_max_abs,
+                        a_margin,
+                        b_margin,
+                        sorted_ids(&a.selected[token]),
+                        sorted_ids(&b.selected[token]),
+                    ));
+                }
+            }
+        }
+        let states_a = &left_state[2 * layer..2 * layer + 2];
+        let states_b = &right_state[2 * layer..2 * layer + 2];
+        let state_parts: Vec<_> = states_a
+            .iter()
+            .zip(states_b)
+            .map(|(a, b)| {
+                assert_eq!((a.layer, a.name), (b.layer, b.name));
+                (a.name, relative_l2(a.values.iter().zip(&b.values)))
+            })
+            .collect();
+        let state_rel_l2 = state_parts
+            .iter()
+            .map(|(_, value)| *value)
+            .fold(0.0f64, f64::max);
+        let hidden_rel_l2 = relative_l2(
+            a.hidden
+                .iter()
+                .zip(&b.hidden)
+                .flat_map(|(a, b)| a.iter().zip(b)),
+        );
+        let flip_range = if flips == 0 {
+            "- | -".to_string()
+        } else {
+            format!("{flip_min:.6e} | {flip_max:.6e}")
+        };
+        println!(
+            "{layer:>5} | {flips:>5} | {flip_range} | {all_min:.6e} | {state_rel_l2:.6e} | {hidden_rel_l2:.6e} | {}:{:.6e},{}:{:.6e}",
+            state_parts[0].0, state_parts[0].1, state_parts[1].0, state_parts[1].1,
+        );
+    }
+    if let Some((layer, token, max_abs, left_margin, right_margin, left_ids, right_ids)) = first {
+        println!(
+            "{label} first_flip layer={layer} token={token} router_max_abs={max_abs:.6e} left_margin={left_margin:.6e} right_margin={right_margin:.6e} left_ids={left_ids:?} right_ids={right_ids:?}"
+        );
+    } else {
+        println!("{label} first_flip=none");
+    }
+}
+
+#[test]
+#[ignore = "requires Qwen3.6 checkpoint"]
+fn routing_flip_prefill_vs_step() -> TestResult<()> {
+    let (model, device, tokens) = setup()?;
+    let mut prefill = Engine::new(model.clone(), &device)?;
+    let mut decode = Engine::new(model, &device)?;
+    let mut ps = prefill.new_session(SessionId(1))?;
+    let mut ds = decode.new_session(SessionId(1))?;
+    let (_, prefill_trace) = prefill.prefill_routing_trace(&mut ps, &tokens)?;
+    let mut decode_trace: Vec<RoutingLayerTrace> = Vec::new();
+    for &token in &tokens {
+        let (_, step_trace) = decode.step_eager_routing_trace(&mut ds, token)?;
+        if decode_trace.is_empty() {
+            decode_trace = step_trace;
+        } else {
+            assert_eq!(decode_trace.len(), step_trace.len());
+            for (layer, step) in decode_trace.iter_mut().zip(step_trace) {
+                layer.append(step);
+            }
+        }
+    }
+    print_routing_comparison(
+        "prefill/step",
+        &prefill_trace,
+        &decode_trace,
+        &prefill.state_snapshot(&ps)?,
+        &decode.state_snapshot(&ds)?,
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Qwen3.6 checkpoint"]
+fn routing_flip_append_vs_whole() -> TestResult<()> {
+    let (model, device, tokens) = setup()?;
+    let mut append = Engine::new(model.clone(), &device)?;
+    let mut whole = Engine::new(model, &device)?;
+    let mut asession = append.new_session(SessionId(1))?;
+    let mut wsession = whole.new_session(SessionId(1))?;
+    let (_, mut append_trace) = append.prefill_routing_trace(&mut asession, &tokens[..100])?;
+    let (_, second_trace) = append.prefill_routing_trace(&mut asession, &tokens[100..])?;
+    assert_eq!(append_trace.len(), second_trace.len());
+    for (layer, second) in append_trace.iter_mut().zip(second_trace) {
+        layer.append(second);
+    }
+    let (_, whole_trace) = whole.prefill_routing_trace(&mut wsession, &tokens)?;
+    print_routing_comparison(
+        "append/whole",
+        &append_trace,
+        &whole_trace,
+        &append.state_snapshot(&asession)?,
+        &whole.state_snapshot(&wsession)?,
+    );
     Ok(())
 }
 

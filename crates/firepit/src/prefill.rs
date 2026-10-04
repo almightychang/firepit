@@ -1,5 +1,7 @@
 use crate::Result;
 use crate::checkpoint::Stream;
+#[cfg(feature = "testing")]
+use crate::engine::RoutingLayerTrace;
 use crate::execute::gemv_tile;
 use crate::execute::{input_output, three_inputs_output, two_inputs_output, weight};
 use crate::model::{MixerWeights, Model};
@@ -369,6 +371,70 @@ pub(crate) fn run_observed(
             Ok(())
         },
     )
+}
+
+#[cfg(feature = "testing")]
+pub(crate) fn run_routing_observed(
+    model: &Model,
+    plan: &mut PrefillPlan,
+    session: &mut Session,
+    stream: &Stream,
+) -> Result<Vec<RoutingLayerTrace>> {
+    let mut layers = Vec::<RoutingLayerTrace>::new();
+    let last_row = plan.len - 1;
+    let experts = model.dims.moe().experts();
+    let top_k = model.dims.moe().top_k();
+    let hidden = model.dims.hidden();
+    run_inner(
+        model,
+        plan,
+        session,
+        stream,
+        &mut firepit_kernels::sink::Eager(stream),
+        last_row,
+        |op, plan| {
+            match op {
+                PrefillOp::TopK => {
+                    let logits: Vec<f32> = plan.buffers[Slot::Router.index()]
+                        .dup()
+                        .to_host_vec()
+                        .sync_on(stream)?;
+                    let ids: Vec<i32> = plan.top_ids.dup().to_host_vec().sync_on(stream)?;
+                    let width = top_k.next_power_of_two();
+                    let mut trace = RoutingLayerTrace::default();
+                    trace.router_logits = logits
+                        .chunks_exact(experts)
+                        .take(plan.len)
+                        .map(|row| row.to_vec())
+                        .collect();
+                    trace.selected = ids
+                        .chunks_exact(width)
+                        .take(plan.len)
+                        .map(|row| row[..top_k].to_vec())
+                        .collect();
+                    layers.push(trace);
+                }
+                PrefillOp::Kernel(Op::Add {
+                    delta: Slot::MoeDelta,
+                    out,
+                    ..
+                }) => {
+                    let values: Vec<f32> = plan.buffers[out.index()]
+                        .dup()
+                        .to_host_vec()
+                        .sync_on(stream)?;
+                    layers.last_mut().ok_or("hidden without router")?.hidden = values
+                        .chunks_exact(hidden)
+                        .take(plan.len)
+                        .map(|row| row.to_vec())
+                        .collect();
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    )?;
+    Ok(layers)
 }
 
 fn run_inner(

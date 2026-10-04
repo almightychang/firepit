@@ -13,7 +13,7 @@ pub use checkpoint::{Checkpoint, HostBf16Tensor, HostTensor, SafetensorsFile};
 pub use config::{LayerKind, ModelConfig, ModelDims};
 pub use engine::Engine;
 #[cfg(feature = "testing")]
-pub use engine::{SessionStateSnapshot, VerificationFault};
+pub use engine::{RoutingLayerTrace, SessionStateSnapshot, VerificationFault};
 pub use model::{LoadOptions, Model};
 pub use session::{Batch, LayerState, Session, SessionId};
 

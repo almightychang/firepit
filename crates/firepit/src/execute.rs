@@ -1,9 +1,17 @@
 use crate::Result;
+#[cfg(feature = "testing")]
+use crate::checkpoint::Stream;
+#[cfg(feature = "testing")]
+use crate::engine::RoutingLayerTrace;
 use crate::model::{MixerWeights, Model};
 use crate::plan::{NormName, Op, Slot, StepPlan, WeightName};
 use crate::session::{LayerState, Session};
+#[cfg(feature = "testing")]
+use cuda_async::device_operation::DeviceOp;
 use cutile::tensor::{IntoPartition, PartitionMut, Tensor};
 use cutile::tile_kernel::TileKernel;
+#[cfg(feature = "testing")]
+use cutile::tile_kernel::ToHostVecOp;
 use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile, expert_gemv_view, gemv};
 use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::{Q8_BLOCK, Weight};
@@ -124,6 +132,75 @@ pub(crate) fn run(
     plan: &mut StepPlan,
     sessions: &mut [&mut Session],
     sink: &mut impl Sink,
+) -> Result<()> {
+    run_inner(model, plan, sessions, sink, |_, _| Ok(()))
+}
+
+#[cfg(feature = "testing")]
+pub(crate) fn run_routing_observed(
+    model: &Model,
+    plan: &mut StepPlan,
+    sessions: &mut [&mut Session],
+    stream: &Stream,
+) -> Result<Vec<RoutingLayerTrace>> {
+    if sessions.len() != 1 {
+        return Err("routing observation requires one session".into());
+    }
+    let mut layers = Vec::<RoutingLayerTrace>::new();
+    let experts = model.dims.moe().experts();
+    let top_k = model.dims.moe().top_k();
+    let hidden = model.dims.hidden();
+    run_inner(
+        model,
+        plan,
+        sessions,
+        &mut firepit_kernels::sink::Eager(stream),
+        |op, plan| {
+            match op {
+                Op::TopK { layer } => {
+                    let logits: Vec<f32> = plan.buffers[Slot::Router.index()]
+                        .dup()
+                        .to_host_vec()
+                        .sync_on(stream)?;
+                    let ids: Vec<i32> = plan.selections[layer][0]
+                        .indices()
+                        .dup()
+                        .to_host_vec()
+                        .sync_on(stream)?;
+                    let mut trace = RoutingLayerTrace::default();
+                    trace.router_logits.push(logits[..experts].to_vec());
+                    trace.selected.push(ids[..top_k].to_vec());
+                    layers.push(trace);
+                }
+                Op::Add {
+                    delta: Slot::MoeDelta,
+                    out,
+                    ..
+                } => {
+                    let values: Vec<f32> = plan.buffers[out.index()]
+                        .dup()
+                        .to_host_vec()
+                        .sync_on(stream)?;
+                    layers
+                        .last_mut()
+                        .ok_or("hidden without router")?
+                        .hidden
+                        .push(values[..hidden].to_vec());
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    )?;
+    Ok(layers)
+}
+
+fn run_inner(
+    model: &Model,
+    plan: &mut StepPlan,
+    sessions: &mut [&mut Session],
+    sink: &mut impl Sink,
+    mut after_op: impl FnMut(Op, &StepPlan) -> Result<()>,
 ) -> Result<()> {
     let d = &model.dims;
     let g = d.gdn();
@@ -527,6 +604,7 @@ pub(crate) fn run(
         if let Err(error) = result {
             return Err(format!("op {op_index} {op:?}: {error}").into());
         }
+        after_op(op, plan)?;
     }
     Ok(())
 }
