@@ -292,6 +292,20 @@ impl PrefillPlan {
             .to_host_vec()
             .sync_on(stream)?)
     }
+
+    #[cfg(feature = "testing")]
+    pub(crate) fn reset_rope_positions(&mut self, model: &Model, stream: &Stream) -> Result<()> {
+        let positions: Vec<usize> = (0..self.rows).collect();
+        let (cos, sin) = rope::frequencies(&positions, &model.dims.q_rope());
+        let shape = &[self.rows, model.dims.attention().head_dim()];
+        self.cos = api::copy_host_vec_to_device(&Arc::new(cos))
+            .reshape(shape)
+            .sync_on(stream)?;
+        self.sin = api::copy_host_vec_to_device(&Arc::new(sin))
+            .reshape(shape)
+            .sync_on(stream)?;
+        Ok(())
+    }
 }
 
 fn gemm_tile(cols: usize, rows: usize, grouped: bool) -> GemmTile {
@@ -315,6 +329,56 @@ pub(crate) fn run(
     session: &mut Session,
     stream: &Stream,
     sink: &mut impl Sink,
+) -> Result<()> {
+    let last_row = plan.len - 1;
+    run_inner(model, plan, session, stream, sink, last_row, |_, _| Ok(()))
+}
+
+#[cfg(feature = "testing")]
+pub(crate) fn run_observed(
+    model: &Model,
+    plan: &mut PrefillPlan,
+    session: &mut Session,
+    stream: &Stream,
+    first_row_lm_head: bool,
+    hidden: &mut Vec<Vec<f32>>,
+) -> Result<()> {
+    let row = if first_row_lm_head { 0 } else { plan.len - 1 };
+    let last = plan.len - 1;
+    let width = model.dims.hidden();
+    run_inner(
+        model,
+        plan,
+        session,
+        stream,
+        &mut firepit_kernels::sink::Eager(stream),
+        row,
+        |op, plan| {
+            if let PrefillOp::Kernel(Op::Add {
+                delta: Slot::MoeDelta,
+                out,
+                ..
+            }) = op
+            {
+                let values: Vec<f32> = plan.buffers[out.index()]
+                    .dup()
+                    .to_host_vec()
+                    .sync_on(stream)?;
+                hidden.push(values[last * width..(last + 1) * width].to_vec());
+            }
+            Ok(())
+        },
+    )
+}
+
+fn run_inner(
+    model: &Model,
+    plan: &mut PrefillPlan,
+    session: &mut Session,
+    stream: &Stream,
+    sink: &mut impl Sink,
+    lm_head_row: usize,
+    mut after_op: impl FnMut(PrefillOp, &PrefillPlan) -> Result<()>,
 ) -> Result<()> {
     let d = &model.dims;
     let g = d.gdn();
@@ -380,8 +444,8 @@ pub(crate) fn run(
                     };
                     if matches!(name, NormName::Final) {
                         let shaped = source.view(&[rows, width])?;
-                        let x = shaped.slice(&[len - 1..len, 0..width])?;
-                        let y = target.slice_mut(&[len - 1..len, 0..width])?;
+                        let x = shaped.slice(&[lm_head_row..lm_head_row + 1, 0..width])?;
+                        let y = target.slice_mut(&[lm_head_row..lm_head_row + 1, 0..width])?;
                         sink.run(
                             norm::rms_norm(
                                 y.partition([1, width]),
@@ -439,7 +503,7 @@ pub(crate) fn run(
                     let output_rows = dense.rows;
                     if matches!(name, WeightName::LmHead) {
                         let shaped = source.view(&[rows, cols])?;
-                        let last = shaped.slice(&[len - 1..len, 0..cols])?;
+                        let last = shaped.slice(&[lm_head_row..lm_head_row + 1, 0..cols])?;
                         let x = last.view(&[
                             1,
                             cols / firepit_kernels::weights::Q8_BLOCK,
@@ -545,6 +609,7 @@ pub(crate) fn run(
         if let Err(error) = result {
             return Err(format!("prefill op {index} {op:?}: {error}").into());
         }
+        after_op(op, plan)?;
     }
     Ok(())
 }

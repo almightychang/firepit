@@ -9,6 +9,8 @@ use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
 use cutile::api::{self, DeviceOpReshape};
+#[cfg(feature = "testing")]
+use cutile::tile_kernel::ToHostVecOp;
 use firepit_kernels::rope;
 use firepit_kernels::sink::{Eager, Graph, Trace, Traced};
 use firepit_kernels::tile::{MIN_ROW_TILE, channel_tile, row_tile};
@@ -18,6 +20,22 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ENGINE: AtomicU64 = AtomicU64::new(1);
 const TARGET_BLOCKS_PER_SM: usize = 1;
+
+#[cfg(feature = "testing")]
+#[derive(Clone, Copy, Debug, Default)]
+pub enum VerificationFault {
+    #[default]
+    None,
+    ResetRopePosition,
+    FirstRowLmHead,
+}
+
+#[cfg(feature = "testing")]
+pub struct SessionStateSnapshot {
+    pub layer: usize,
+    pub name: &'static str,
+    pub values: Vec<f32>,
+}
 
 struct CachedPlan {
     instances: Vec<u64>,
@@ -115,6 +133,64 @@ impl Engine {
             prefill::run(model, plan, session, stream, &mut sink)?;
             Ok(sink.into_trace())
         })
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn prefill_observed(
+        &mut self,
+        session: &mut Session,
+        tokens: &[u32],
+        fault: VerificationFault,
+    ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
+        self.prefill_with(session, tokens, |model, plan, session, stream| {
+            if matches!(fault, VerificationFault::ResetRopePosition) {
+                plan.reset_rope_positions(model, stream)?;
+            }
+            let mut hidden = Vec::with_capacity(model.dims.layers().len());
+            prefill::run_observed(
+                model,
+                plan,
+                session,
+                stream,
+                matches!(fault, VerificationFault::FirstRowLmHead),
+                &mut hidden,
+            )?;
+            Ok(hidden)
+        })
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn state_snapshot(&self, session: &Session) -> Result<Vec<SessionStateSnapshot>> {
+        if session.engine != self.id || session.poisoned {
+            return Err("invalid session for snapshot".into());
+        }
+        let mut result = Vec::new();
+        for (layer, state) in session.state.iter().enumerate() {
+            let parts: [(&str, &cutile::tensor::Tensor<f32>); 2] = match state {
+                crate::session::LayerState::Gdn { conv, recurrent } => {
+                    [("conv", conv), ("recurrent", recurrent)]
+                }
+                crate::session::LayerState::Attention { k, v } => [("k", k), ("v", v)],
+            };
+            for (name, tensor) in parts {
+                let values = match state {
+                    crate::session::LayerState::Attention { .. } => {
+                        let shape = tensor.shape();
+                        let mut values: Vec<f32> =
+                            tensor.dup().to_host_vec().sync_on(&self.stream)?;
+                        values.truncate(session.position * shape[1] as usize * shape[2] as usize);
+                        values
+                    }
+                    _ => tensor.dup().to_host_vec().sync_on(&self.stream)?,
+                };
+                result.push(SessionStateSnapshot {
+                    layer,
+                    name,
+                    values,
+                });
+            }
+        }
+        Ok(result)
     }
 
     fn prefill_with<T>(
@@ -342,6 +418,14 @@ mod tests {
         Ok(())
     }
 
+    fn top5(values: &[f32]) -> Vec<usize> {
+        let mut indices: Vec<_> = (0..values.len()).collect();
+        indices.sort_unstable_by(|&a, &b| values[b].total_cmp(&values[a]).then(a.cmp(&b)));
+        indices.truncate(5);
+        indices.sort_unstable();
+        indices
+    }
+
     fn assert_trace(trace: &Trace, expected: impl IntoIterator<Item = &'static str>) {
         let kinds: Vec<_> = expected.into_iter().collect();
         assert_eq!(
@@ -546,6 +630,77 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn reset_rope_position_breaks_append() -> Result<()> {
+        let device = Device::new(0)?;
+        let mut config: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/small-qwen.json"))?;
+        config["text_config"]["layer_types"] =
+            serde_json::json!(["full_attention", "full_attention"]);
+        let model = Arc::new(Model::random_from_config(
+            &config["text_config"],
+            8,
+            7,
+            &device.new_stream()?,
+        )?);
+        let mut whole = Engine::new(model.clone(), &device)?;
+        let mut append = Engine::new(model, &device)?;
+        let mut ws = whole.new_session(SessionId(1))?;
+        let mut as_ = append.new_session(SessionId(1))?;
+        let expected = whole.prefill(&mut ws, &[1, 2, 3, 4])?;
+        append.prefill(&mut as_, &[1, 2])?;
+        let (actual, _) =
+            append.prefill_observed(&mut as_, &[3, 4], VerificationFault::ResetRopePosition)?;
+        let max = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("reset rope append logits max_abs={max}");
+        println!(
+            "reset rope top5={:?} expected={:?}",
+            top5(&actual),
+            top5(&expected)
+        );
+        assert_ne!(
+            top5(&actual),
+            top5(&expected),
+            "resetting RoPE must fail append top5"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn first_row_lm_head_breaks_prefill_vs_step() -> Result<()> {
+        let device = Device::new(0)?;
+        let model = small_model(&device)?;
+        let mut prefill = Engine::new(model.clone(), &device)?;
+        let mut decode = Engine::new(model, &device)?;
+        let mut ps = prefill.new_session(SessionId(1))?;
+        let mut ds = decode.new_session(SessionId(1))?;
+        let (actual, _) =
+            prefill.prefill_observed(&mut ps, &[1, 2], VerificationFault::FirstRowLmHead)?;
+        decode.step_eager(decode.batch([(&mut ds, 1)])?)?;
+        let expected = decode.step_eager(decode.batch([(&mut ds, 2)])?)?;
+        let max = actual
+            .iter()
+            .zip(&expected)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        println!("first row lm_head prefill/step logits max_abs={max}");
+        println!(
+            "first row lm_head top5={:?} expected={:?}",
+            top5(&actual),
+            top5(&expected)
+        );
+        assert_ne!(
+            top5(&actual),
+            top5(&expected),
+            "first-row lm_head must fail prefill/step top5"
+        );
         Ok(())
     }
 

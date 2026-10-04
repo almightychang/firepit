@@ -43,6 +43,16 @@ GEMV는 oracle 비교와 선형성·배치 독립·가중치 행 치환을 검�
 
 기본 검증: `scripts/dev.sh test --workspace`. 실제 모델 정답 비교: `scripts/dev.sh test -p firepit --test reference -- --ignored`.
 
+### 3.7 엔진 전체 모델 검증
+
+`tools/reference/trace_qwen36.py --engine`는 기존 prefill과 같은 150개 token ID로 HF 전체 층의 마지막 토큰 logits와 각 층 출력 residual의 마지막 행을 기록한다. GB10에서 `scripts/dev.sh test -p firepit --test engine_verify -- --ignored --nocapture`로 검증한다. 모델과 정답지 경로는 각각 `FIREPIT_VERIFY_MODEL`, `FIREPIT_VERIFY_REF`로 바꾸고, 작은 접두부 확인에는 `FIREPIT_VERIFY_LAYERS=2`를 사용한다.
+
+- HF 비교: 마지막 토큰 logits의 top-1과 top-5 집합이 같아야 한다. logits의 최대 절대·상대 오차와 상대 L2, 층별 마지막 residual 행의 같은 세 수치는 기록한다.
+- 경로 동치: `prefill(T)`와 `step_eager` T회, `prefill(A)` 뒤 `prefill(B)`와 `prefill(A+B)`의 마지막 logits top-1·top-5 집합이 같아야 한다. 두 경로의 logits 및 모든 층의 GDN conv·recurrent 또는 attention K·V state 차이를 기록한다. 현재 고정 입력은 T=150, A=100, B=50이다.
+- 작은 random 모델 대조는 이어 붙이기에서 RoPE 위치를 0으로 재설정하거나 prefill lm_head가 첫 행을 읽으면 차이가 생기는지 검사한다.
+
+전체 layer stack의 수학적으로 엄밀한 오차 상한은 미해결이다. 따라서 위 top-k 일치만 통과 조건이고, 기록하는 오차 수치에는 근거 없는 허용치를 두지 않는다.
+
 ## 판정 기준 현황
 
 | 커널 | 판정 | 근거 |

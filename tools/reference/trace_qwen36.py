@@ -20,7 +20,7 @@ def prefix_config(model_dir: Path, layers: int) -> Qwen3_5MoeTextConfig:
     return Qwen3_5MoeTextConfig(**text)
 
 
-def prefix_weights(model_dir: Path, layers: int) -> dict[str, torch.Tensor]:
+def prefix_weights(model_dir: Path, layers: int, dtype=torch.float32, device="cpu") -> dict[str, torch.Tensor]:
     def local_name(name: str) -> str | None:
         if name == "lm_head.weight":
             return name
@@ -36,7 +36,7 @@ def prefix_weights(model_dir: Path, layers: int) -> dict[str, torch.Tensor]:
     for name, shard in index.items():
         if (local := local_name(name)) is not None:
             with safe_open(model_dir / shard, framework="pt") as f:
-                weights[local] = f.get_tensor(name).to(torch.float32)
+                weights[local] = f.get_tensor(name).to(device=device, dtype=dtype)
     return weights
 
 
@@ -50,6 +50,46 @@ def load_prefix(model_dir: Path, layers: int) -> Qwen3_5MoeForCausalLM:
     norm = model.model.norm
     model.model.norm = torch.nn.Identity()
     return model.eval(), norm.eval()
+
+
+def load_engine(model_dir: Path, layers: int):
+    with torch.device("meta"):
+        model = Qwen3_5MoeForCausalLM(prefix_config(model_dir, layers))
+    weights = prefix_weights(model_dir, layers, torch.bfloat16, "cuda")
+    missing, unexpected = model.load_state_dict(weights, strict=False, assign=True)
+    del weights
+    if unexpected or missing:
+        raise SystemExit(f"missing={missing} unexpected={unexpected}")
+    model.model.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(model.config)
+    norm = model.model.norm
+    model.model.norm = torch.nn.Identity()
+    return model.to("cuda").eval(), norm.to("cuda").eval()
+
+
+def trace_engine(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
+    with torch.inference_mode():
+        out = model.model(
+            input_ids=torch.tensor([tokens], device="cuda"),
+            use_cache=False,
+            output_hidden_states=True,
+        )
+        records = {
+            f"layer{layer}/hidden": hidden[0, -1].float().cpu().contiguous()
+            for layer, hidden in enumerate(out.hidden_states[1:])
+        }
+        records["logits"] = model.lm_head(norm(out.hidden_states[-1][:, -1:]))[0, 0].float().cpu().contiguous()
+        records["tokens"] = torch.tensor(tokens, dtype=torch.float32)
+    return records
+
+
+def use_torch_reference_kernels():
+    for name in (
+        "torch_chunk_gated_delta_rule",
+        "torch_recurrent_gated_delta_rule",
+        "causal_conv1d_fn",
+        "causal_conv1d_update",
+    ):
+        setattr(qwen_module, name, getattr(qwen_module, name).__wrapped__)
 
 
 def trace(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
@@ -438,26 +478,45 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--layers", type=int, default=4)
+    parser.add_argument("--layers", type=int)
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--prefill", action="store_true")
+    parser.add_argument("--engine", action="store_true")
     args = parser.parse_args()
 
+    if args.engine and args.prefill:
+        parser.error("--engine and --prefill are separate modes")
+
+    if args.engine:
+        text = json.loads((args.model / "config.json").read_text())["text_config"]
+        layers = text["num_hidden_layers"] if args.layers is None else args.layers
+    else:
+        layers = 4 if args.layers is None else args.layers
+
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if args.prefill:
+    if args.prefill or args.engine:
         source = args.prompt * 100
         tokens = tokenizer(source, add_special_tokens=False)["input_ids"][:150]
         if len(tokens) != 150:
             raise SystemExit(f"prompt produced only {len(tokens)} tokens")
     else:
         tokens = tokenizer(args.prompt)["input_ids"]
-    model, norm = load_prefix(args.model, args.layers)
+    if args.engine:
+        if not torch.cuda.is_available():
+            raise SystemExit("--engine requires a CUDA PyTorch build")
+        use_torch_reference_kernels()
+        model, norm = load_engine(args.model, layers)
+        records = trace_engine(model, norm, tokens)
+    else:
+        model, norm = load_prefix(args.model, layers)
     if args.prefill:
         records, maximum = trace_prefill(model, norm, tokens)
         print(f"HF prefill vs decode max abs: {maximum}", flush=True)
-    else:
+    elif not args.engine:
         records = trace(model, norm, tokens)
-    metadata = {"model": MODEL_ID, "layers": str(args.layers), "prompt": args.prompt, "tokens": json.dumps(tokens)}
+    metadata = {"model": MODEL_ID, "layers": str(layers), "prompt": args.prompt, "tokens": json.dumps(tokens)}
+    if args.engine:
+        metadata["mode"] = "engine"
     if args.prefill:
         metadata["mode"] = "prefill"
         metadata["max_abs"] = json.dumps(maximum)
