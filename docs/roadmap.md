@@ -44,6 +44,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
     ○ GDN delta rule value 열 타일: 현재 32열을 장치와 head 차원에 맞춰 선택
     ○ GEMV 행 타일(BN): DEFAULT_GEMV_TILE 고정값 → row_tile 같은 SM 채우기 규칙
     ○ 행이 적은 행렬(MoE expert 등)이 SM을 못 채우면 split-K
+    ○ MoE grouped GEMM은 현재 모든 expert에 BM=16을 쓰고 expert별 마지막 타일을 패딩한다. expert 행 수에 따라 BM=64/16 등으로 달리 골라 패딩과 CTA 수를 함께 줄이고, 행별 gather의 register spill을 줄인다.
     ○ GEMV 열 타일(NB): batch·레지스터 압박에 따라 autotune 또는 규칙
     ○ TARGET_BLOCKS_PER_SM, MIN_ROW_TILE, MAX_BATCH_SESSIONS 근거 재검토
 
@@ -89,13 +90,14 @@ E2와 같은 순서(개념 → 구현 → 정답 비교)에 성능 기준을 더
 | 3.3 GDN conv | 시퀀스 causal conv, 마지막 state | conv 출력과 state 일치 | 대역폭 대비 % | ✔ (GB10 5000토큰 layer당 2.35 ms, 대역폭의 약 70%) |
 | 3.4 GDN chunk ① | chunk 안 계산, FLA 블록 삼각 역행렬 | f64 oracle·HF 입력·decode 합성 | 성분별 반올림 상한, GB10 5000토큰 layer당 6.1 ms | ✔ |
 | 3.5 GDN chunk ② | chunk 사이 state 전달 | f64 oracle·decode 동치·HF 150토큰 GDN layer | RTX 5080 5000토큰 second phase 3.96 ms, 전체 chunk 5.74 ms | ✔ (HF GDN layer 끝-끝 일치, GB10 5000토큰 chunk 전체 layer당 21 ms) |
-| 3.6 MoE prefill | expert별로 토큰 모으기 | MoE 블록 일치 | 실측 최대 대비 % | ○ |
+| 3.6 MoE prefill | expert별로 토큰 모으기 | MoE 블록 일치 | 실측 최대 대비 % | ✔ (host 안정 정렬·expert별 BM 패딩, f64 PBT·decode 동치·HF 150토큰 4 layer, RTX 5080 T=5000 gate_up 35.74 ms·down 13.33 ms) |
 | 3.7 조립 | 엔진 prefill 경로 | prefill(T) = decode T번 (logits, state) | 5000토큰 prompt 215초 → 5초 이내 (계산 하한 약 0.4초, [기준선](research/measurements/gemm-peak-gb10.md)) | ○ |
 
 E7 성능 단계에서 GEMM의 M·N·K와 GPU 특성에 따라 타일 크기를 자동 선택한다. E3.1은 호출자가 타일을 지정하며 기본값은 64×128×32이다.
 E3.2 attention의 현재 기본 BM×BN은 16×32이다. RTX 5080의 head_dim 256 release cubin에서 255 registers/thread, 1008-byte stack/thread와 `STL` spill을 확인했다. 타일 자동 선택과 spill 저감은 E7에서 다룬다.
 E3.3 conv prefill은 채널 타일별 block이 시간축을 순차 처리한다. f64 oracle, decode 반복, HF 150토큰 비교에서 출력과 마지막 state가 일치했다. 같은 GPU에서 다른 실험을 병행해 성능은 측정하지 않았다.
 E3.5는 value head와 state 열 타일별 block이 chunk를 순서대로 처리한다. 현재 열 타일은 `row_tile`을 이용해 SM 수와 head 수에서 선택한다. RTX 5080 모델 형상에서 32열이며 release cubin은 255 registers/thread, 2368-byte stack/thread와 `STL` spill이 있다. 타일·spill 개선은 E7에서 한다.
+E3.6은 RTX 5080 T=5000에서 expert별 1264행을 패딩했다. grouped GEMM release cubin은 255 registers/thread, 2240-byte stack/thread와 `STL`/`LDL` spill이 있어 E7에서 gather 방식과 BM 선택을 함께 다룬다.
 
 ## 정답지 만들기 (2.0)
 

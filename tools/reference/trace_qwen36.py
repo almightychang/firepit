@@ -307,6 +307,29 @@ def trace_prefill(model, norm, tokens: list[int]) -> tuple[dict[str, torch.Tenso
             records[f"{key}/output"] = output[0].clone()
         hooks.append(module.register_forward_hook(record))
     for layer, block in enumerate(model.model.layers):
+        def moe_input(_module, args, layer=layer):
+            records[f"layer{layer}/moe/in"] = args[0][0].clone()
+        def router(_module, _args, output, layer=layer):
+            prefix = f"layer{layer}/moe"
+            records[f"{prefix}/logits"] = output[0].clone()
+            records[f"{prefix}/weights"] = output[1].clone()
+            records[f"{prefix}/indices"] = output[2].to(torch.float32).clone()
+        def routed(_module, _args, output, layer=layer):
+            records[f"layer{layer}/moe/routed"] = output.clone()
+        def moe_output(_module, _args, output, layer=layer):
+            records[f"layer{layer}/moe/delta"] = output[0].clone()
+        def shared(_module, _args, output, layer=layer):
+            records[f"layer{layer}/moe/shared"] = output.clone()
+        def shared_gate(_module, _args, output, layer=layer):
+            records[f"layer{layer}/moe/shared_gate"] = output.clone()
+        hooks.extend((
+            block.mlp.register_forward_pre_hook(moe_input),
+            block.mlp.gate.register_forward_hook(router),
+            block.mlp.experts.register_forward_hook(routed),
+            block.mlp.shared_expert.register_forward_hook(shared),
+            block.mlp.shared_expert_gate.register_forward_hook(shared_gate),
+            block.mlp.register_forward_hook(moe_output),
+        ))
         if block.block_type != "linear_attention":
             continue
         gdn = block.linear_attn

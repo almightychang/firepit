@@ -539,6 +539,7 @@ dependencies = [
  "half",
  "proptest",
  "safetensors",
+ "serde_json",
 ]
 
 [[package]]

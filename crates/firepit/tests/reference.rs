@@ -13,11 +13,15 @@ use firepit_kernels::gdn_chunk::{
     apply_inverse, first_phase_matrices, invert_diagonal, merge_inverse, second_phase,
     second_phase_value_tile,
 };
-use firepit_kernels::gemm::{DEFAULT_GEMM_TILE, gemm};
+use firepit_kernels::gemm::{
+    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, GroupInput, gemm, grouped_gemm,
+};
 use firepit_kernels::gemv::expert_gemv;
 use firepit_kernels::gemv::gemv;
 use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile};
-use firepit_kernels::moe::{ExpertSelection, MoeDims, combine};
+use firepit_kernels::moe::{
+    ExpertSelection, MoeDims, PrefillPlan, combine, combine_prefill, combine_prefill_view,
+};
 use firepit_kernels::norm::rms_norm;
 use firepit_kernels::rope::{RopeDims, frequencies, generics as rope_generics, rope};
 use firepit_kernels::sink::Eager;
@@ -1614,6 +1618,333 @@ fn expert_outputs(
     )
     .sync_on(stream)?;
     Ok(outputs)
+}
+
+fn routed_prefill(
+    stream: &Arc<cuda_core::Stream>,
+    dims: MoeDims,
+    gate_up: &DenseMatrix<bf16>,
+    down: &DenseMatrix<bf16>,
+    x: &Tensor<f32>,
+    plan: &PrefillPlan,
+) -> Result<Tensor<f32>, Box<dyn std::error::Error>> {
+    let rows = plan.layout().padded_rows();
+    let tile = DEFAULT_GROUPED_GEMM_TILE;
+    let mut projected = api::zeros::<f32>(&[rows, 2 * dims.intermediate()]).sync_on(stream)?;
+    grouped_gemm(
+        gate_up,
+        &x.view(&[plan.layout().tokens(), dims.hidden()])?,
+        projected.partition([tile.m, tile.n]),
+        plan,
+        2 * dims.intermediate(),
+        GroupInput::Tokens,
+        tile,
+    )
+    .submit(&mut Eager(stream))?;
+    let mut activated = api::zeros::<f32>(&[rows, dims.intermediate()]).sync_on(stream)?;
+    firepit_kernels::swiglu::swiglu(activated.partition([1, dims.intermediate()]), &projected)
+        .generics(vec![dims.intermediate().to_string()])
+        .sync_on(stream)?;
+    let mut routed = api::zeros::<f32>(&[rows, dims.hidden()]).sync_on(stream)?;
+    grouped_gemm(
+        down,
+        &activated.view(&[rows, dims.intermediate()])?,
+        routed.partition([tile.m, tile.n]),
+        plan,
+        dims.hidden(),
+        GroupInput::Padded,
+        tile,
+    )
+    .submit(&mut Eager(stream))?;
+    Ok(routed)
+}
+
+#[test]
+#[ignore = "needs Qwen3.6 weights and regenerated 150-token prefill reference"]
+fn moe_prefill_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
+    let model_dir = home("Models/qwen3.6-35b-a3b");
+    let dims = moe_dims(&model_dir)?;
+    let checkpoint = Checkpoint::open(model_dir)?;
+    let refs = SafetensorsFile::open(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../refs/qwen36-prefix4-prefill.safetensors"),
+    )?;
+    let device = Device::new(0)?;
+    let stream = device.new_stream()?;
+    let mut worst = [0.0f64; 4];
+    let mut near_ties = 0usize;
+    let mut wrong_permutation = 0.0f64;
+    let mut wrong_renorm = 0.0f64;
+    for layer in 0..4 {
+        let key = format!("layer{layer}/moe");
+        let input = refs.tensor(&format!("{key}/in"))?;
+        let t = input.shape[0];
+        assert_eq!(input.shape, [t, dims.hidden()]);
+        let padded = t.div_ceil(DEFAULT_GEMM_TILE.m) * DEFAULT_GEMM_TILE.m;
+        let mut x_host = input.data.clone();
+        x_host.resize(padded * dims.hidden(), 0.0);
+        let x = api::copy_host_vec_to_device(&Arc::new(x_host))
+            .reshape(&[padded, dims.hidden()])
+            .sync_on(&stream)?;
+        let prefix = format!("model.language_model.layers.{layer}.mlp");
+        let router_host = checkpoint.tensor_bf16(&format!("{prefix}.gate.weight"))?;
+        let router = router_host.clone().upload_matrix(&stream)?;
+        let gate_up = checkpoint
+            .tensor_bf16(&format!("{prefix}.experts.gate_up_proj"))?
+            .upload_matrix(&stream)?;
+        let down = checkpoint
+            .tensor_bf16(&format!("{prefix}.experts.down_proj"))?
+            .upload_matrix(&stream)?;
+        let shared = load_expert(&checkpoint, layer, &stream, dims)?;
+        let shared_gate = checkpoint
+            .tensor_bf16(&format!("{prefix}.shared_expert_gate.weight"))?
+            .upload_matrix(&stream)?;
+        let mut logits = api::zeros::<f32>(&[padded, dims.experts()]).sync_on(&stream)?;
+        gemm(
+            &router,
+            &x.view(&[padded, dims.hidden()])?,
+            logits.partition([DEFAULT_GEMM_TILE.m, DEFAULT_GEMM_TILE.n]),
+            DEFAULT_GEMM_TILE,
+        )
+        .submit(&mut Eager(&stream))?;
+        let gpu_logits: Vec<f32> = logits.dup().to_host_vec().sync_on(&stream)?;
+        let hf_logits = refs.tensor(&format!("{key}/logits"))?;
+        assert_eq!(hf_logits.shape, [t, dims.experts()]);
+        let logits_error = relative_max(
+            &gpu_logits[..t * dims.experts()],
+            &hf_logits.data.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+        );
+        worst[0] = worst[0].max(logits_error);
+        assert!(logits_error < 1e-5, "{key} router logits {logits_error}");
+
+        let native = PrefillPlan::top_k(
+            &logits.slice(&[0..t, 0..dims.experts()])?,
+            &dims,
+            DEFAULT_GROUPED_GEMM_TILE.m,
+            &stream,
+        )?;
+        let native_ids: Vec<i32> = native.indices().dup().to_host_vec().sync_on(&stream)?;
+        let native_weights: Vec<f32> = native.weights().dup().to_host_vec().sync_on(&stream)?;
+        let hf_ids = refs.tensor(&format!("{key}/indices"))?;
+        let hf_weights = refs.tensor(&format!("{key}/weights"))?;
+        assert_eq!(hf_ids.shape, [t, dims.top_k()]);
+        assert_eq!(hf_weights.shape, [t, dims.top_k()]);
+        let ids: Vec<i32> = hf_ids.data.iter().map(|&v| v as i32).collect();
+        let stride = dims.top_k().next_power_of_two();
+        for token in 0..t {
+            let mut tie = false;
+            for slot in 0..dims.top_k() {
+                let actual = native_ids[token * stride + slot] as usize;
+                let expected = ids[token * dims.top_k() + slot] as usize;
+                if actual != expected {
+                    let gap = (hf_logits.data[token * dims.experts() + actual]
+                        - hf_logits.data[token * dims.experts() + expected])
+                        .abs() as f64;
+                    let magnitude = |expert: usize| -> f64 {
+                        (0..dims.hidden())
+                            .map(|col| {
+                                (router_host.data[expert * dims.hidden() + col].to_f32() as f64
+                                    * input.data[token * dims.hidden() + col] as f64)
+                                    .abs()
+                            })
+                            .sum()
+                    };
+                    let bound = 2.0
+                        * check::gamma_tilde(dims.hidden())
+                        * (magnitude(actual) + magnitude(expected));
+                    assert!(
+                        gap <= bound,
+                        "{key} token {token} slot {slot}: tie gap {gap} > {bound}"
+                    );
+                    near_ties += 1;
+                    tie = true;
+                }
+            }
+            if !tie {
+                for slot in 0..dims.top_k() {
+                    let error = (native_weights[token * stride + slot]
+                        - hf_weights.data[token * dims.top_k() + slot])
+                        .abs() as f64;
+                    worst[1] = worst[1].max(error);
+                    assert!(error < 1e-5, "{key} token {token} top-k weight {error}");
+                }
+            }
+        }
+
+        let plan = PrefillPlan::parse(
+            &ids,
+            &hf_weights.data,
+            &dims,
+            DEFAULT_GROUPED_GEMM_TILE.m,
+            &stream,
+        )?;
+        let exact_x = api::copy_host_vec_to_device(&Arc::new(input.data.clone()))
+            .reshape(&[t, dims.hidden()])
+            .sync_on(&stream)?;
+        let routed = routed_prefill(&stream, dims, &gate_up, &down, &exact_x, &plan)?;
+        let zero_shared = api::zeros::<f32>(&[t, dims.hidden()]).sync_on(&stream)?;
+        let zero_gate = api::zeros::<f32>(&[t, 1]).sync_on(&stream)?;
+        let mut routed_sum = api::zeros::<f32>(&[t, dims.hidden()]).sync_on(&stream)?;
+        combine_prefill(
+            routed_sum.partition([1, dims.hidden()]),
+            &routed,
+            &plan,
+            &zero_shared,
+            &zero_gate,
+        )
+        .sync_on(&stream)?;
+        let actual_routed: Vec<f32> = routed_sum.to_host_vec().sync_on(&stream)?;
+        let hf_routed = refs.tensor(&format!("{key}/routed"))?;
+        let routed_error = relative_max(
+            &actual_routed,
+            &hf_routed.data.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+        );
+        worst[2] = worst[2].max(routed_error);
+        let split = (1.0 / 256.0f64).powi(2);
+        let routed_bound = 2.0
+            * (check::gamma_tilde(dims.hidden()) + check::gamma_tilde(dims.intermediate()) + split)
+            + check::gamma_tilde(dims.top_k());
+        assert!(
+            routed_error < routed_bound,
+            "{key} routed {routed_error} > {routed_bound}"
+        );
+
+        let mut shared_projected =
+            api::zeros::<f32>(&[padded, 2 * dims.shared_intermediate()]).sync_on(&stream)?;
+        gemm(
+            &shared.gate_up,
+            &x.view(&[padded, dims.hidden()])?,
+            shared_projected.partition([DEFAULT_GEMM_TILE.m, DEFAULT_GEMM_TILE.n]),
+            DEFAULT_GEMM_TILE,
+        )
+        .submit(&mut Eager(&stream))?;
+        let mut shared_activated =
+            api::zeros::<f32>(&[padded, dims.shared_intermediate()]).sync_on(&stream)?;
+        firepit_kernels::swiglu::swiglu(
+            shared_activated.partition([1, dims.shared_intermediate()]),
+            &shared_projected,
+        )
+        .generics(vec![dims.shared_intermediate().to_string()])
+        .sync_on(&stream)?;
+        let mut shared_output = api::zeros::<f32>(&[padded, dims.hidden()]).sync_on(&stream)?;
+        gemm(
+            &shared.down,
+            &shared_activated.view(&[padded, dims.shared_intermediate()])?,
+            shared_output.partition([DEFAULT_GEMM_TILE.m, DEFAULT_GEMM_TILE.n]),
+            DEFAULT_GEMM_TILE,
+        )
+        .submit(&mut Eager(&stream))?;
+        let mut gate_output = api::zeros::<f32>(&[padded, 1]).sync_on(&stream)?;
+        gemm(
+            &shared_gate,
+            &x.view(&[padded, dims.hidden()])?,
+            gate_output.partition([DEFAULT_GEMM_TILE.m, 1]),
+            GemmTile {
+                n: 1,
+                ..DEFAULT_GEMM_TILE
+            },
+        )
+        .submit(&mut Eager(&stream))?;
+        let mut delta = api::zeros::<f32>(&[t, dims.hidden()]).sync_on(&stream)?;
+        combine_prefill_view(
+            delta.partition([1, dims.hidden()]),
+            &routed,
+            &plan,
+            &shared_output.slice(&[0..t, 0..dims.hidden()])?,
+            &gate_output.slice(&[0..t, 0..1])?,
+        )
+        .sync_on(&stream)?;
+        let actual_delta: Vec<f32> = delta.to_host_vec().sync_on(&stream)?;
+        let hf_delta = refs.tensor(&format!("{key}/delta"))?;
+        let delta_error = relative_max(
+            &actual_delta,
+            &hf_delta.data.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+        );
+        worst[3] = worst[3].max(delta_error);
+        let delta_bound = routed_bound
+            + 2.0
+                * (check::gamma_tilde(dims.hidden())
+                    + check::gamma_tilde(dims.shared_intermediate())
+                    + split);
+        assert!(
+            delta_error < delta_bound,
+            "{key} delta {delta_error} > {delta_bound}"
+        );
+
+        if layer == 0 {
+            let mut shuffled_ids = ids.clone();
+            let replacement = (dims.top_k()..ids.len())
+                .find(|&position| {
+                    let token = position / dims.top_k();
+                    !ids[..dims.top_k()].contains(&ids[position])
+                        && !ids[token * dims.top_k()..(token + 1) * dims.top_k()].contains(&ids[0])
+                })
+                .unwrap();
+            shuffled_ids.swap(0, replacement);
+            let shuffled = PrefillPlan::parse(
+                &shuffled_ids,
+                &hf_weights.data,
+                &dims,
+                DEFAULT_GROUPED_GEMM_TILE.m,
+                &stream,
+            )?;
+            let mut wrong = api::zeros::<f32>(&[t, dims.hidden()]).sync_on(&stream)?;
+            combine_prefill(
+                wrong.partition([1, dims.hidden()]),
+                &routed,
+                &shuffled,
+                &zero_shared,
+                &zero_gate,
+            )
+            .sync_on(&stream)?;
+            wrong_permutation = relative_max(
+                &wrong.to_host_vec().sync_on(&stream)?,
+                &hf_routed.data.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+            );
+            let mut unnormalized = Vec::with_capacity(t * dims.top_k());
+            for token in 0..t {
+                let logits = &hf_logits.data[token * dims.experts()..(token + 1) * dims.experts()];
+                let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let denominator: f64 = logits.iter().map(|&v| ((v - max) as f64).exp()).sum();
+                for slot in 0..dims.top_k() {
+                    unnormalized.push(
+                        (((logits[ids[token * dims.top_k() + slot] as usize] - max) as f64).exp()
+                            / denominator) as f32,
+                    );
+                }
+            }
+            let wrong_plan = PrefillPlan::parse(
+                &ids,
+                &unnormalized,
+                &dims,
+                DEFAULT_GROUPED_GEMM_TILE.m,
+                &stream,
+            )?;
+            let mut wrong = api::zeros::<f32>(&[t, dims.hidden()]).sync_on(&stream)?;
+            combine_prefill(
+                wrong.partition([1, dims.hidden()]),
+                &routed,
+                &wrong_plan,
+                &zero_shared,
+                &zero_gate,
+            )
+            .sync_on(&stream)?;
+            wrong_renorm = relative_max(
+                &wrong.to_host_vec().sync_on(&stream)?,
+                &hf_routed.data.iter().map(|&v| v as f64).collect::<Vec<_>>(),
+            );
+            assert!(wrong_permutation > 1e-5 && wrong_renorm > 1e-5);
+        }
+        println!(
+            "{key} T={t} router={logits_error:.8e} routed={routed_error:.8e} delta={delta_error:.8e} padding={}",
+            plan.layout().padding_rows()
+        );
+    }
+    println!(
+        "MoE prefill HF worst router={:.8e} top_weights={:.8e} routed={:.8e} delta={:.8e} near_ties={near_ties} shuffled={wrong_permutation:.8e} no_renorm={wrong_renorm:.8e}",
+        worst[0], worst[1], worst[2], worst[3]
+    );
+    Ok(())
 }
 
 #[test]

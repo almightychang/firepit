@@ -1,7 +1,8 @@
 use cuda_async::device_operation::{DeviceOp, GraphNode};
-use cutile::api;
+use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{Partition, PartitionMut, Tensor, TensorView, TensorViewMut};
 use cutile::tile_kernel::TileKernel;
+use cutile::tile_kernel::ToHostVecOp;
 use std::sync::Arc;
 
 use crate::sink::Sink;
@@ -54,6 +55,79 @@ mod kernels {
     }
 
     #[cutile::entry()]
+    pub fn top_k_prefill<const SIZE: i32, const TOP: i32>(
+        logits: &Tensor<f32, { [-1, -1] }>,
+        indices: &mut Tensor<i32, { [1, TOP] }>,
+        weights: &mut Tensor<f32, { [1, TOP] }>,
+        experts: i32,
+        k: i32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let values: Tile<f32, { [SIZE] }> = logits
+            .partition(shape![1, SIZE])
+            .load([pid.0, 0])
+            .reshape(shape![SIZE]);
+        let positions: Tile<i32, { [SIZE] }> = iota(shape![SIZE]);
+        let ranks: Tile<i32, { [TOP] }> = iota(shape![TOP]);
+        let valid: Tile<bool, { [SIZE] }> = lt_tile(positions, experts.broadcast(shape![SIZE]));
+        let negative: Tile<f32, { [SIZE] }> = constant(f32::NEG_INFINITY, shape![SIZE]);
+        let mut remaining: Tile<f32, { [SIZE] }> = select(valid, values, negative);
+        let maximum: Tile<f32, { [1] }> = reduce_max(remaining, 0i32);
+        let origin: f32 = tile_to_scalar(maximum.reshape(shape![]));
+        let mut total: Tile<f32, { [1] }> = constant(0.0f32, shape![1]);
+        let mut selected_ids: Tile<i32, { [TOP] }> = constant(0i32, shape![TOP]);
+        let mut selected_scores: Tile<f32, { [TOP] }> = constant(0.0f32, shape![TOP]);
+        for rank in 0i32..k {
+            let peak_tile: Tile<f32, { [1] }> = reduce_max(remaining, 0i32);
+            let peak: f32 = tile_to_scalar(peak_tile.reshape(shape![]));
+            let matching: Tile<bool, { [SIZE] }> = eq_tile(remaining, peak.broadcast(shape![SIZE]));
+            let candidates: Tile<i32, { [SIZE] }> = select(
+                matching,
+                positions,
+                (experts - 1i32).broadcast(shape![SIZE]),
+            );
+            let winner_tile: Tile<i32, { [1] }> = reduce_min(candidates, 0i32);
+            let winner: i32 = tile_to_scalar(winner_tile.reshape(shape![]));
+            let score: Tile<f32, { [1] }> = exp((peak - origin).broadcast(shape![1]));
+            let slot: Tile<bool, { [TOP] }> = eq_tile(ranks, rank.broadcast(shape![TOP]));
+            selected_ids = select(slot, winner.broadcast(shape![TOP]), selected_ids);
+            selected_scores = select(slot, score.broadcast(shape![TOP]), selected_scores);
+            total = total + score;
+            let chosen: Tile<bool, { [SIZE] }> = eq_tile(positions, winner.broadcast(shape![SIZE]));
+            remaining = select(chosen, negative, remaining);
+        }
+        indices.store(selected_ids.reshape(shape![1, TOP]));
+        weights.store((selected_scores / total.broadcast(shape![TOP])).reshape(shape![1, TOP]));
+    }
+
+    #[cutile::entry()]
+    pub fn combine_prefill_kernel<const H: i32>(
+        out: &mut Tensor<f32, { [1, H] }>,
+        routed: &Tensor<f32, { [-1, H] }>,
+        inverse: &Tensor<i32, { [-1, -1] }>,
+        weights: &Tensor<f32, { [-1, -1] }>,
+        shared: &Tensor<f32, { [-1, H] }>,
+        gate: &Tensor<f32, { [-1, 1] }>,
+        k: i32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let mut sum: Tile<f32, { [1, H] }> = constant(0.0f32, shape![1, H]);
+        for rank in 0i32..k {
+            let location: Tile<i32, { [1, 1] }> =
+                inverse.partition(shape![1, 1]).load([pid.0, rank]);
+            let row: i32 = tile_to_scalar(location.reshape(shape![]));
+            let value: Tile<f32, { [1, H] }> = routed.partition(shape![1, H]).load([row, 0]);
+            let weight: Tile<f32, { [1, 1] }> = weights.partition(shape![1, 1]).load([pid.0, rank]);
+            sum = sum + value * weight.broadcast(shape![1, H]);
+        }
+        let shared: Tile<f32, { [1, H] }> = shared.partition(shape![1, H]).load([pid.0, 0]);
+        let gate: Tile<f32, { [1, 1] }> = gate.partition(shape![1, 1]).load([pid.0, 0]);
+        let one: Tile<f32, { [1, 1] }> = constant(1.0f32, shape![1, 1]);
+        let sigmoid = one / (one + exp(gate * constant(-1.0f32, shape![1, 1])));
+        out.store(sum + shared * sigmoid.broadcast(shape![1, H]));
+    }
+
+    #[cutile::entry()]
     pub fn combine_kernel<const H: i32>(
         out: &mut Tensor<f32, { [1, H] }>,
         routed: &Tensor<f32, { [-1, H] }>,
@@ -75,6 +149,8 @@ mod kernels {
         out.store(sum + shared * sigmoid.broadcast(shape![1, H]));
     }
 }
+
+pub use kernels::top_k_prefill;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeDimensionError;
@@ -177,6 +253,7 @@ pub enum ExpertSelectionError {
     Index,
     Duplicate,
     Weight,
+    Tile,
 }
 
 impl std::fmt::Display for ExpertSelectionError {
@@ -287,6 +364,361 @@ impl ExpertSelection {
     pub fn weights(&self) -> &Tensor<f32> {
         &self.weights
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct PrefillLayout {
+    tokens: usize,
+    tile_rows: usize,
+    token_rows: Vec<i32>,
+    tile_experts: Vec<i32>,
+    inverse: Vec<i32>,
+    ranges: Vec<(usize, usize)>,
+}
+
+impl PrefillLayout {
+    pub fn parse(
+        indices: &[i32],
+        weights: &[f32],
+        dims: &MoeDims,
+        tile_rows: usize,
+    ) -> Result<Self, ExpertSelectionError> {
+        if indices.is_empty() || indices.len() % dims.top_k != 0 || weights.len() != indices.len() {
+            return Err(ExpertSelectionError::Count);
+        }
+        for (ids, scores) in indices
+            .chunks_exact(dims.top_k)
+            .zip(weights.chunks_exact(dims.top_k))
+        {
+            let total: f32 = scores.iter().sum();
+            if scores.iter().any(|&x| !x.is_finite() || x < 0.0)
+                || !total.is_finite()
+                || total <= 0.0
+            {
+                return Err(ExpertSelectionError::Weight);
+            }
+            let mut seen = vec![false; dims.experts];
+            for &id in ids {
+                if id < 0 || id as usize >= dims.experts {
+                    return Err(ExpertSelectionError::Index);
+                }
+                if std::mem::replace(&mut seen[id as usize], true) {
+                    return Err(ExpertSelectionError::Duplicate);
+                }
+            }
+        }
+        Self::from_indices(indices, dims, tile_rows)
+    }
+
+    fn from_indices(
+        indices: &[i32],
+        dims: &MoeDims,
+        tile_rows: usize,
+    ) -> Result<Self, ExpertSelectionError> {
+        if indices.is_empty()
+            || indices.len() % dims.top_k != 0
+            || indices.len() > i32::MAX as usize
+        {
+            return Err(ExpertSelectionError::Count);
+        }
+        if tile_rows == 0 || tile_rows > i32::MAX as usize || !tile_rows.is_power_of_two() {
+            return Err(ExpertSelectionError::Tile);
+        }
+        let tokens = indices.len() / dims.top_k;
+        if tokens
+            .checked_mul(dims.top_k.next_power_of_two())
+            .is_none_or(|len| len > i32::MAX as usize)
+        {
+            return Err(ExpertSelectionError::Count);
+        }
+        let mut entries = Vec::with_capacity(indices.len());
+        for (token, ids) in indices.chunks_exact(dims.top_k).enumerate() {
+            let mut seen = vec![false; dims.experts];
+            for (slot, &id) in ids.iter().enumerate() {
+                if id < 0 || id as usize >= dims.experts {
+                    return Err(ExpertSelectionError::Index);
+                }
+                if std::mem::replace(&mut seen[id as usize], true) {
+                    return Err(ExpertSelectionError::Duplicate);
+                }
+                entries.push((id as usize, token, slot));
+            }
+        }
+        entries.sort_by_key(|entry| entry.0);
+        let mut token_rows = Vec::new();
+        let mut tile_experts = Vec::new();
+        let mut inverse = vec![0i32; indices.len()];
+        let mut ranges = vec![(0usize, 0usize); dims.experts];
+        let mut cursor = 0;
+        for (expert, range) in ranges.iter_mut().enumerate() {
+            range.0 = token_rows.len();
+            while cursor < entries.len() && entries[cursor].0 == expert {
+                let (_, token, slot) = entries[cursor];
+                if token_rows.len() > i32::MAX as usize {
+                    return Err(ExpertSelectionError::Count);
+                }
+                inverse[token * dims.top_k + slot] = token_rows.len() as i32;
+                token_rows.push(token as i32);
+                cursor += 1;
+                range.1 += 1;
+            }
+            let padded = range
+                .1
+                .checked_next_multiple_of(tile_rows)
+                .ok_or(ExpertSelectionError::Count)?;
+            let end = range
+                .0
+                .checked_add(padded)
+                .filter(|&end| end <= i32::MAX as usize)
+                .ok_or(ExpertSelectionError::Count)?;
+            token_rows.resize(end, -1);
+            tile_experts.extend(std::iter::repeat_n(expert as i32, padded / tile_rows));
+        }
+        if token_rows.len() > i32::MAX as usize {
+            return Err(ExpertSelectionError::Count);
+        }
+        Ok(Self {
+            tokens,
+            tile_rows,
+            token_rows,
+            tile_experts,
+            inverse,
+            ranges,
+        })
+    }
+
+    pub fn tokens(&self) -> usize {
+        self.tokens
+    }
+    pub fn padded_rows(&self) -> usize {
+        self.token_rows.len()
+    }
+    pub fn padding_rows(&self) -> usize {
+        self.token_rows.len() - self.inverse.len()
+    }
+    pub fn token_rows(&self) -> &[i32] {
+        &self.token_rows
+    }
+    pub fn tile_experts(&self) -> &[i32] {
+        &self.tile_experts
+    }
+    pub fn inverse(&self) -> &[i32] {
+        &self.inverse
+    }
+    pub fn ranges(&self) -> &[(usize, usize)] {
+        &self.ranges
+    }
+    pub fn tile_rows(&self) -> usize {
+        self.tile_rows
+    }
+}
+
+pub struct PrefillPlan {
+    dims: MoeDims,
+    layout: PrefillLayout,
+    indices: Tensor<i32>,
+    weights: Tensor<f32>,
+    token_rows: Tensor<i32>,
+    tile_experts: Tensor<i32>,
+    inverse: Tensor<i32>,
+}
+
+impl PrefillPlan {
+    pub fn top_k(
+        logits: &TensorView<'_, f32>,
+        dims: &MoeDims,
+        tile_rows: usize,
+        stream: &Arc<cuda_core::Stream>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let shape = logits.shape();
+        if shape.len() != 2 || shape[0] <= 0 || shape[1] != dims.experts as i32 {
+            return Err(ExpertSelectionError::Count.into());
+        }
+        let tokens = shape[0] as usize;
+        let padded = dims.top_k.next_power_of_two();
+        if tokens
+            .checked_mul(padded)
+            .is_none_or(|len| len > i32::MAX as usize)
+        {
+            return Err(ExpertSelectionError::Count.into());
+        }
+        let mut indices = api::zeros::<i32>(&[tokens, padded]).sync_on(stream)?;
+        let mut weights = api::zeros::<f32>(&[tokens, padded]).sync_on(stream)?;
+        let host: Vec<i32> = kernels::top_k_prefill(
+            logits,
+            indices.partition([1, padded]),
+            weights.partition([1, padded]),
+            dims.experts as i32,
+            dims.top_k as i32,
+        )
+        .generics(dims.top_k_generics())
+        .then(|(_, ids, _, _, _)| ids.unpartition().dup().to_host_vec())
+        .sync_on(stream)?;
+        let ids: Vec<i32> = host
+            .chunks_exact(padded)
+            .flat_map(|row| row[..dims.top_k].iter().copied())
+            .collect();
+        let layout = PrefillLayout::from_indices(&ids, dims, tile_rows)?;
+        Self::upload(layout, indices, weights, dims, stream)
+    }
+
+    pub fn parse(
+        indices: &[i32],
+        weights: &[f32],
+        dims: &MoeDims,
+        tile_rows: usize,
+        stream: &Arc<cuda_core::Stream>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let layout = PrefillLayout::parse(indices, weights, dims, tile_rows)?;
+        let padded = dims.top_k.next_power_of_two();
+        let mut ids = vec![0; layout.tokens * padded];
+        let mut scores = vec![0.0; layout.tokens * padded];
+        for token in 0..layout.tokens {
+            ids[token * padded..token * padded + dims.top_k]
+                .copy_from_slice(&indices[token * dims.top_k..(token + 1) * dims.top_k]);
+            scores[token * padded..token * padded + dims.top_k]
+                .copy_from_slice(&weights[token * dims.top_k..(token + 1) * dims.top_k]);
+        }
+        let gpu_ids = api::copy_host_vec_to_device(&Arc::new(ids))
+            .reshape(&[layout.tokens, padded])
+            .sync_on(stream)?;
+        let gpu_scores = api::copy_host_vec_to_device(&Arc::new(scores))
+            .reshape(&[layout.tokens, padded])
+            .sync_on(stream)?;
+        Self::upload(layout, gpu_ids, gpu_scores, dims, stream)
+    }
+
+    fn upload(
+        layout: PrefillLayout,
+        indices: Tensor<i32>,
+        weights: Tensor<f32>,
+        dims: &MoeDims,
+        stream: &Arc<cuda_core::Stream>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let upload = |data: Vec<i32>| api::copy_host_vec_to_device(&Arc::new(data)).sync_on(stream);
+        let inverse = layout
+            .inverse
+            .chunks_exact(dims.top_k)
+            .flat_map(|row| {
+                row.iter().copied().chain(std::iter::repeat_n(
+                    0,
+                    dims.top_k.next_power_of_two() - dims.top_k,
+                ))
+            })
+            .collect();
+        Ok(Self {
+            dims: *dims,
+            token_rows: upload(layout.token_rows.clone())?,
+            tile_experts: upload(layout.tile_experts.clone())?,
+            inverse: api::copy_host_vec_to_device(&Arc::new(inverse))
+                .reshape(&[layout.tokens, dims.top_k.next_power_of_two()])
+                .sync_on(stream)?,
+            layout,
+            indices,
+            weights,
+        })
+    }
+
+    pub fn layout(&self) -> &PrefillLayout {
+        &self.layout
+    }
+    pub fn indices(&self) -> &Tensor<i32> {
+        &self.indices
+    }
+    pub fn weights(&self) -> &Tensor<f32> {
+        &self.weights
+    }
+    pub(crate) fn token_rows(&self) -> &Tensor<i32> {
+        &self.token_rows
+    }
+    pub(crate) fn tile_experts(&self) -> &Tensor<i32> {
+        &self.tile_experts
+    }
+    pub(crate) fn dims(&self) -> MoeDims {
+        self.dims
+    }
+}
+
+pub fn combine_prefill<'a>(
+    out: Partition<&'a mut Tensor<f32>>,
+    routed: &'a Tensor<f32>,
+    plan: &'a PrefillPlan,
+    shared: &'a Tensor<f32>,
+    gate: &'a Tensor<f32>,
+) -> impl DeviceOp<
+    Output = (
+        Partition<&'a mut Tensor<f32>>,
+        &'a Tensor<f32>,
+        &'a Tensor<i32>,
+        &'a Tensor<f32>,
+        &'a Tensor<f32>,
+        &'a Tensor<f32>,
+        i32,
+    ),
+> + GraphNode
++ 'a {
+    let dims = plan.dims;
+    assert_eq!(out.partition_shape, vec![1, dims.hidden]);
+    assert_eq!(
+        routed.shape(),
+        &[plan.layout.padded_rows() as i32, dims.hidden as i32]
+    );
+    assert_eq!(
+        shared.shape(),
+        &[plan.layout.tokens as i32, dims.hidden as i32]
+    );
+    assert_eq!(gate.shape(), &[plan.layout.tokens as i32, 1]);
+    kernels::combine_prefill_kernel(
+        out,
+        routed,
+        &plan.inverse,
+        &plan.weights,
+        shared,
+        gate,
+        dims.top_k as i32,
+    )
+    .generics(dims.combine_generics())
+}
+
+pub fn combine_prefill_view<'a>(
+    out: Partition<&'a mut Tensor<f32>>,
+    routed: &'a Tensor<f32>,
+    plan: &'a PrefillPlan,
+    shared: &'a TensorView<'a, f32>,
+    gate: &'a TensorView<'a, f32>,
+) -> impl DeviceOp<
+    Output = (
+        Partition<&'a mut Tensor<f32>>,
+        &'a Tensor<f32>,
+        &'a Tensor<i32>,
+        &'a Tensor<f32>,
+        &'a TensorView<'a, f32>,
+        &'a TensorView<'a, f32>,
+        i32,
+    ),
+> + GraphNode
++ 'a {
+    let dims = plan.dims;
+    assert_eq!(out.partition_shape, vec![1, dims.hidden]);
+    assert_eq!(
+        routed.shape(),
+        &[plan.layout.padded_rows() as i32, dims.hidden as i32]
+    );
+    assert_eq!(
+        shared.shape(),
+        &[plan.layout.tokens as i32, dims.hidden as i32]
+    );
+    assert_eq!(gate.shape(), &[plan.layout.tokens as i32, 1]);
+    kernels::combine_prefill_kernel(
+        out,
+        routed,
+        &plan.inverse,
+        &plan.weights,
+        shared,
+        gate,
+        dims.top_k as i32,
+    )
+    .generics(dims.combine_generics())
 }
 
 pub fn combine<'a>(

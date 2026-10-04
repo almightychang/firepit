@@ -4,6 +4,8 @@
 
 GEMV 검증은 `tests/gemv_dense.rs`와 `tests/gemv_q8.rs`에서 공개 `gemv(&Weight, ..)` 경로를 사용한다. dense PBT 가중치는 bf16로 반올림해 정확히 표현되는 f32 값으로 oracle을 계산한다. expert 변형은 `tests/moe.rs`에서 검증한다.
 
+MoE prefill은 `tests/moe_prefill.rs`에서 host 안정 정렬·expert별 타일 패딩·역순열을 정확 비교하고, grouped gate/up·down GEMM 각각을 f64 내적 oracle과 비교한다. 각 GEMM의 성분별 허용 오차는 `(γ̃_K(8)+2⁻¹⁶)Σ|w_k x_k|`이며, 결합은 실제 routed 입력을 고정한 뒤 `γ̃_(k+2)(8)Σ|term|`로 판정한다. 토큰별 2.6 decode 경로와 전체 MoE 출력도 비교한다. 150토큰 HF prefill은 router, top-k, routed 합, shared 포함 Δx를 op별로 비교하고 expert 번호 순열·재정규화 누락 대조를 실행한다.
+
 ## PBT
 
 - 커널마다 기본 64건. `PROPTEST_CASES=256 scripts/dev.sh test ...`로 늘린다(컨테이너에 전달된다).
