@@ -165,3 +165,13 @@ GB10, 전체 모델, JIT 준비 뒤 두 번째 호출. wall 8.72 s, launch별 GP
 - GB10에서 bulk load 변형은 dense GEMM 상한(V3)과 같은 수준이다. layer당 122 ms → 약 38 ms, 40층 4.9 s → 약 1.5 s. 전체 prefill 추정 8.7 s → 약 5.4 s.
 - X를 bf16 하나로(mma 1번) 바꿔도 GB10에서 1~2%만 빨라졌다. 정확도 손실에 비해 이득이 없다.
 - 한 커널에 `[BM,BN]` 출력과 `[1,BK]` scratch 출력을 함께 두면 `launch grid (1, 8, 1) does not match the inferred partition grid (16, 64, 1)`. gather를 별도 launch로 떼면 해결된다.
+
+## 분리형 grouped GEMM 반영 후 엔진 prefill (`038b417`, `bench --profile`)
+
+| T | wall | 이전(`382167d`) |
+|---:|---:|---:|
+| 512 | 0.56 s | 0.84 s |
+| 2048 | 1.89 s | 3.19 s |
+| 5000 | 5.47 s | 8.72 s |
+
+T=5000 상위: gemm 1.70 s(35%), moe_grouped_gemm 1.13 s(23%), causal_attention 0.64 s, moe_host_sort 0.54 s(host, wall), gdn_chunk_second 0.45 s, norm 0.19 s, moe_gather 0.15 s. wall − GPU 합 = 0.61 s 중 0.54 s가 host 정렬 span이다. 이전 측정의 host 정렬 0.22 s보다 커졌고 원인은 확인하지 않았다. 생성 토큰 열("The capital of France is" 32토큰)은 이전과 같다.
