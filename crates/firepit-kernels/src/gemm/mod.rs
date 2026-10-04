@@ -1,7 +1,7 @@
 use crate::moe::PrefillPlan;
 use crate::sink::Sink;
 use crate::weights::DenseMatrix;
-use cutile::tensor::{Partition, Tensor, TensorView};
+use cutile::tensor::{Partition, Tensor, TensorView, TensorViewMut};
 use half::bf16;
 
 #[cutile::module]
@@ -123,6 +123,78 @@ pub fn grouped_gemm<'a>(
 }
 
 impl GroupedGemm<'_> {
+    pub fn submit<S: Sink>(self, sink: &mut S) -> Result<(), cuda_async::error::DeviceError> {
+        use cutile::tile_kernel::TileKernel;
+        let w = self
+            .weight
+            .weights
+            .view(&[self.weight.rows, self.weight.cols])
+            .expect("DenseMatrix storage has the declared shape");
+        sink.run(
+            kernels::grouped_gemm_kernel(
+                self.y,
+                self.x,
+                &w,
+                self.plan.tile_experts(),
+                self.rows_per_expert as i32,
+            )
+            .generics(vec![
+                self.tile.m.to_string(),
+                self.tile.n.to_string(),
+                self.tile.k.to_string(),
+                self.weight.cols.to_string(),
+            ]),
+        )?;
+        Ok(())
+    }
+}
+
+pub struct GroupedGemmView<'a> {
+    weight: &'a DenseMatrix<bf16>,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<TensorViewMut<'a, f32>>,
+    plan: &'a PrefillPlan,
+    rows_per_expert: usize,
+    tile: GemmTile,
+}
+
+pub fn grouped_gemm_view<'a>(
+    weight: &'a DenseMatrix<bf16>,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<TensorViewMut<'a, f32>>,
+    plan: &'a PrefillPlan,
+    rows_per_expert: usize,
+    tile: GemmTile,
+) -> GroupedGemmView<'a> {
+    assert_eq!(tile.m, plan.layout().tile_rows());
+    assert!(tile.m > 0 && tile.n > 0 && tile.k > 0);
+    assert_eq!(weight.rows, plan.dims().experts() * rows_per_expert);
+    assert_eq!(
+        x.shape(),
+        &[plan.layout().padded_rows() as i32, weight.cols as i32]
+    );
+    assert_eq!(y.partition_shape, vec![tile.m, tile.n]);
+    assert_eq!(
+        y.grid().expect("valid output grid"),
+        (
+            plan.layout().tile_experts().len() as u32,
+            (rows_per_expert / tile.n) as u32,
+            1,
+        )
+    );
+    assert_eq!(rows_per_expert % tile.n, 0);
+    assert_eq!(weight.cols % tile.k, 0);
+    GroupedGemmView {
+        weight,
+        x,
+        y,
+        plan,
+        rows_per_expert,
+        tile,
+    }
+}
+
+impl GroupedGemmView<'_> {
     pub fn submit<S: Sink>(self, sink: &mut S) -> Result<(), cuda_async::error::DeviceError> {
         use cutile::tile_kernel::TileKernel;
         let w = self

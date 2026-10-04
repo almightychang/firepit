@@ -346,6 +346,28 @@ pub struct PrefillLayout {
 }
 
 impl PrefillLayout {
+    pub fn max_padded_rows(
+        tokens: usize,
+        dims: &MoeDims,
+        tile_rows: usize,
+    ) -> Result<usize, ExpertSelectionError> {
+        if tokens == 0 || tile_rows == 0 || !tile_rows.is_power_of_two() {
+            return Err(ExpertSelectionError::Tile);
+        }
+        let routes = tokens
+            .checked_mul(dims.top_k)
+            .ok_or(ExpertSelectionError::Count)?;
+        let occupied = dims.experts.min(routes);
+        routes
+            .checked_add(
+                occupied
+                    .checked_mul(tile_rows - 1)
+                    .ok_or(ExpertSelectionError::Count)?,
+            )
+            .filter(|&rows| rows <= i32::MAX as usize)
+            .ok_or(ExpertSelectionError::Count)
+    }
+
     pub fn parse(
         indices: &[i32],
         weights: &[f32],
@@ -636,6 +658,37 @@ pub fn gather_prefill<'a>(
         .generics(vec![tile_cols.to_string(), plan.dims.hidden.to_string()])
 }
 
+pub fn gather_prefill_view<'a>(
+    sorted: Partition<TensorViewMut<'a, f32>>,
+    x: &'a TensorView<'a, f32>,
+    plan: &'a PrefillPlan,
+    tile_cols: usize,
+) -> impl DeviceOp<
+    Output = (
+        Partition<TensorViewMut<'a, f32>>,
+        &'a TensorView<'a, f32>,
+        &'a Tensor<i32>,
+    ),
+> + GraphNode
++ 'a {
+    assert_eq!(sorted.partition_shape, vec![1, tile_cols]);
+    assert_eq!(
+        x.shape(),
+        &[plan.layout.tokens as i32, plan.dims.hidden as i32]
+    );
+    assert_eq!(
+        sorted.grid().expect("valid output grid"),
+        (
+            plan.layout.padded_rows() as u32,
+            (plan.dims.hidden / tile_cols) as u32,
+            1,
+        )
+    );
+    assert_eq!(plan.dims.hidden % tile_cols, 0);
+    kernels::gather_prefill_kernel(sorted, x, &plan.token_rows)
+        .generics(vec![tile_cols.to_string(), plan.dims.hidden.to_string()])
+}
+
 pub fn combine_prefill<'a>(
     out: Partition<&'a mut Tensor<f32>>,
     routed: &'a Tensor<f32>,
@@ -687,6 +740,47 @@ pub fn combine_prefill_view<'a>(
     Output = (
         Partition<&'a mut Tensor<f32>>,
         &'a Tensor<f32>,
+        &'a Tensor<i32>,
+        &'a Tensor<f32>,
+        &'a TensorView<'a, f32>,
+        &'a TensorView<'a, f32>,
+        i32,
+    ),
+> + GraphNode
++ 'a {
+    let dims = plan.dims;
+    assert_eq!(out.partition_shape, vec![1, dims.hidden]);
+    assert_eq!(
+        routed.shape(),
+        &[plan.layout.padded_rows() as i32, dims.hidden as i32]
+    );
+    assert_eq!(
+        shared.shape(),
+        &[plan.layout.tokens as i32, dims.hidden as i32]
+    );
+    assert_eq!(gate.shape(), &[plan.layout.tokens as i32, 1]);
+    kernels::combine_prefill_kernel(
+        out,
+        routed,
+        &plan.inverse,
+        &plan.weights,
+        shared,
+        gate,
+        dims.top_k as i32,
+    )
+    .generics(dims.combine_generics())
+}
+
+pub fn combine_prefill_sliced<'a>(
+    out: Partition<&'a mut Tensor<f32>>,
+    routed: &'a TensorView<'a, f32>,
+    plan: &'a PrefillPlan,
+    shared: &'a TensorView<'a, f32>,
+    gate: &'a TensorView<'a, f32>,
+) -> impl DeviceOp<
+    Output = (
+        Partition<&'a mut Tensor<f32>>,
+        &'a TensorView<'a, f32>,
         &'a Tensor<i32>,
         &'a Tensor<f32>,
         &'a TensorView<'a, f32>,

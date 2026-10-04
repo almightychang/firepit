@@ -376,9 +376,15 @@ fn layout_covers_single_token_skew_and_empty_experts() -> Result<(), Box<dyn std
 
 #[test]
 fn layout_oracle_pbt() {
-    let cases = (1usize..=33, 1usize..=3, any::<bool>(), any::<u16>());
+    let cases = (
+        1usize..=33,
+        1usize..=3,
+        any::<bool>(),
+        any::<u16>(),
+        prop::sample::select(vec![16usize, 32]),
+    );
     common::runner(64, file!())
-        .run(&cases, |(tokens, k, skew, seed)| {
+        .run(&cases, |(tokens, k, skew, seed, tile_rows)| {
             let dims = MoeDims::new(32, 32, 32, 4, k).unwrap();
             let ids: Vec<i32> = (0..tokens)
                 .flat_map(|token| {
@@ -388,7 +394,9 @@ fn layout_oracle_pbt() {
                 })
                 .collect();
             let scores = vec![1.0 / k as f32; tokens * k];
-            let layout = PrefillLayout::parse(&ids, &scores, &dims, 16).unwrap();
+            let layout = PrefillLayout::parse(&ids, &scores, &dims, tile_rows).unwrap();
+            let max_rows = PrefillLayout::max_padded_rows(tokens, &dims, tile_rows).unwrap();
+            prop_assert!(layout.padded_rows() <= max_rows);
             let mut expected = Vec::new();
             for expert in 0..4 {
                 let mut count = 0usize;
@@ -399,14 +407,14 @@ fn layout_oracle_pbt() {
                         count += 1;
                     }
                 }
-                expected.resize(start + count.div_ceil(16) * 16, -1);
+                expected.resize(start + count.div_ceil(tile_rows) * tile_rows, -1);
                 prop_assert_eq!(layout.ranges()[expert], (start, count));
             }
             prop_assert_eq!(layout.token_rows(), expected);
-            prop_assert_eq!(layout.padded_rows() % 16, 0);
+            prop_assert_eq!(layout.padded_rows() % tile_rows, 0);
             prop_assert_eq!(layout.padding_rows(), layout.padded_rows() - tokens * k);
             for (tile, &expert) in layout.tile_experts().iter().enumerate() {
-                for row in tile * 16..(tile + 1) * 16 {
+                for row in tile * tile_rows..(tile + 1) * tile_rows {
                     let token = layout.token_rows()[row];
                     if token >= 0 {
                         prop_assert!(
@@ -417,11 +425,39 @@ fn layout_oracle_pbt() {
             }
             for (position, &row) in layout.inverse().iter().enumerate() {
                 prop_assert_eq!(layout.token_rows()[row as usize], (position / k) as i32);
-                prop_assert_eq!(layout.tile_experts()[row as usize / 16], ids[position]);
+                prop_assert_eq!(
+                    layout.tile_experts()[row as usize / tile_rows],
+                    ids[position]
+                );
             }
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn max_padded_rows_is_attained() -> Result<(), Box<dyn std::error::Error>> {
+    for tile_rows in [16, 32] {
+        for (tokens, top_k, ids) in [
+            (1, 4, vec![0, 1, 2, 3]),
+            (4, 1, vec![0, 1, 2, 3]),
+            (
+                tile_rows + 4,
+                1,
+                [vec![0; tile_rows + 1], vec![1, 2, 3]].concat(),
+            ),
+        ] {
+            let dims = MoeDims::new(32, 32, 32, 4, top_k)?;
+            let layout = PrefillLayout::parse(&ids, &vec![1.0; ids.len()], &dims, tile_rows)?;
+            assert_eq!(
+                layout.padded_rows(),
+                PrefillLayout::max_padded_rows(tokens, &dims, tile_rows)?
+            );
+        }
+    }
+    let dims = MoeDims::new(32, 32, 32, 4, 2)?;
+    assert!(PrefillLayout::max_padded_rows(usize::MAX, &dims, 32).is_err());
+    Ok(())
 }
 
 #[test]

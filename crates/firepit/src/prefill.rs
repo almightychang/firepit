@@ -11,10 +11,10 @@ use cutile::tensor::{IntoPartition, PartitionMut, Reshape, Tensor};
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit_kernels::attention::DEFAULT_PREFILL_TILE;
 use firepit_kernels::gemm::{
-    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, gemm, grouped_gemm,
+    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, gemm, grouped_gemm_view,
 };
 use firepit_kernels::gemv::gemv;
-use firepit_kernels::moe::PrefillPlan as MoePrefillPlan;
+use firepit_kernels::moe::{PrefillLayout as MoePrefillLayout, PrefillPlan as MoePrefillPlan};
 use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::Weight;
 use firepit_kernels::{attention, elementwise, embedding, gdn, gdn_chunk, moe, norm, rope, swiglu};
@@ -170,7 +170,7 @@ pub struct PrefillPlan {
     conv_spare: Option<Tensor<f32>>,
     recurrent_spare: Option<Tensor<f32>>,
     moe: Option<MoePrefillPlan>,
-    moe_sorted: Option<Tensor<f32>>,
+    moe_sorted: Tensor<f32>,
     top_ids: Tensor<i32>,
     top_weights: Tensor<f32>,
     len: usize,
@@ -191,6 +191,8 @@ impl PrefillPlan {
     ) -> Result<Self> {
         let len = tokens.len();
         let rows = len.div_ceil(CHUNK) * CHUNK;
+        let m = model.dims.moe();
+        let max_moe_rows = MoePrefillLayout::max_padded_rows(len, &m, DEFAULT_GROUPED_GEMM_TILE.m)?;
         let mut ops = Vec::new();
         for op in StepPlan::ops(model) {
             match op {
@@ -222,7 +224,10 @@ impl PrefillPlan {
         let buffers = Slot::ALL
             .iter()
             .map(|&slot| {
-                let shape = PrefillSlot::Sequence(slot).shape(model, rows, len);
+                let mut shape = PrefillSlot::Sequence(slot).shape(model, rows, len);
+                if matches!(slot, Slot::ExpertUp | Slot::ExpertAct | Slot::ExpertOut) {
+                    shape[0] = max_moe_rows;
+                }
                 api::zeros::<f32>(&shape).sync_on(stream)
             })
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -270,7 +275,7 @@ impl PrefillPlan {
             conv_spare,
             recurrent_spare,
             moe: None,
-            moe_sorted: None,
+            moe_sorted: api::zeros::<f32>(&[max_moe_rows, model.dims.hidden()]).sync_on(stream)?,
             top_ids,
             top_weights,
             len,
@@ -507,11 +512,12 @@ pub(crate) fn run(
                         .padded_rows();
                     let (source, target) =
                         input_output(&mut plan.buffers, Slot::ExpertUp, Slot::ExpertAct);
+                    let x = source.slice(&[0..count, 0..2 * m.intermediate()])?;
+                    let y = target.slice_mut(&[0..count, 0..m.intermediate()])?;
                     sink.run(
-                        swiglu::swiglu(target.partition([1, m.intermediate()]), source)
+                        swiglu::swiglu(y.partition([1, m.intermediate()]), &x)
                             .generics(vec![m.intermediate().to_string()]),
                     )?;
-                    debug_assert_eq!(source.shape()[0] as usize, count);
                 }
                 PrefillOp::Kernel(Op::SharedSwiglu) => {
                     let (source, target) =
@@ -835,22 +841,17 @@ fn run_special(
             let layout =
                 MoePrefillPlan::parse(&ids, &weights, &m, DEFAULT_GROUPED_GEMM_TILE.m, stream)?;
             let count = layout.layout().padded_rows();
-            for slot in [Slot::ExpertUp, Slot::ExpertAct, Slot::ExpertOut] {
-                let width = match slot {
-                    Slot::ExpertUp => 2 * m.intermediate(),
-                    Slot::ExpertAct => m.intermediate(),
-                    _ => d.hidden(),
-                };
-                plan.buffers[slot.index()] = api::zeros::<f32>(&[count, width]).sync_on(stream)?;
+            if count > plan.moe_sorted.shape()[0] as usize {
+                return Err("MoE padded rows exceed prefill buffer capacity".into());
             }
-            plan.moe_sorted = Some(api::zeros::<f32>(&[count, d.hidden()]).sync_on(stream)?);
             plan.moe = Some(layout);
         }
         PrefillOp::Gather => {
             let layout = plan.moe.as_ref().ok_or("missing MoE layout")?;
+            let count = layout.layout().padded_rows();
             let x = plan.buffers[Slot::Normed.index()].slice(&[0..len, 0..d.hidden()])?;
-            let sorted = plan.moe_sorted.as_mut().ok_or("missing sorted MoE input")?;
-            sink.run(moe::gather_prefill(
+            let sorted = plan.moe_sorted.slice_mut(&[0..count, 0..d.hidden()])?;
+            sink.run(moe::gather_prefill_view(
                 sorted.partition([1, DEFAULT_GROUPED_GEMM_TILE.k]),
                 &x,
                 layout,
@@ -859,13 +860,15 @@ fn run_special(
         }
         PrefillOp::ExpertGateUp { layer } => {
             let layout = plan.moe.as_ref().ok_or("missing MoE layout")?;
-            let x = plan.moe_sorted.as_ref().ok_or("missing sorted MoE input")?;
+            let count = layout.layout().padded_rows();
+            let x = plan.moe_sorted.slice(&[0..count, 0..d.hidden()])?;
             let target = &mut plan.buffers[Slot::ExpertUp.index()];
+            let y = target.slice_mut(&[0..count, 0..2 * m.intermediate()])?;
             let tile = gemm_tile(d.hidden(), 2 * m.intermediate(), true);
-            grouped_gemm(
+            grouped_gemm_view(
                 &model.layers[layer].moe.gate_up,
-                &x.view(&[layout.layout().padded_rows(), d.hidden()])?,
-                target.partition([tile.m, tile.n]),
+                &x,
+                y.partition([tile.m, tile.n]),
                 layout,
                 2 * m.intermediate(),
                 tile,
@@ -876,12 +879,14 @@ fn run_special(
             let layout = plan.moe.as_ref().ok_or("missing MoE layout")?;
             let (source, target) =
                 input_output(&mut plan.buffers, Slot::ExpertAct, Slot::ExpertOut);
-            let x = source.view(&[layout.layout().padded_rows(), m.intermediate()])?;
+            let count = layout.layout().padded_rows();
+            let x = source.slice(&[0..count, 0..m.intermediate()])?;
+            let y = target.slice_mut(&[0..count, 0..d.hidden()])?;
             let tile = gemm_tile(m.intermediate(), d.hidden(), true);
-            grouped_gemm(
+            grouped_gemm_view(
                 &model.layers[layer].moe.down,
                 &x,
-                target.partition([tile.m, tile.n]),
+                y.partition([tile.m, tile.n]),
                 layout,
                 d.hidden(),
                 tile,
@@ -899,9 +904,10 @@ fn run_special(
             );
             let shared = shared.slice(&[0..len, 0..d.hidden()])?;
             let gate = gate.slice(&[0..len, 0..1])?;
-            sink.run(moe::combine_prefill_view(
+            let routed = routed.slice(&[0..layout.layout().padded_rows(), 0..d.hidden()])?;
+            sink.run(moe::combine_prefill_sliced(
                 target.partition([1, d.hidden()]),
-                routed,
+                &routed,
                 layout,
                 &shared,
                 &gate,
