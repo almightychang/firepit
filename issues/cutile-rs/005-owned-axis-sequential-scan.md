@@ -31,3 +31,11 @@ Costs: the time tile is a const generic, so every new power-of-two prompt length
 ## Question
 
 `cutile/src/tensor.rs` documents `OWNED`: "An owned axis is not traversed by the mapped work-item stream: each stream item owns the axis's full extent, so in-kernel loops traverse it with plain (`Dim`-bounded) indices." That reads like exactly this case. Is `MappedPartitionMut` with an `OWNED` time axis the intended pattern? If so, could an example be added (the only `MappedPartitionMut` example, `persistent_gemm.rs`, does not use `OWNED`), including how a second mutable output (the in-place state) should be partitioned so the grids agree? We are happy to contribute the example once the intended shape is clear.
+
+## Follow-up experiment (2026-10-04, RTX 5080, probe code in `005-owned-prefill-probe.rs`)
+
+- A causal conv prefill with the time axis `OWNED` works: output `[T, C]`, tile `[1, CT]`, `map([OWNED, 1], C/CT)`, and the in-place state as an ordinary `&mut Tensor` `[C, K−1]` partitioned `[CT, KT]` share the physical grid `(C/CT, 1, 1)`. Results match our existing kernel bit for bit and an f64 oracle to 4.9e-9.
+- The time tile leaves the const generics, but the in-process JIT count was 1 at T=3 and 1 at T=16, 0 for T=5, 9, 32 … 1024 (the existing kernel: 1 per T). Which shape properties trigger respecialization?
+- Two mapped outputs with different map shapes (`[OWNED, 1]` and `[1, OWNED]`) launched with the same `num_tile_blocks`. Is the pairing of their `iter_indices()` guaranteed?
+- For a chunked scan whose state is updated in place, `MappedPartitionMut` has no `load()`, so the state cannot simply be a mapped output too. What is the recommended pattern?
+- Performance at CT=16: 1.08× the time of the non-mapped kernel (T = 256–1024).
