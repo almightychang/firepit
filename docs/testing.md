@@ -51,6 +51,8 @@ GEMV는 oracle 비교와 선형성·배치 독립·가중치 행 치환을 검�
 - 경로 동치: `prefill(T)`와 `step_eager` T회, `prefill(A)` 뒤 `prefill(B)`와 `prefill(A+B)`의 마지막 logits top-1·top-5 집합이 같아야 한다. 두 경로의 logits 및 모든 층의 GDN conv·recurrent 또는 attention K·V state 차이를 기록한다. 현재 고정 입력은 T=150, A=100, B=50이다.
 - 작은 random 모델 대조는 이어 붙이기에서 RoPE 위치를 0으로 재설정하거나 prefill lm_head가 첫 행을 읽으면 차이가 생기는지 검사한다.
 
+GB10 결과(2026-10-04, [기록](research/measurements/engine-verify-gb10.md)): 세 비교 모두 통과. 두 경로의 상태 차이는 첫 MoE 라우팅 flip(근소 margin에서 top-k 집합이 갈림) 전까지 1e-5 수준이고, flip layer에서 계단식으로 뛴다. 따라서 첫 flip 뒤의 tensor 비교는 커널 정확도의 근거가 아니다. 커널 정확도를 전체 stack에서 보려면 라우팅을 고정한 비교가, 모델 품질은 많은 토큰에 대한 출력 분포 비교(KL, perplexity, top-k 일치율)가 맞다.
+
 전체 layer stack의 수학적으로 엄밀한 오차 상한은 미해결이다. 따라서 위 top-k 일치만 통과 조건이고, 기록하는 오차 수치에는 근거 없는 허용치를 두지 않는다.
 
 ## 판정 기준 현황

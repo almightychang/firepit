@@ -23,8 +23,8 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
  E2. Qwen3.6-35B-A3B decode (실제 수학)                            ✔
     아래 "E2 공부 단위" 참고
 
- E3. prefill                                                      ◐
-    아래 "E3 공부 단위" 참고. 동기: 5071토큰 prompt를 decode 경로로 215초
+ E3. prefill                                                      ✔
+    아래 "E3 공부 단위" 참고. 동기: 5071토큰 prompt를 decode 경로로 215초 → GB10 5000토큰 4.97초
 
  E4. 성능 (GB10)                                                  ◐
     ✔ Spark 측정 → GDN conv 타일화로 decode 12 → 30.6 tok/s (대역폭 하한의 92%)
@@ -93,7 +93,7 @@ E2와 같은 순서(개념 → 구현 → 정답 비교)에 성능 기준을 더
 | 3.4 GDN chunk ① | chunk 안 계산, FLA 블록 삼각 역행렬 | f64 oracle·HF 입력·decode 합성 | 성분별 반올림 상한, GB10 5000토큰 layer당 6.1 ms | ✔ |
 | 3.5 GDN chunk ② | chunk 사이 state 전달 | f64 oracle·decode 동치·HF 150토큰 GDN layer | RTX 5080 5000토큰 second phase 3.96 ms, 전체 chunk 5.74 ms | ✔ (HF GDN layer 끝-끝 일치, GB10 5000토큰 chunk 전체 layer당 21 ms) |
 | 3.6 MoE prefill | expert별로 토큰 모으기 | MoE 블록 일치 | 실측 최대 대비 % | ✔ (host 안정 정렬·expert별 BM 패딩, f64 PBT·decode 동치·HF 150토큰 4 layer, RTX 5080 T=5000 gate_up 35.74 ms·down 13.33 ms) |
-| 3.7 조립 | 엔진 prefill 경로 | prefill(T) = decode T번 (logits, state) | 5000토큰 prompt 215초 → 5초 이내 (계산 하한 약 0.4초, [기준선](research/measurements/gemm-peak-gb10.md)) | ○ |
+| 3.7 조립 | 엔진 prefill 경로 | prefill(T) = decode T번 (logits, state) | 5000토큰 prompt 215초 → 5초 이내 (계산 하한 약 0.4초, [기준선](research/measurements/gemm-peak-gb10.md)) | ✔ (GB10 4.97 s; 실제 모델 HF·prefill/step·이어 붙이기 top-1/top-5 일치, [검증](research/measurements/engine-verify-gb10.md)) |
 
 E7 성능 단계에서 GEMM의 M·N·K와 GPU 특성에 따라 타일 크기를 자동 선택한다. E3.1은 호출자가 타일을 지정하며 기본값은 64×128×32이다.
 E3.2 attention의 현재 기본 BM×BN은 16×32이다. RTX 5080의 head_dim 256 release cubin에서 255 registers/thread, 1008-byte stack/thread와 `STL` spill을 확인했다. 타일 자동 선택과 spill 저감은 E7에서 다룬다.
