@@ -12,12 +12,20 @@ struct Args {
     warmup: usize,
     max_seq: usize,
     layers: Option<usize>,
+    prefill_lengths: Option<Vec<usize>>,
 }
 
 fn parse_args() -> Result<Args> {
     let mut values = env::args().skip(1);
-    let (mut model, mut batches, mut steps, mut warmup, mut max_seq, mut layers) =
-        (None, None, None, None, None, None);
+    let (
+        mut model,
+        mut batches,
+        mut steps,
+        mut warmup,
+        mut max_seq,
+        mut layers,
+        mut prefill_lengths,
+    ) = (None, None, None, None, None, None, None);
     while let Some(flag) = values.next() {
         let value = values.next().ok_or(format!("missing value for {flag}"))?;
         match flag.as_str() {
@@ -34,16 +42,37 @@ fn parse_args() -> Result<Args> {
             "--warmup" => warmup = Some(value.parse()?),
             "--max-seq" => max_seq = Some(value.parse()?),
             "--layers" => layers = Some(value.parse()?),
+            "--prefill-lengths" => {
+                prefill_lengths = Some(
+                    value
+                        .split(',')
+                        .map(str::parse)
+                        .collect::<std::result::Result<_, _>>()?,
+                )
+            }
             _ => return Err(format!("unknown argument {flag}").into()),
         }
     }
     Ok(Args {
         model: model.ok_or("missing --model")?,
-        batches: batches.ok_or("missing --batches")?,
-        steps: steps.ok_or("missing --steps")?,
-        warmup: warmup.ok_or("missing --warmup")?,
+        batches: if prefill_lengths.is_some() {
+            batches.unwrap_or_default()
+        } else {
+            batches.ok_or("missing --batches")?
+        },
+        steps: if prefill_lengths.is_some() {
+            steps.unwrap_or_default()
+        } else {
+            steps.ok_or("missing --steps")?
+        },
+        warmup: if prefill_lengths.is_some() {
+            warmup.unwrap_or_default()
+        } else {
+            warmup.ok_or("missing --warmup")?
+        },
         max_seq: max_seq.ok_or("missing --max-seq")?,
         layers,
+        prefill_lengths,
     })
 }
 
@@ -53,7 +82,10 @@ fn percentile(sorted: &[Duration], p: f64) -> Duration {
 
 fn main() -> Result<()> {
     let args = parse_args()?;
-    if args.warmup + args.steps > args.max_seq {
+    if args.prefill_lengths.is_some() && cfg!(debug_assertions) {
+        return Err("prefill measurement requires --release".into());
+    }
+    if args.prefill_lengths.is_none() && args.warmup + args.steps > args.max_seq {
         return Err("warmup + steps exceeds max_seq".into());
     }
     let device = Device::new(0)?;
@@ -69,6 +101,27 @@ fn main() -> Result<()> {
     println!("load {:.1}s", loading.elapsed().as_secs_f64());
     let mut engine = Engine::new(model, &device)?;
     let token = 760;
+    if let Some(lengths) = args.prefill_lengths {
+        for length in lengths {
+            if length == 0 || length > args.max_seq {
+                return Err("invalid prefill length".into());
+            }
+            let tokens = vec![token; length];
+            let mut warm = engine.new_session(SessionId(1))?;
+            let _ = engine.prefill(&mut warm, &tokens)?;
+            engine.close_session(warm)?;
+            let mut session = engine.new_session(SessionId(2))?;
+            let started = Instant::now();
+            let logits = engine.prefill(&mut session, &tokens)?;
+            println!(
+                "prefill T={length} wall_ms={:.3} logits={}",
+                started.elapsed().as_secs_f64() * 1e3,
+                logits.len()
+            );
+            engine.close_session(session)?;
+        }
+        return Ok(());
+    }
     for &batch in &args.batches {
         let mut sessions = (0..batch)
             .map(|id| engine.new_session(SessionId(id as u64)))

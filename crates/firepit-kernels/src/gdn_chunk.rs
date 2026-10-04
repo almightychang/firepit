@@ -1,3 +1,6 @@
+pub const DEFAULT_CHUNK_SIZE: usize = 64;
+pub const DEFAULT_BLOCK_SIZE: usize = 16;
+
 #[cutile::module]
 mod kernels {
     use cutile::core::*;

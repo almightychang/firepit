@@ -4,6 +4,7 @@ mod engine;
 mod execute;
 mod model;
 mod plan;
+mod prefill;
 mod session;
 #[cfg(feature = "testing")]
 mod testing;

@@ -3,6 +3,7 @@ use crate::checkpoint::Stream;
 use crate::execute::run;
 use crate::model::Model;
 use crate::plan::StepPlan;
+use crate::prefill::{self, PrefillPlan};
 use crate::session::{Batch, Session, SessionId};
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::DeviceOp;
@@ -86,6 +87,54 @@ impl Engine {
         self.step_with(batch, |model, plan, sessions, stream| {
             run(model, plan, sessions, &mut Eager(stream))
         })
+    }
+
+    pub fn prefill(&mut self, session: &mut Session, tokens: &[u32]) -> Result<Vec<f32>> {
+        let result = (|| -> Result<Vec<f32>> {
+            if session.engine != self.id
+                || session.poisoned
+                || tokens.is_empty()
+                || session
+                    .position
+                    .checked_add(tokens.len())
+                    .is_none_or(|end| end > self.model.dims.max_seq())
+                || tokens
+                    .iter()
+                    .any(|&token| token as usize >= self.model.dims.vocab())
+            {
+                return Err("invalid prefill session or tokens".into());
+            }
+            for op in StepPlan::ops(&self.model) {
+                if let crate::plan::Op::Gemv { layer, name, .. } = op {
+                    if !matches!(
+                        crate::execute::weight(&self.model, layer, name),
+                        firepit_kernels::weights::Weight::Dense(_)
+                    ) {
+                        return Err("prefill requires dense bf16 weights".into());
+                    }
+                }
+            }
+            let mut plan = PrefillPlan::new(
+                &self.model,
+                tokens,
+                session.position,
+                self.gdn_conv_tile,
+                self.gdn_value_tile,
+                &self.stream,
+            )?;
+            prefill::run(&self.model, &mut plan, session, &self.stream)?;
+            plan.logits(&self.stream)
+        })();
+        match result {
+            Ok(logits) => {
+                session.position += tokens.len();
+                Ok(logits)
+            }
+            Err(error) => {
+                session.poisoned = true;
+                Err(error)
+            }
+        }
     }
 
     pub fn step(&mut self, batch: Batch<'_>) -> Result<Vec<f32>> {
@@ -216,6 +265,107 @@ mod tests {
         assert!(engine.step_eager(batch).is_err());
         assert_eq!(session.position(), 0);
         assert!(engine.batch([(&mut session, 1)]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_small_model_runs() -> Result<()> {
+        let device = Device::new(0)?;
+        let model = small_model(&device)?;
+        let mut engine = Engine::new(model, &device)?;
+        let mut session = engine.new_session(SessionId(1))?;
+        let logits = engine.prefill(&mut session, &[1, 2])?;
+        assert_eq!(logits.len(), engine.model.dims.vocab());
+        assert_eq!(session.position(), 2);
+        Ok(())
+    }
+
+    #[test]
+    fn invalid_prefill_poisons_session() -> Result<()> {
+        let device = Device::new(0)?;
+        let model = small_model(&device)?;
+        let mut engine = Engine::new(model, &device)?;
+        for tokens in [vec![], vec![engine.model.dims.vocab() as u32]] {
+            let mut session = engine.new_session(SessionId(1))?;
+            assert!(engine.prefill(&mut session, &tokens).is_err());
+            assert_eq!(session.position(), 0);
+            assert!(engine.batch([(&mut session, 1)]).is_err());
+            engine.close_session(session)?;
+        }
+        let mut session = engine.new_session(SessionId(1))?;
+        let overlong = vec![1; engine.model.dims.max_seq() + 1];
+        assert!(engine.prefill(&mut session, &overlong).is_err());
+        assert_eq!(session.position(), 0);
+        assert!(engine.batch([(&mut session, 1)]).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn prefill_small_model_diagnostics() -> Result<()> {
+        use cutile::tile_kernel::ToHostVecOp;
+        let device = Device::new(0)?;
+        let model = small_model(&device)?;
+        let mut prefill_engine = Engine::new(model.clone(), &device)?;
+        let mut decode_engine = Engine::new(model, &device)?;
+        let mut p = prefill_engine.new_session(SessionId(1))?;
+        let mut s = decode_engine.new_session(SessionId(1))?;
+        for tokens in [[1, 2].as_slice(), [3, 4].as_slice()] {
+            let actual = prefill_engine.prefill(&mut p, tokens)?;
+            let mut expected = Vec::new();
+            for &token in tokens {
+                let batch = decode_engine.batch([(&mut s, token)])?;
+                expected = decode_engine.step_eager(batch)?;
+            }
+            let max = actual
+                .iter()
+                .zip(&expected)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f32, f32::max);
+            println!("position={} logits max_abs={max}", p.position());
+            assert!(actual.iter().all(|x| x.is_finite()));
+            for (layer, (ps, ds)) in p.state.iter().zip(&s.state).enumerate() {
+                match (ps, ds) {
+                    (
+                        crate::session::LayerState::Gdn {
+                            conv: pc,
+                            recurrent: pr,
+                        },
+                        crate::session::LayerState::Gdn {
+                            conv: dc,
+                            recurrent: dr,
+                        },
+                    ) => {
+                        for (name, pv, dv) in [("conv", pc, dc), ("recurrent", pr, dr)] {
+                            let a = pv.dup().to_host_vec().sync_on(&prefill_engine.stream)?;
+                            let b = dv.dup().to_host_vec().sync_on(&decode_engine.stream)?;
+                            let max = a
+                                .iter()
+                                .zip(&b)
+                                .map(|(x, y)| (x - y).abs())
+                                .fold(0.0f32, f32::max);
+                            println!("layer={layer} {name} max_abs={max}");
+                        }
+                    }
+                    (
+                        crate::session::LayerState::Attention { k: pk, v: pv },
+                        crate::session::LayerState::Attention { k: dk, v: dv },
+                    ) => {
+                        for (name, x, y) in [("k", pk, dk), ("v", pv, dv)] {
+                            let a = x.dup().to_host_vec().sync_on(&prefill_engine.stream)?;
+                            let b = y.dup().to_host_vec().sync_on(&decode_engine.stream)?;
+                            let end = p.position() * a.len() / prefill_engine.model.dims.max_seq();
+                            let max = a[..end]
+                                .iter()
+                                .zip(&b[..end])
+                                .map(|(x, y)| (x - y).abs())
+                                .fold(0.0f32, f32::max);
+                            println!("layer={layer} {name} max_abs={max}");
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
         Ok(())
     }
 

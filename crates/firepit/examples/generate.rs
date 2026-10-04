@@ -112,18 +112,9 @@ fn main() -> Result<()> {
     )?);
     let mut engine = Engine::new(model, &device)?;
     let mut session = engine.new_session(SessionId(1))?;
-    let mut prefill = Vec::with_capacity(input.len());
-    let mut logits = Vec::new();
-    for &token in input {
-        let step = Instant::now();
-        let batch = engine.batch([(&mut session, token)])?;
-        logits = if args.eager {
-            engine.step_eager(batch)?
-        } else {
-            engine.step(batch)?
-        };
-        prefill.push(step.elapsed());
-    }
+    let prefill_started = Instant::now();
+    let mut logits = engine.prefill(&mut session, input)?;
+    let prefill_time = prefill_started.elapsed();
     let mut generated = Vec::new();
     let mut decode_times = Vec::new();
     let mut stream = tokenizer.decode_stream(true);
@@ -153,7 +144,7 @@ fn main() -> Result<()> {
     }
     println!();
     println!("token_ids: {generated:?}");
-    println!("prefill_step_times: {:?}", prefill);
+    println!("prefill_time: {:?}", prefill_time);
     println!("decode_step_times: {:?}", decode_times);
     println!("total_time: {:?}", started.elapsed());
     Ok(())

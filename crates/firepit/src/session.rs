@@ -3,6 +3,7 @@ use crate::{LayerKind, ModelDims, Result};
 use cuda_async::device_operation::DeviceOp;
 use cutile::api;
 use cutile::tensor::Tensor;
+use firepit_kernels::gdn::GdnDims;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,6 +22,47 @@ pub enum LayerState {
         k: Tensor<f32>,
         v: Tensor<f32>,
     },
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct GdnStateLayout(GdnDims);
+
+impl GdnStateLayout {
+    pub(crate) fn new(dims: GdnDims) -> Self {
+        Self(dims)
+    }
+
+    pub(crate) fn conv_storage(self) -> [usize; 2] {
+        [self.0.conv_dim(), self.0.conv_kernel() - 1]
+    }
+
+    pub(crate) fn conv_prefill(self) -> [usize; 3] {
+        [1, self.0.conv_dim(), self.0.conv_kernel() - 1]
+    }
+
+    pub(crate) fn conv_prefill_grid(self, channel_tile: usize) -> [usize; 3] {
+        [1, channel_tile, self.0.conv_kernel().next_power_of_two()]
+    }
+
+    pub(crate) fn recurrent_storage(self) -> [usize; 3] {
+        [
+            self.0.value_heads(),
+            self.0.key_head_dim(),
+            self.0.value_head_dim(),
+        ]
+    }
+
+    pub(crate) fn recurrent_prefill(self) -> [usize; 3] {
+        [
+            1,
+            self.0.value_heads() * self.0.key_head_dim(),
+            self.0.value_head_dim(),
+        ]
+    }
+
+    pub(crate) fn recurrent_prefill_grid(self, value_tile: usize) -> [usize; 3] {
+        [1, self.0.key_head_dim(), value_tile]
+    }
 }
 
 pub struct Session {
@@ -51,15 +93,11 @@ impl Session {
             state.push(match kind {
                 LayerKind::Gdn => {
                     let g = dims.gdn();
+                    let layout = GdnStateLayout::new(g);
                     LayerState::Gdn {
-                        conv: api::zeros::<f32>(&[g.conv_dim(), g.conv_kernel() - 1])
+                        conv: api::zeros::<f32>(&layout.conv_storage()).sync_on(stream)?,
+                        recurrent: api::zeros::<f32>(&layout.recurrent_storage())
                             .sync_on(stream)?,
-                        recurrent: api::zeros::<f32>(&[
-                            g.value_heads(),
-                            g.key_head_dim(),
-                            g.value_head_dim(),
-                        ])
-                        .sync_on(stream)?,
                     }
                 }
                 LayerKind::Attention => {

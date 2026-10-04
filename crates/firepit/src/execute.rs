@@ -9,7 +9,7 @@ use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::{Q8_BLOCK, Weight};
 use firepit_kernels::{attention, elementwise, embedding, gdn, moe, norm, rope, swiglu};
 
-fn input_output(
+pub(crate) fn input_output(
     buffers: &mut [Tensor<f32>],
     input: Slot,
     output: Slot,
@@ -22,7 +22,7 @@ fn input_output(
     (if i < o { &before[i] } else { &after[i - o - 1] }, out)
 }
 
-fn two_inputs_output(
+pub(crate) fn two_inputs_output(
     buffers: &mut [Tensor<f32>],
     a: Slot,
     b: Slot,
@@ -39,7 +39,7 @@ fn two_inputs_output(
     (get(a), get(b), out)
 }
 
-fn three_inputs_output(
+pub(crate) fn three_inputs_output(
     buffers: &mut [Tensor<f32>],
     a: Slot,
     b: Slot,
@@ -57,7 +57,7 @@ fn three_inputs_output(
     (get(a), get(b), get(c), out)
 }
 
-fn gemv_tile(rows: usize, cols: usize) -> GemvTile {
+pub(crate) fn gemv_tile(rows: usize, cols: usize) -> GemvTile {
     let mut tile = DEFAULT_GEMV_TILE;
     while rows % tile.rows != 0 {
         tile.rows /= 2;
@@ -68,7 +68,7 @@ fn gemv_tile(rows: usize, cols: usize) -> GemvTile {
     tile
 }
 
-fn weight(model: &Model, layer: usize, name: WeightName) -> &Weight {
+pub(crate) fn weight(model: &Model, layer: usize, name: WeightName) -> &Weight {
     use WeightName::*;
     if matches!(name, LmHead) {
         return &model.lm_head;

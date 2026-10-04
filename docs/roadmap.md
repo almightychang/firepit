@@ -47,6 +47,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
     ○ MoE grouped GEMM은 현재 모든 expert에 BM=16을 쓰고 expert별 마지막 타일을 패딩한다. expert 행 수에 따라 BM=64/16 등으로 달리 골라 패딩과 CTA 수를 함께 줄이고, 행별 gather의 register spill을 줄인다.
     ○ GEMV 열 타일(NB): batch·레지스터 압박에 따라 autotune 또는 규칙
     ○ TARGET_BLOCKS_PER_SM, MIN_ROW_TILE, MAX_BATCH_SESSIONS 근거 재검토
+    ○ GDN prefill chunk 크기와 역행렬 대각 block 크기(현재 64/16)를 장치와 모델 형상에 따라 선택
 
  기여 트랙 (병행)
     ✔ cutile-rs #184 재현 · slice_mut 구현 (로컬 브랜치)

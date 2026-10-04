@@ -13,48 +13,6 @@ mod kernels {
     use cutile::core::*;
 
     #[cutile::entry()]
-    pub fn top_k<const SIZE: i32, const TOP: i32>(
-        logits: &Tensor<f32, { [-1] }>,
-        indices: &mut Tensor<i32, { [TOP] }>,
-        weights: &mut Tensor<f32, { [TOP] }>,
-        experts: i32,
-        k: i32,
-    ) {
-        let values: Tile<f32, { [SIZE] }> = logits.partition(shape![SIZE]).load([0]);
-        let positions: Tile<i32, { [SIZE] }> = iota(shape![SIZE]);
-        let ranks: Tile<i32, { [TOP] }> = iota(shape![TOP]);
-        let valid: Tile<bool, { [SIZE] }> = lt_tile(positions, experts.broadcast(shape![SIZE]));
-        let negative: Tile<f32, { [SIZE] }> = constant(f32::NEG_INFINITY, shape![SIZE]);
-        let mut remaining: Tile<f32, { [SIZE] }> = select(valid, values, negative);
-        let maximum: Tile<f32, { [1] }> = reduce_max(remaining, 0i32);
-        let origin: f32 = tile_to_scalar(maximum.reshape(shape![]));
-        let mut total: Tile<f32, { [1] }> = constant(0.0f32, shape![1]);
-        let mut selected_ids: Tile<i32, { [TOP] }> = constant(0i32, shape![TOP]);
-        let mut selected_scores: Tile<f32, { [TOP] }> = constant(0.0f32, shape![TOP]);
-        for rank in 0i32..k {
-            let peak_tile: Tile<f32, { [1] }> = reduce_max(remaining, 0i32);
-            let peak: f32 = tile_to_scalar(peak_tile.reshape(shape![]));
-            let matching: Tile<bool, { [SIZE] }> = eq_tile(remaining, peak.broadcast(shape![SIZE]));
-            let candidates: Tile<i32, { [SIZE] }> = select(
-                matching,
-                positions,
-                (experts - 1i32).broadcast(shape![SIZE]),
-            );
-            let winner_tile: Tile<i32, { [1] }> = reduce_min(candidates, 0i32);
-            let winner: i32 = tile_to_scalar(winner_tile.reshape(shape![]));
-            let score: Tile<f32, { [1] }> = exp((peak - origin).broadcast(shape![1]));
-            let slot: Tile<bool, { [TOP] }> = eq_tile(ranks, rank.broadcast(shape![TOP]));
-            selected_ids = select(slot, winner.broadcast(shape![TOP]), selected_ids);
-            selected_scores = select(slot, score.broadcast(shape![TOP]), selected_scores);
-            total = total + score;
-            let chosen: Tile<bool, { [SIZE] }> = eq_tile(positions, winner.broadcast(shape![SIZE]));
-            remaining = select(chosen, negative, remaining);
-        }
-        indices.store(selected_ids);
-        weights.store(selected_scores / total.broadcast(shape![TOP]));
-    }
-
-    #[cutile::entry()]
     pub fn top_k_prefill<const SIZE: i32, const TOP: i32>(
         logits: &Tensor<f32, { [-1, -1] }>,
         indices: &mut Tensor<i32, { [1, TOP] }>,
@@ -122,28 +80,6 @@ mod kernels {
         }
         let shared: Tile<f32, { [1, H] }> = shared.partition(shape![1, H]).load([pid.0, 0]);
         let gate: Tile<f32, { [1, 1] }> = gate.partition(shape![1, 1]).load([pid.0, 0]);
-        let one: Tile<f32, { [1, 1] }> = constant(1.0f32, shape![1, 1]);
-        let sigmoid = one / (one + exp(gate * constant(-1.0f32, shape![1, 1])));
-        out.store(sum + shared * sigmoid.broadcast(shape![1, H]));
-    }
-
-    #[cutile::entry()]
-    pub fn combine_kernel<const H: i32>(
-        out: &mut Tensor<f32, { [1, H] }>,
-        routed: &Tensor<f32, { [-1, H] }>,
-        weights: &Tensor<f32, { [-1] }>,
-        shared: &Tensor<f32, { [1, H] }>,
-        gate: &Tensor<f32, { [1, 1] }>,
-        k: i32,
-    ) {
-        let mut sum: Tile<f32, { [1, H] }> = constant(0.0f32, shape![1, H]);
-        for rank in 0i32..k {
-            let row: Tile<f32, { [1, H] }> = routed.partition(shape![1, H]).load([rank, 0]);
-            let weight: Tile<f32, { [1] }> = weights.partition(shape![1]).load([rank]);
-            sum = sum + row * weight.reshape(shape![1, 1]).broadcast(shape![1, H]);
-        }
-        let shared: Tile<f32, { [1, H] }> = shared.partition(shape![1, H]).load([0, 0]);
-        let gate: Tile<f32, { [1, 1] }> = gate.partition(shape![1, 1]).load([0, 0]);
         let one: Tile<f32, { [1, 1] }> = constant(1.0f32, shape![1, 1]);
         let sigmoid = one / (one + exp(gate * constant(-1.0f32, shape![1, 1])));
         out.store(sum + shared * sigmoid.broadcast(shape![1, H]));
@@ -267,6 +203,7 @@ impl std::error::Error for ExpertSelectionError {}
 pub struct ExpertSelection {
     indices: Tensor<i32>,
     weights: Tensor<f32>,
+    inverse: Tensor<i32>,
     dims: MoeDims,
 }
 
@@ -277,8 +214,11 @@ impl ExpertSelection {
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let padded = dims.top_k.next_power_of_two();
         Ok(Self {
-            indices: api::zeros::<i32>(&[padded]).sync_on(stream)?,
-            weights: api::zeros::<f32>(&[padded]).sync_on(stream)?,
+            indices: api::zeros::<i32>(&[1, padded]).sync_on(stream)?,
+            weights: api::zeros::<f32>(&[1, padded]).sync_on(stream)?,
+            inverse: api::copy_host_vec_to_device(&Arc::new((0..padded as i32).collect()))
+                .reshape(&[1, padded])
+                .sync_on(stream)?,
             dims: *dims,
         })
     }
@@ -290,11 +230,12 @@ impl ExpertSelection {
     ) -> Result<(), Box<dyn std::error::Error>> {
         assert_eq!(logits.shape(), &[self.dims.experts as i32]);
         let padded = self.dims.top_k.next_power_of_two();
+        let rows = logits.view(&[1, self.dims.experts])?;
         sink.run(
-            kernels::top_k(
-                logits,
-                self.indices.partition([padded]),
-                self.weights.partition([padded]),
+            kernels::top_k_prefill(
+                &rows,
+                self.indices.partition([1, padded]),
+                self.weights.partition([1, padded]),
                 self.dims.experts as i32,
                 self.dims.top_k as i32,
             )
@@ -347,8 +288,15 @@ impl ExpertSelection {
         let mut padded_weights = weights.to_vec();
         padded_weights.resize(padded, 0.0);
         Ok(Self {
-            indices: api::copy_host_vec_to_device(&Arc::new(padded_indices)).sync_on(stream)?,
-            weights: api::copy_host_vec_to_device(&Arc::new(padded_weights)).sync_on(stream)?,
+            indices: api::copy_host_vec_to_device(&Arc::new(padded_indices))
+                .reshape(&[1, padded])
+                .sync_on(stream)?,
+            weights: api::copy_host_vec_to_device(&Arc::new(padded_weights))
+                .reshape(&[1, padded])
+                .sync_on(stream)?,
+            inverse: api::copy_host_vec_to_device(&Arc::new((0..padded as i32).collect()))
+                .reshape(&[1, padded])
+                .sync_on(stream)?,
             dims: *dims,
         })
     }
@@ -731,6 +679,7 @@ pub fn combine<'a>(
     Output = (
         Partition<&'a mut Tensor<f32>>,
         &'a Tensor<f32>,
+        &'a Tensor<i32>,
         &'a Tensor<f32>,
         &'a Tensor<f32>,
         &'a Tensor<f32>,
@@ -742,9 +691,10 @@ pub fn combine<'a>(
     assert_eq!(routed.shape(), &[dims.top_k as i32, dims.hidden as i32]);
     assert_eq!(shared.shape(), &[1, dims.hidden as i32]);
     assert_eq!(gate.shape(), &[1, 1]);
-    kernels::combine_kernel(
+    kernels::combine_prefill_kernel(
         out,
         routed,
+        &selection.inverse,
         &selection.weights,
         shared,
         gate,
@@ -763,6 +713,7 @@ pub fn combine_view<'a>(
     Output = (
         Partition<TensorViewMut<'a, f32>>,
         &'a TensorView<'a, f32>,
+        &'a Tensor<i32>,
         &'a Tensor<f32>,
         &'a TensorView<'a, f32>,
         &'a TensorView<'a, f32>,
@@ -774,9 +725,10 @@ pub fn combine_view<'a>(
     assert_eq!(routed.shape(), &[dims.top_k as i32, dims.hidden as i32]);
     assert_eq!(shared.shape(), &[1, dims.hidden as i32]);
     assert_eq!(gate.shape(), &[1, 1]);
-    kernels::combine_kernel(
+    kernels::combine_prefill_kernel(
         out,
         routed,
+        &selection.inverse,
         &selection.weights,
         shared,
         gate,

@@ -136,6 +136,78 @@ mod kernels {
     }
 
     #[cutile::entry()]
+    pub fn prepare_chunk_qk<const KEY_HEADS: i32, const DK: i32>(
+        query: &mut Tensor<f32, { [1, 1, DK] }>,
+        key: &mut Tensor<f32, { [1, 1, DK] }>,
+        q_input: &Tensor<f32, { [-1, -1] }>,
+        k_input: &Tensor<f32, { [-1, -1] }>,
+        valid: i32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let time = pid.0;
+        if time < valid {
+            let q: Tile<f32, { [1, 1, DK] }> = q_input
+                .partition(shape![1, DK])
+                .load([time, pid.1])
+                .reshape(shape![1, 1, DK]);
+            let k: Tile<f32, { [1, 1, DK] }> = k_input
+                .partition(shape![1, DK])
+                .load([time, pid.1])
+                .reshape(shape![1, 1, DK]);
+            query.store(q);
+            key.store(k);
+        }
+    }
+
+    #[cutile::entry()]
+    pub fn prepare_chunk_value_gate<const VALUE_HEADS: i32, const DV: i32>(
+        value: &mut Tensor<f32, { [1, 1, DV] }>,
+        gate: &mut Tensor<f32, { [1, 1] }>,
+        beta: &mut Tensor<f32, { [1, 1] }>,
+        v_input: &Tensor<f32, { [-1, -1] }>,
+        a: &Tensor<f32, { [-1, VALUE_HEADS] }>,
+        b: &Tensor<f32, { [-1, VALUE_HEADS] }>,
+        a_log: &Tensor<f32, { [-1] }>,
+        dt_bias: &Tensor<f32, { [-1] }>,
+        valid: i32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let time = pid.0;
+        let head = pid.1;
+        if time < valid {
+            let v: Tile<f32, { [1, 1, DV] }> = v_input
+                .partition(shape![1, DV])
+                .load([time, head])
+                .reshape(shape![1, 1, DV]);
+            value.store(v);
+            let a_value: Tile<f32, { [1] }> = a
+                .partition(shape![1, 1])
+                .load([time, head])
+                .reshape(shape![1]);
+            let b_value: Tile<f32, { [1] }> = b
+                .partition(shape![1, 1])
+                .load([time, head])
+                .reshape(shape![1]);
+            let al: Tile<f32, { [1] }> = a_log.partition(shape![1]).load([head]);
+            let dt: Tile<f32, { [1] }> = dt_bias.partition(shape![1]).load([head]);
+            let one: Tile<f32, { [1] }> = constant(1.0f32, shape![1]);
+            let zero: Tile<f32, { [1] }> = constant(0.0f32, shape![1]);
+            let negative: Tile<f32, { [1] }> = constant(-1.0f32, shape![1]);
+            let selected = one / (one + exp(b_value * negative));
+            let x = a_value + dt;
+            let tiny = exp(min_tile(x, zero));
+            let series = tiny - tiny * tiny * constant(0.5f32, shape![1])
+                + tiny * tiny * tiny * constant(0.33333334f32, shape![1]);
+            let ordinary = max_tile(x, zero) + log(one + exp(absf(x) * negative));
+            let cutoff: Tile<f32, { [1] }> = constant(-8.0f32, shape![1]);
+            let softplus = select(lt_tile(x, cutoff), series, ordinary);
+            let log_decay = exp(al) * softplus * negative;
+            beta.store(selected.reshape(shape![1, 1]));
+            gate.store(log_decay.reshape(shape![1, 1]));
+        }
+    }
+
+    #[cutile::entry()]
     pub fn delta_step<const KEY_HEADS: i32, const VALUE_HEADS: i32, const DK: i32, const T: i32>(
         out: &mut Tensor<f32, { [1, 1, T] }>,
         state: &mut Tensor<f32, { [1, DK, T] }>,
@@ -213,7 +285,10 @@ mod kernels {
     }
 }
 
-pub use kernels::{conv1d_silu, conv1d_silu_prefill, delta_step, gated_silu};
+pub use kernels::{
+    conv1d_silu, conv1d_silu_prefill, delta_step, gated_silu, prepare_chunk_qk,
+    prepare_chunk_value_gate,
+};
 
 use crate::weights::Q8_BLOCK;
 

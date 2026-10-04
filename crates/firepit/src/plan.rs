@@ -82,7 +82,7 @@ impl Slot {
         self as usize
     }
 
-    fn shape(self, model: &Model, batch: usize) -> Vec<usize> {
+    pub(crate) fn shape(self, model: &Model, batch: usize) -> Vec<usize> {
         let d = &model.dims;
         let g = d.gdn();
         let a = d.attention();
@@ -242,13 +242,7 @@ pub struct StepPlan {
 }
 
 impl StepPlan {
-    pub fn new(
-        model: &Model,
-        batch: usize,
-        gdn_value_tile: usize,
-        gdn_conv_tile: usize,
-        stream: &Stream,
-    ) -> Result<Self> {
+    pub(crate) fn ops(model: &Model) -> Vec<Op> {
         let mut ops = vec![Op::Embed {
             out: Slot::Residual0,
         }];
@@ -399,6 +393,17 @@ impl StepPlan {
             input: Slot::Normed,
             out: Slot::Logits,
         });
+        ops
+    }
+
+    pub fn new(
+        model: &Model,
+        batch: usize,
+        gdn_value_tile: usize,
+        gdn_conv_tile: usize,
+        stream: &Stream,
+    ) -> Result<Self> {
+        let ops = Self::ops(model);
         let buffers = Slot::ALL
             .iter()
             .map(|&slot| api::zeros::<f32>(&slot.shape(model, batch)).sync_on(stream))

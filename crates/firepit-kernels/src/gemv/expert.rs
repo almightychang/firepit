@@ -17,13 +17,14 @@ mod kernels {
         y: &mut Tensor<f32, { [1, BN] }>,
         w: &Tensor<T, { [-1, -1, 32] }>,
         x: &Tensor<f32, { [-1, -1, 32] }>,
-        expert_ids: &Tensor<i32, { [-1] }>,
+        expert_ids: &Tensor<i32, { [-1, -1] }>,
         blocks: i32,
         row_tiles: i32,
         input_stride: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
-        let expert_tile: Tile<i32, { [1] }> = expert_ids.partition(shape![1]).load([pid.0]);
+        let expert_tile: Tile<i32, { [1, 1] }> =
+            expert_ids.partition(shape![1, 1]).load([0, pid.0]);
         let expert: i32 = tile_to_scalar(expert_tile.reshape(shape![]));
         let w_part = w.partition(shape![BN, NB, 32]);
         let x_part = x.partition(shape![1, NB, 32]);
