@@ -1,6 +1,9 @@
 use cuda_core::Device;
-use firepit::quality::{QualityChunk, mean, quantile, t95, truncated_kl};
+use firepit::quality::{
+    KlDiagnosis, KlResult, QualityChunk, diagnose_kl, mean, quantile, t95, truncated_kl,
+};
 use firepit::{Engine, LoadOptions, Model, Result, ScoredRows, SessionId};
+use std::collections::BTreeSet;
 use std::env;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,12 +21,15 @@ struct Args {
     chunks: usize,
     mode: Mode,
     layers: Option<usize>,
+    top_kl: usize,
+    only_chunks: Option<BTreeSet<usize>>,
 }
 
 fn args() -> Result<Args> {
     let mut values = env::args().skip(1);
     let (mut model, mut reference, mut chunks, mut mode, mut layers) =
         (None, None, None, None, None);
+    let (mut top_kl, mut only_chunks) = (0, None);
     while let Some(flag) = values.next() {
         let value = values.next().ok_or(format!("missing value for {flag}"))?;
         match flag.as_str() {
@@ -38,6 +44,18 @@ fn args() -> Result<Args> {
                 })
             }
             "--layers" => layers = Some(value.parse::<usize>()?),
+            "--top-kl" => top_kl = value.parse()?,
+            "--only-chunks" => {
+                if value.is_empty() {
+                    return Err("--only-chunks requires comma-separated indices".into());
+                }
+                only_chunks = Some(
+                    value
+                        .split(',')
+                        .map(str::parse)
+                        .collect::<std::result::Result<BTreeSet<usize>, _>>()?,
+                );
+            }
             _ => return Err(format!("unknown argument {flag}").into()),
         }
     }
@@ -45,13 +63,60 @@ fn args() -> Result<Args> {
     if chunks == 0 {
         return Err("--chunks must be positive".into());
     }
+    if only_chunks
+        .as_ref()
+        .is_some_and(|set| set.iter().any(|&index| index >= chunks))
+    {
+        return Err("--only-chunks index must be less than --chunks".into());
+    }
     Ok(Args {
         model: model.ok_or("missing --model")?,
         reference: reference.ok_or("missing --ref")?,
         chunks,
         mode: mode.ok_or("missing --mode")?,
         layers,
+        top_kl,
+        only_chunks,
     })
+}
+
+struct TopKlRow {
+    chunk: usize,
+    row: usize,
+    next_token: Option<u32>,
+    diagnosis: KlDiagnosis,
+}
+
+fn score_row(
+    chunk: &QualityChunk,
+    chunk_index: usize,
+    offset: usize,
+    logits: &[f32],
+    top: &mut Vec<TopKlRow>,
+    limit: usize,
+) -> Result<KlResult> {
+    let (ids, logp, tail) = chunk.row(offset)?;
+    let score = truncated_kl(ids, logp, tail, logits)?;
+    if limit > 0 && (top.len() < limit || score.kl > top[top.len() - 1].diagnosis.score.kl) {
+        let row = chunk.score_start + offset;
+        top.push(TopKlRow {
+            chunk: chunk_index,
+            row,
+            next_token: chunk.tokens.get(row + 1).copied(),
+            diagnosis: diagnose_kl(ids, logp, logits, score),
+        });
+        top.sort_by(|a, b| b.diagnosis.score.kl.total_cmp(&a.diagnosis.score.kl));
+        top.truncate(limit);
+    }
+    Ok(score)
+}
+
+fn probabilities<T: std::fmt::Display>(pairs: &[(T, f64)]) -> String {
+    pairs
+        .iter()
+        .map(|(id, p)| format!("({id},{p:.6e})"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn reference_path(root: &PathBuf, index: usize) -> PathBuf {
@@ -71,7 +136,11 @@ fn main() -> Result<()> {
     }
     let args = args()?;
     let started = Instant::now();
-    let first = QualityChunk::open(&reference_path(&args.reference, 0))?;
+    let selected: Vec<usize> = args.only_chunks.as_ref().map_or_else(
+        || (0..args.chunks).collect(),
+        |indices| indices.iter().copied().collect(),
+    );
+    let first = QualityChunk::open(&reference_path(&args.reference, selected[0]))?;
     let (chunk_size, score_start, top_k, layers) = (
         first.chunk_size,
         first.score_start,
@@ -94,16 +163,17 @@ fn main() -> Result<()> {
     let mut engine = Engine::new(model, &device)?;
     let scored = chunk_size - score_start;
     let mut first = Some(first);
-    let mut chunk_kl = Vec::with_capacity(args.chunks);
-    let mut chunk_top1 = Vec::with_capacity(args.chunks);
-    let mut all_kl = Vec::with_capacity(args.chunks * scored);
+    let mut chunk_kl = Vec::with_capacity(selected.len());
+    let mut chunk_top1 = Vec::with_capacity(selected.len());
+    let mut all_kl = Vec::with_capacity(selected.len() * scored);
+    let mut top_rows = Vec::with_capacity(args.top_kl.min(selected.len() * scored));
     let mut quarters_kl: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
     let mut quarters_top1: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
     let mut tail_max = 0.0f64;
     println!("chunk mean_KL top1_match tail_mass_max seconds");
-    for index in 0..args.chunks {
+    for (selected_offset, &index) in selected.iter().enumerate() {
         let chunk_started = Instant::now();
-        let chunk = if index == 0 {
+        let chunk = if selected_offset == 0 {
             first.take().unwrap()
         } else {
             QualityChunk::open(&reference_path(&args.reference, index))?
@@ -126,8 +196,14 @@ fn main() -> Result<()> {
                     return Err("unexpected scored logits length".into());
                 }
                 for (offset, row) in logits.chunks_exact(vocab).enumerate() {
-                    let (ids, logp, tail) = chunk.row(offset)?;
-                    row_scores.push(truncated_kl(ids, logp, tail, row)?);
+                    row_scores.push(score_row(
+                        &chunk,
+                        index,
+                        offset,
+                        row,
+                        &mut top_rows,
+                        args.top_kl,
+                    )?);
                 }
             }
             Mode::Decode => {
@@ -136,8 +212,14 @@ fn main() -> Result<()> {
                     let (_, token) = chunk.scored_token(offset)?;
                     let batch = engine.batch([(&mut session, token)])?;
                     let logits = engine.step(batch)?;
-                    let (ids, logp, tail) = chunk.row(offset)?;
-                    row_scores.push(truncated_kl(ids, logp, tail, &logits)?);
+                    row_scores.push(score_row(
+                        &chunk,
+                        index,
+                        offset,
+                        &logits,
+                        &mut top_rows,
+                        args.top_kl,
+                    )?);
                 }
             }
         }
@@ -189,6 +271,35 @@ fn main() -> Result<()> {
                 "{quarter:>7} {:.6e} {:.4}%",
                 mean(&quarters_kl[quarter]),
                 mean(&quarters_top1[quarter]) * 100.0
+            );
+        }
+    }
+    if args.top_kl > 0 {
+        println!("top KL positions (next_token=n/a at the final row of a chunk)");
+        for item in &top_rows {
+            let d = &item.diagnosis;
+            let next = item
+                .next_token
+                .map_or_else(|| "n/a".to_owned(), |id| id.to_string());
+            let hf_firepit_top1 = d
+                .hf_firepit_top1
+                .map_or_else(|| "tail".to_owned(), |p| format!("{p:.6e}"));
+            println!(
+                "chunk={} row={} next_token={} KL={:.6e} top_K_term={:.6e} tail_term={:.6e} p_tail={:.6e} q_tail={:.6e}",
+                item.chunk,
+                item.row,
+                next,
+                d.score.kl,
+                d.score.top_kl,
+                d.score.tail_kl,
+                d.score.tail_mass,
+                d.score.firepit_tail_mass
+            );
+            println!("  HF top5: {}", probabilities(&d.hf_top));
+            println!("  firepit top5: {}", probabilities(&d.firepit_top));
+            println!(
+                "  firepit_p(HF_top1)={:.6e} HF_p(firepit_top1)={hf_firepit_top1}",
+                d.firepit_hf_top1
             );
         }
     }

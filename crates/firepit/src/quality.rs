@@ -90,10 +90,58 @@ impl QualityChunk {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct KlResult {
     pub kl: f64,
+    pub top_kl: f64,
+    pub tail_kl: f64,
     pub same_top1: bool,
     pub tail_mass: f64,
+    pub firepit_tail_mass: f64,
+    log_z: f64,
+}
+
+pub struct KlDiagnosis {
+    pub score: KlResult,
+    pub hf_top: Vec<(i32, f64)>,
+    pub firepit_top: Vec<(usize, f64)>,
+    pub firepit_hf_top1: f64,
+    pub hf_firepit_top1: Option<f64>,
+}
+
+pub fn diagnose_kl(ids: &[i32], logp: &[f32], logits: &[f32], score: KlResult) -> KlDiagnosis {
+    let hf_top = ids
+        .iter()
+        .zip(logp)
+        .take(5)
+        .map(|(&id, &logp)| (id, (logp as f64).exp()))
+        .collect();
+    let mut firepit_top = Vec::<(usize, f32)>::new();
+    for (id, &logit) in logits.iter().enumerate() {
+        if firepit_top.len() < 5 {
+            firepit_top.push((id, logit));
+        } else if logit > firepit_top[firepit_top.len() - 1].1 {
+            *firepit_top.last_mut().unwrap() = (id, logit);
+        } else {
+            continue;
+        }
+        firepit_top.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    }
+    let firepit_hf_top1 = (logits[ids[0] as usize] as f64 - score.log_z).exp();
+    let hf_firepit_top1 = ids
+        .iter()
+        .position(|&id| id as usize == firepit_top[0].0)
+        .map(|index| (logp[index] as f64).exp());
+    KlDiagnosis {
+        score,
+        hf_top,
+        firepit_top: firepit_top
+            .into_iter()
+            .map(|(id, logit)| (id, (logit as f64 - score.log_z).exp()))
+            .collect(),
+        firepit_hf_top1,
+        hf_firepit_top1,
+    }
 }
 
 pub fn truncated_kl(
@@ -154,10 +202,15 @@ pub fn truncated_kl(
         .sum();
     let tail_log_mass = tail_log_mass as f64;
     let tail_mass = tail_log_mass.exp();
+    let tail_kl = tail_mass * (tail_log_mass - tail_q.ln());
     Ok(KlResult {
-        kl: top_kl + tail_mass * (tail_log_mass - tail_q.ln()),
+        kl: top_kl + tail_kl,
+        top_kl,
+        tail_kl,
         same_top1: top1 == ids[0] as usize,
         tail_mass,
+        firepit_tail_mass: tail_q,
+        log_z,
     })
 }
 
@@ -243,6 +296,22 @@ mod tests {
         assert!((center - 0.5).abs() < 1e-12);
         assert!((half - 6.353102368).abs() < 1e-6);
         assert!(t95(&[0.5])?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn diagnosis_preserves_existing_kl_score() -> Result<()> {
+        let ids = [0, 2];
+        let logp = [0.5f32.ln(), 0.2f32.ln()];
+        let logits = [0.4f32.ln(), 0.4f32.ln(), 0.2f32.ln()];
+        let score = truncated_kl(&ids, &logp, 0.3f32.ln(), &logits)?;
+        let diagnosis = diagnose_kl(&ids, &logp, &logits, score);
+        assert_eq!(diagnosis.score.kl.to_bits(), score.kl.to_bits());
+        assert_eq!(
+            diagnosis.score.kl,
+            diagnosis.score.top_kl + diagnosis.score.tail_kl
+        );
+        assert!((diagnosis.hf_firepit_top1.unwrap() - 0.5).abs() < 1e-6);
         Ok(())
     }
 }

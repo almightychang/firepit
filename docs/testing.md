@@ -67,6 +67,8 @@ scripts/dev.sh run --release -p firepit --example quality -- --model "$HOME/Mode
 
 HF 생성은 CUDA PyTorch와 `transformers==5.17.0`, `safetensors==0.8.0`이 필요하다. `--chunks 1` 또는 `2`와 작은 `--chunk-size`, `--score-start`, `--k`, `--layers 2 --device cpu`로 접두부를 시험할 수 있다. Rust 예제에도 같은 `--layers 2`를 준다. 실제 품질 수치는 반드시 release 빌드로 잰다. `prefill`은 채점 범위 전체를 한 번에 계산하고, `decode`는 앞 절반을 prefill한 뒤 나머지를 teacher forcing으로 한 step씩 입력한다. 두 모드 모두 HF 기준의 같은 행을 읽는다. KL은 HF 상위 K 항과 나머지 질량을 합친 거친 분포의 KL이며, 실제 어휘 전체 KL의 하한이다. 출력은 묶음별·전체·채점 구간별 평균 KL과 top-1 일치율, KL 분위수·최댓값, 나머지 질량 최댓값, 묶음 평균 Student t 95% 신뢰구간이다. 묶음이 하나면 신뢰구간은 표시하지 않는다.
 
+원인 진단에는 예를 들어 `--chunks 72 --only-chunks 3,17 --top-kl 10`을 덧붙인다. 선택한 묶음만 채점하고 KL 상위 10개 행의 상위 K 항·나머지 항, 양쪽 top-5 확률과 교차 top-1 확률을 출력한다. 묶음 마지막 행의 다음 토큰은 기준 파일에 없어 `n/a`로 표시한다.
+
 ## 판정 기준 현황
 
 | 커널 | 판정 | 근거 |
