@@ -52,10 +52,10 @@ def load_prefix(model_dir: Path, layers: int) -> Qwen3_5MoeForCausalLM:
     return model.eval(), norm.eval()
 
 
-def load_engine(model_dir: Path, layers: int):
+def load_engine(model_dir: Path, layers: int, device: str = "cuda"):
     with torch.device("meta"):
         model = Qwen3_5MoeForCausalLM(prefix_config(model_dir, layers))
-    weights = prefix_weights(model_dir, layers, torch.bfloat16, "cuda")
+    weights = prefix_weights(model_dir, layers, torch.bfloat16, device)
     missing, unexpected = model.load_state_dict(weights, strict=False, assign=True)
     del weights
     if unexpected or missing:
@@ -63,7 +63,7 @@ def load_engine(model_dir: Path, layers: int):
     model.model.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(model.config)
     norm = model.model.norm
     model.model.norm = torch.nn.Identity()
-    return model.to("cuda").eval(), norm.to("cuda").eval()
+    return model.to(device).eval(), norm.to(device).eval()
 
 
 def trace_engine(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:

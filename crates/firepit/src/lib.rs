@@ -5,16 +5,18 @@ mod execute;
 mod model;
 mod plan;
 mod prefill;
+pub mod quality;
 mod session;
 #[cfg(feature = "testing")]
 mod testing;
 
-pub use checkpoint::{Checkpoint, HostBf16Tensor, HostTensor, SafetensorsFile};
+pub use checkpoint::{Checkpoint, HostBf16Tensor, HostI32Tensor, HostTensor, SafetensorsFile};
 pub use config::{LayerKind, ModelConfig, ModelDims};
 pub use engine::Engine;
 #[cfg(feature = "testing")]
 pub use engine::{RoutingLayerTrace, SessionStateSnapshot, VerificationFault};
 pub use model::{LoadOptions, Model};
+pub use prefill::ScoredRows;
 pub use session::{Batch, LayerState, Session, SessionId};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;

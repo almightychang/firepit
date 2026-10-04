@@ -26,6 +26,47 @@ const CHUNK: usize = gdn_chunk::DEFAULT_CHUNK_SIZE;
 const BLOCK: usize = gdn_chunk::DEFAULT_BLOCK_SIZE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScoredRows {
+    start: usize,
+    end: usize,
+    tokens: usize,
+}
+
+impl ScoredRows {
+    pub fn parse(range: std::ops::Range<usize>, tokens: usize) -> Result<Self> {
+        if range.start >= range.end || range.end > tokens {
+            return Err("invalid scored rows".into());
+        }
+        Ok(Self {
+            start: range.start,
+            end: range.end,
+            tokens,
+        })
+    }
+
+    pub fn last(tokens: usize) -> Result<Self> {
+        let start = tokens.checked_sub(1).ok_or("empty scored sequence")?;
+        Self::parse(start..tokens, tokens)
+    }
+
+    pub fn range(self) -> std::ops::Range<usize> {
+        self.start..self.end
+    }
+
+    fn len(self) -> usize {
+        self.end - self.start
+    }
+
+    fn outer(self) -> std::ops::Range<usize> {
+        if self.len() == 1 {
+            return self.range();
+        }
+        let tile = DEFAULT_GEMM_TILE.m;
+        self.start / tile * tile..self.end.div_ceil(tile) * tile
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PrefillSlot {
     Sequence(Slot),
     Query,
@@ -180,6 +221,7 @@ pub struct PrefillPlan {
     position: usize,
     conv_tile: usize,
     value_tile: usize,
+    scored: ScoredRows,
 }
 
 impl PrefillPlan {
@@ -189,10 +231,17 @@ impl PrefillPlan {
         position: usize,
         conv_tile: usize,
         value_tile: usize,
+        scored: ScoredRows,
         stream: &Stream,
     ) -> Result<Self> {
         let len = tokens.len();
+        if scored.tokens != len {
+            return Err("scored rows belong to another sequence length".into());
+        }
         let rows = len.div_ceil(CHUNK) * CHUNK;
+        if scored.outer().end > rows {
+            return Err("scored rows exceed padded sequence".into());
+        }
         let m = model.dims.moe();
         let max_moe_rows = MoePrefillLayout::max_padded_rows(len, &m, DEFAULT_GROUPED_GEMM_TILE.m)?;
         let mut ops = Vec::new();
@@ -229,6 +278,9 @@ impl PrefillPlan {
                 let mut shape = PrefillSlot::Sequence(slot).shape(model, rows, len);
                 if matches!(slot, Slot::ExpertUp | Slot::ExpertAct | Slot::ExpertOut) {
                     shape[0] = max_moe_rows;
+                }
+                if slot == Slot::Logits {
+                    shape = vec![scored.outer().len(), model.dims.vocab()];
                 }
                 api::zeros::<f32>(&shape).sync_on(stream)
             })
@@ -285,14 +337,23 @@ impl PrefillPlan {
             position,
             conv_tile,
             value_tile,
+            scored,
         })
     }
 
     pub fn logits(&self, stream: &Stream) -> Result<Vec<f32>> {
-        Ok(self.buffers[Slot::Logits.index()]
+        let all: Vec<f32> = self.buffers[Slot::Logits.index()]
             .dup()
             .to_host_vec()
-            .sync_on(stream)?)
+            .sync_on(stream)?;
+        let first = (self.scored.start - self.scored.outer().start)
+            * (all.len() / self.scored.outer().len());
+        let end = first + self.scored.len() * (all.len() / self.scored.outer().len());
+        if first == 0 && end == all.len() {
+            Ok(all)
+        } else {
+            Ok(all[first..end].to_vec())
+        }
     }
 
     #[cfg(feature = "testing")]
@@ -332,8 +393,15 @@ pub(crate) fn run(
     stream: &Stream,
     sink: &mut impl Sink,
 ) -> Result<()> {
-    let last_row = plan.len - 1;
-    run_inner(model, plan, session, stream, sink, last_row, |_, _| Ok(()))
+    run_inner(
+        model,
+        plan,
+        session,
+        stream,
+        sink,
+        plan.scored.start,
+        |_, _| Ok(()),
+    )
 }
 
 #[cfg(feature = "testing")]
@@ -345,7 +413,11 @@ pub(crate) fn run_observed(
     first_row_lm_head: bool,
     hidden: &mut Vec<Vec<f32>>,
 ) -> Result<()> {
-    let row = if first_row_lm_head { 0 } else { plan.len - 1 };
+    let row = if first_row_lm_head {
+        0
+    } else {
+        plan.scored.start
+    };
     let last = plan.len - 1;
     let width = model.dims.hidden();
     run_inner(
@@ -381,7 +453,7 @@ pub(crate) fn run_routing_observed(
     stream: &Stream,
 ) -> Result<Vec<RoutingLayerTrace>> {
     let mut layers = Vec::<RoutingLayerTrace>::new();
-    let last_row = plan.len - 1;
+    let last_row = plan.scored.start;
     let experts = model.dims.moe().experts();
     let top_k = model.dims.moe().top_k();
     let hidden = model.dims.hidden();
@@ -483,7 +555,12 @@ fn run_inner(
                             &model.layers[layer].post_norm,
                             d.norm_eps(),
                         ),
-                        NormName::Final => (d.hidden(), 1, &model.final_norm, d.norm_eps()),
+                        NormName::Final => (
+                            d.hidden(),
+                            plan.scored.outer().len(),
+                            &model.final_norm,
+                            d.norm_eps(),
+                        ),
                         NormName::Q => {
                             let MixerWeights::Attention(w) = &model.layers[layer].mixer else {
                                 unreachable!()
@@ -510,8 +587,13 @@ fn run_inner(
                     };
                     if matches!(name, NormName::Final) {
                         let shaped = source.view(&[rows, width])?;
-                        let x = shaped.slice(&[lm_head_row..lm_head_row + 1, 0..width])?;
-                        let y = target.slice_mut(&[lm_head_row..lm_head_row + 1, 0..width])?;
+                        let range = if plan.scored.len() == 1 {
+                            lm_head_row..lm_head_row + 1
+                        } else {
+                            plan.scored.outer()
+                        };
+                        let x = shaped.slice(&[range.clone(), 0..width])?;
+                        let y = target.slice_mut(&[range, 0..width])?;
                         sink.run(
                             norm::rms_norm(
                                 y.partition([1, width]),
@@ -569,19 +651,27 @@ fn run_inner(
                     let output_rows = dense.rows;
                     if matches!(name, WeightName::LmHead) {
                         let shaped = source.view(&[rows, cols])?;
-                        let last = shaped.slice(&[lm_head_row..lm_head_row + 1, 0..cols])?;
-                        let x = last.view(&[
-                            1,
-                            cols / firepit_kernels::weights::Q8_BLOCK,
-                            firepit_kernels::weights::Q8_BLOCK,
-                        ])?;
-                        gemv(
-                            w,
-                            &x,
-                            target.partition([1, gemv_tile(output_rows, cols).rows]),
-                            gemv_tile(output_rows, cols),
-                        )
-                        .submit(sink)?;
+                        if plan.scored.len() == 1 {
+                            let selected =
+                                shaped.slice(&[lm_head_row..lm_head_row + 1, 0..cols])?;
+                            let x = selected.view(&[
+                                1,
+                                cols / firepit_kernels::weights::Q8_BLOCK,
+                                firepit_kernels::weights::Q8_BLOCK,
+                            ])?;
+                            gemv(
+                                w,
+                                &x,
+                                target.partition([1, gemv_tile(output_rows, cols).rows]),
+                                gemv_tile(output_rows, cols),
+                            )
+                            .submit(sink)?;
+                        } else {
+                            let selected = shaped.slice(&[plan.scored.outer(), 0..cols])?;
+                            let tile = gemm_tile(cols, output_rows, false);
+                            gemm(dense, &selected, target.partition([tile.m, tile.n]), tile)
+                                .submit(sink)?;
+                        }
                     } else {
                         let x = source.view(&[rows, cols])?;
                         let tile = gemm_tile(cols, output_rows, false);

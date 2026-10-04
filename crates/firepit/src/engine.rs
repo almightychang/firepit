@@ -3,7 +3,7 @@ use crate::checkpoint::Stream;
 use crate::execute::run;
 use crate::model::Model;
 use crate::plan::StepPlan;
-use crate::prefill::{self, PrefillPlan};
+use crate::prefill::{self, PrefillPlan, ScoredRows};
 use crate::session::{Batch, Session, SessionId};
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::DeviceOp;
@@ -20,6 +20,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_ENGINE: AtomicU64 = AtomicU64::new(1);
 const TARGET_BLOCKS_PER_SM: usize = 1;
+
+fn last_scored_rows(session: &mut Session, tokens: &[u32]) -> Result<ScoredRows> {
+    ScoredRows::last(tokens.len()).map_err(|error| {
+        session.poisoned = true;
+        error
+    })
+}
 
 #[cfg(feature = "testing")]
 #[derive(Clone, Copy, Debug, Default)]
@@ -134,7 +141,17 @@ impl Engine {
     }
 
     pub fn prefill(&mut self, session: &mut Session, tokens: &[u32]) -> Result<Vec<f32>> {
-        self.prefill_with(session, tokens, |model, plan, session, stream| {
+        let rows = last_scored_rows(session, tokens)?;
+        self.prefill_scored(session, tokens, rows)
+    }
+
+    pub fn prefill_scored(
+        &mut self,
+        session: &mut Session,
+        tokens: &[u32],
+        rows: ScoredRows,
+    ) -> Result<Vec<f32>> {
+        self.prefill_with(session, tokens, rows, |model, plan, session, stream| {
             prefill::run(model, plan, session, stream, &mut Eager(stream))
         })
         .map(|(logits, ())| logits)
@@ -145,7 +162,8 @@ impl Engine {
         session: &mut Session,
         tokens: &[u32],
     ) -> Result<(Vec<f32>, Trace)> {
-        self.prefill_with(session, tokens, |model, plan, session, stream| {
+        let rows = last_scored_rows(session, tokens)?;
+        self.prefill_with(session, tokens, rows, |model, plan, session, stream| {
             let mut sink = Traced::new(stream);
             prefill::run(model, plan, session, stream, &mut sink)?;
             Ok(sink.into_trace())
@@ -159,7 +177,8 @@ impl Engine {
         tokens: &[u32],
         fault: VerificationFault,
     ) -> Result<(Vec<f32>, Vec<Vec<f32>>)> {
-        self.prefill_with(session, tokens, |model, plan, session, stream| {
+        let rows = last_scored_rows(session, tokens)?;
+        self.prefill_with(session, tokens, rows, |model, plan, session, stream| {
             if matches!(fault, VerificationFault::ResetRopePosition) {
                 plan.reset_rope_positions(model, stream)?;
             }
@@ -182,7 +201,8 @@ impl Engine {
         session: &mut Session,
         tokens: &[u32],
     ) -> Result<(Vec<f32>, Vec<RoutingLayerTrace>)> {
-        self.prefill_with(session, tokens, |model, plan, session, stream| {
+        let rows = last_scored_rows(session, tokens)?;
+        self.prefill_with(session, tokens, rows, |model, plan, session, stream| {
             prefill::run_routing_observed(model, plan, session, stream)
         })
     }
@@ -237,6 +257,7 @@ impl Engine {
         &mut self,
         session: &mut Session,
         tokens: &[u32],
+        scored: ScoredRows,
         execute: impl FnOnce(&Model, &mut PrefillPlan, &mut Session, &Stream) -> Result<T>,
     ) -> Result<(Vec<f32>, T)> {
         let result = (|| -> Result<(Vec<f32>, T)> {
@@ -269,6 +290,7 @@ impl Engine {
                 session.position,
                 self.gdn_conv_tile,
                 self.gdn_value_tile,
+                scored,
                 &self.stream,
             )?;
             let output = execute(&self.model, &mut plan, session, &self.stream)?;
@@ -524,6 +546,7 @@ mod tests {
             0,
             traced.gdn_conv_tile,
             traced.gdn_value_tile,
+            ScoredRows::last(2)?,
             &traced.stream,
         )?;
         assert_trace(&trace, plan.ops.iter().map(|op| op.kind()));
@@ -670,6 +693,59 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn scored_rows_match_last_row_and_steps() -> Result<()> {
+        let device = Device::new(0)?;
+        let model = small_model(&device)?;
+        let mut plain = Engine::new(model.clone(), &device)?;
+        let mut scored = Engine::new(model.clone(), &device)?;
+        let mut decode = Engine::new(model, &device)?;
+        let mut plain_session = plain.new_session(SessionId(1))?;
+        let mut scored_session = scored.new_session(SessionId(1))?;
+        let mut decode_session = decode.new_session(SessionId(1))?;
+        let tokens = [1, 2, 3, 4];
+        let last = plain.prefill(&mut plain_session, &tokens)?;
+        let scored_last = scored.prefill_scored(
+            &mut scored_session,
+            &tokens,
+            ScoredRows::last(tokens.len())?,
+        )?;
+        assert_eq!(
+            last.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            scored_last.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+
+        let mut all = Engine::new(Arc::clone(&decode.model), &device)?;
+        let mut all_session = all.new_session(SessionId(1))?;
+        let rows = all.prefill_scored(
+            &mut all_session,
+            &tokens,
+            ScoredRows::parse(1..4, tokens.len())?,
+        )?;
+        let vocab = rows.len() / 3;
+        for (index, &token) in tokens.iter().enumerate() {
+            let batch = decode.batch([(&mut decode_session, token)])?;
+            let step = decode.step_eager(batch)?;
+            if index >= 1 {
+                let row = &rows[(index - 1) * vocab..index * vocab];
+                let max_abs = row
+                    .iter()
+                    .zip(&step)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0.0f32, f32::max);
+                println!("scored row {index} vs step max_abs={max_abs}");
+                assert!(
+                    row.iter()
+                        .zip(&step)
+                        .all(|(a, b)| (a - b).abs() <= 3e-4 * (1.0 + b.abs()))
+                );
+            }
+        }
+        assert!(ScoredRows::parse(0..0, 4).is_err());
+        assert!(ScoredRows::parse(0..5, 4).is_err());
         Ok(())
     }
 

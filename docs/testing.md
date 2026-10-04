@@ -55,6 +55,18 @@ GB10 결과(2026-10-04, [기록](research/measurements/engine-verify-gb10.md)): 
 
 전체 layer stack의 수학적으로 엄밀한 오차 상한은 미해결이다. 따라서 위 top-k 일치만 통과 조건이고, 기록하는 오차 수치에는 근거 없는 허용치를 두지 않는다.
 
+### 출력 품질 평가 (1차)
+
+`tools/reference/quality_ref.py`는 [llama.cpp의 WikiText-2 test 출처](https://github.com/ggml-org/llama.cpp/blob/master/scripts/get-wikitext-2.sh)를 `--cache`에 저장하고 Qwen tokenizer로 전체 원문을 토큰화한다. 완전한 4096토큰 묶음마다 새 문맥을 만들고, 기본적으로 행 2048~4095의 다음 토큰 분포를 채점한다. 행 `i`의 logits는 토큰 `i`를 입력한 뒤 토큰 `i+1`을 예측한다. 마지막 행은 다음 묶음의 실제 토큰 유무와 관계없이 분포만 평가한다. 각 묶음의 HF bf16 모델 분포에서 상위 256개 ID·log 확률과 나머지 log 질량을 f32/I32 safetensors로 별도 저장한다. 완성된 묶음 파일은 검증 후 건너뛰므로 중단 후 같은 명령을 재실행할 수 있다.
+
+```bash
+python3 tools/reference/quality_ref.py --model "$HOME/Models/qwen3.6-35b-a3b" --cache /tmp/wiki.test.raw --out refs/quality-qwen36
+scripts/dev.sh run --release -p firepit --example quality -- --model "$HOME/Models/qwen3.6-35b-a3b" --ref refs/quality-qwen36 --chunks 2 --mode prefill
+scripts/dev.sh run --release -p firepit --example quality -- --model "$HOME/Models/qwen3.6-35b-a3b" --ref refs/quality-qwen36 --chunks 2 --mode decode
+```
+
+HF 생성은 CUDA PyTorch와 `transformers==5.17.0`, `safetensors==0.8.0`이 필요하다. `--chunks 1` 또는 `2`와 작은 `--chunk-size`, `--score-start`, `--k`, `--layers 2 --device cpu`로 접두부를 시험할 수 있다. Rust 예제에도 같은 `--layers 2`를 준다. 실제 품질 수치는 반드시 release 빌드로 잰다. `prefill`은 채점 범위 전체를 한 번에 계산하고, `decode`는 앞 절반을 prefill한 뒤 나머지를 teacher forcing으로 한 step씩 입력한다. 두 모드 모두 HF 기준의 같은 행을 읽는다. KL은 HF 상위 K 항과 나머지 질량을 합친 거친 분포의 KL이며, 실제 어휘 전체 KL의 하한이다. 출력은 묶음별·전체·채점 구간별 평균 KL과 top-1 일치율, KL 분위수·최댓값, 나머지 질량 최댓값, 묶음 평균 Student t 95% 신뢰구간이다. 묶음이 하나면 신뢰구간은 표시하지 않는다.
+
 ## 판정 기준 현황
 
 | 커널 | 판정 | 근거 |

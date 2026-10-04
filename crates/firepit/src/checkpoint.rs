@@ -19,6 +19,11 @@ pub struct HostTensor {
     pub data: Vec<f32>,
 }
 
+pub struct HostI32Tensor {
+    pub shape: Vec<usize>,
+    pub data: Vec<i32>,
+}
+
 #[derive(Clone)]
 pub struct HostBf16Tensor {
     pub shape: Vec<usize>,
@@ -71,6 +76,23 @@ impl SafetensorsFile {
         Ok(HostTensor {
             shape: info.shape.clone(),
             data: self.read(info, 0, len)?,
+        })
+    }
+
+    pub fn tensor_i32(&self, name: &str) -> Result<HostI32Tensor> {
+        let info = self.info(name)?;
+        if info.dtype != Dtype::I32 {
+            return Err(format!("{name}: expected I32, got {:?}", info.dtype).into());
+        }
+        let mut bytes = vec![0u8; info.data_offsets.1 - info.data_offsets.0];
+        self.file
+            .read_exact_at(&mut bytes, self.data_start + info.data_offsets.0 as u64)?;
+        Ok(HostI32Tensor {
+            shape: info.shape.clone(),
+            data: bytes
+                .chunks_exact(4)
+                .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect(),
         })
     }
 
