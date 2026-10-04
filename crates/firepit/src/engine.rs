@@ -3,6 +3,8 @@ use crate::checkpoint::Stream;
 use crate::execute::run;
 use crate::model::Model;
 use crate::plan::StepPlan;
+#[cfg(feature = "testing")]
+pub use crate::prefill::IsolatedLayerTrace;
 use crate::prefill::{self, PrefillPlan, ScoredRows};
 use crate::session::{Batch, Session, SessionId};
 use cuda_async::cuda_graph::CudaGraph;
@@ -205,6 +207,41 @@ impl Engine {
         self.prefill_with(session, tokens, rows, |model, plan, session, stream| {
             prefill::run_routing_observed(model, plan, session, stream)
         })
+    }
+
+    #[cfg(feature = "testing")]
+    pub fn prefill_isolated_layer(
+        &mut self,
+        tokens: &[u32],
+        layer: usize,
+        input: &[f32],
+    ) -> Result<IsolatedLayerTrace> {
+        if tokens.is_empty()
+            || tokens.len() > self.model.dims.max_seq()
+            || tokens
+                .iter()
+                .any(|&token| token as usize >= self.model.dims.vocab())
+        {
+            return Err("invalid isolated layer tokens".into());
+        }
+        let mut session = self.new_session(SessionId(layer as u64 + 1))?;
+        let mut plan = PrefillPlan::new(
+            &self.model,
+            tokens,
+            0,
+            self.gdn_conv_tile,
+            self.gdn_value_tile,
+            ScoredRows::last(tokens.len())?,
+            &self.stream,
+        )?;
+        prefill::run_isolated_layer(
+            &self.model,
+            &mut plan,
+            &mut session,
+            layer,
+            input,
+            &self.stream,
+        )
     }
 
     #[cfg(feature = "testing")]

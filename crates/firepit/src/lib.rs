@@ -14,7 +14,7 @@ pub use checkpoint::{Checkpoint, HostBf16Tensor, HostI32Tensor, HostTensor, Safe
 pub use config::{LayerKind, ModelConfig, ModelDims};
 pub use engine::Engine;
 #[cfg(feature = "testing")]
-pub use engine::{RoutingLayerTrace, SessionStateSnapshot, VerificationFault};
+pub use engine::{IsolatedLayerTrace, RoutingLayerTrace, SessionStateSnapshot, VerificationFault};
 pub use model::{LoadOptions, Model};
 pub use prefill::ScoredRows;
 pub use session::{Batch, LayerState, Session, SessionId};

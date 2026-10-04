@@ -372,3 +372,114 @@ fn append_vs_whole() -> TestResult<()> {
     assert_top("append vs whole", &actual, &expected);
     Ok(())
 }
+
+#[test]
+#[ignore = "requires Qwen3.6 checkpoint and a --tokens-json engine reference"]
+fn hf_locate_divergence() -> TestResult<()> {
+    let reference = SafetensorsFile::open(reference_path())?;
+    let tokens: Vec<u32> = serde_json::from_str(
+        reference
+            .metadata("tokens")
+            .ok_or("reference has no tokens")?,
+    )?;
+    let device = Device::new(0)?;
+    let model = Arc::new(Model::from_checkpoint(
+        model_path(),
+        LoadOptions {
+            max_seq: tokens.len(),
+            layers: layers()?,
+        },
+        &device,
+    )?);
+    let mut engine = Engine::new(model, &device)?;
+    let mut session = engine.new_session(SessionId(1))?;
+    let (logits, trace) = engine.prefill_routing_trace(&mut session, &tokens)?;
+    let last = tokens.len() - 1;
+    println!("layer | firepit experts | HF experts | same | hidden rel_l2");
+    for (layer, observed) in trace.iter().enumerate() {
+        let ours = sorted_ids(&observed.selected[last]);
+        let theirs = sorted_ids(
+            &reference
+                .tensor(&format!("layer{layer}/experts"))?
+                .data
+                .iter()
+                .map(|&x| x as i32)
+                .collect::<Vec<_>>(),
+        );
+        let expected = reference.tensor(&format!("layer{layer}/hidden"))?.data;
+        let rel = relative_l2(observed.hidden[last].iter().zip(&expected));
+        println!(
+            "{layer:5} | {ours:?} | {theirs:?} | {} | {rel:.6e}",
+            ours == theirs
+        );
+    }
+    let expected = reference.tensor("logits")?.data;
+    println!("firepit top5 {:?}", top(&logits, 5));
+    println!("HF top5 {:?}", top(&expected, 5));
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires Qwen3.6 checkpoint and --isolate-layers engine reference"]
+fn hf_isolated_layers() -> TestResult<()> {
+    let reference = SafetensorsFile::open(reference_path())?;
+    let tokens: Vec<u32> = serde_json::from_str(
+        reference
+            .metadata("tokens")
+            .ok_or("reference has no tokens")?,
+    )?;
+    let indices: Vec<usize> = serde_json::from_str(
+        reference
+            .metadata("isolate_layers")
+            .ok_or("reference has no isolate_layers")?,
+    )?;
+    let device = Device::new(0)?;
+    let model = Arc::new(Model::from_checkpoint(
+        model_path(),
+        LoadOptions {
+            max_seq: tokens.len(),
+            layers: layers()?,
+        },
+        &device,
+    )?);
+    let mut engine = Engine::new(model, &device)?;
+    println!("layer | mixer rel_l2 | moe rel_l2 | hidden rel_l2 | firepit experts | HF experts");
+    for layer in indices {
+        let input = reference.tensor(&format!("layer{layer}/input"))?;
+        let actual = engine.prefill_isolated_layer(&tokens, layer, &input.data)?;
+        let expected_mixer = reference.tensor(&format!("layer{layer}/mixer"))?;
+        let expected_moe = reference.tensor(&format!("layer{layer}/moe"))?;
+        let expected_hidden = reference.tensor(&format!("layer{layer}/hidden"))?;
+        assert_eq!(
+            actual.mixer.len(),
+            expected_mixer.data.len(),
+            "layer {layer} mixer shape"
+        );
+        assert_eq!(
+            actual.moe.len(),
+            expected_moe.data.len(),
+            "layer {layer} MoE shape"
+        );
+        assert_eq!(
+            actual.hidden.len(),
+            expected_hidden.data.len(),
+            "layer {layer} hidden shape"
+        );
+        let experts = reference.tensor(&format!("layer{layer}/experts"))?;
+        let theirs = sorted_ids(
+            &experts
+                .data
+                .iter()
+                .map(|&value| value as i32)
+                .collect::<Vec<_>>(),
+        );
+        let ours = sorted_ids(&actual.selected);
+        println!(
+            "{layer:5} | {:.6e} | {:.6e} | {:.6e} | {ours:?} | {theirs:?}",
+            relative_l2(actual.mixer.iter().zip(&expected_mixer.data)),
+            relative_l2(actual.moe.iter().zip(&expected_moe.data)),
+            relative_l2(actual.hidden.iter().zip(&expected_hidden.data)),
+        );
+    }
+    Ok(())
+}

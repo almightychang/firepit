@@ -509,6 +509,111 @@ pub(crate) fn run_routing_observed(
     Ok(layers)
 }
 
+#[cfg(feature = "testing")]
+pub struct IsolatedLayerTrace {
+    pub mixer: Vec<f32>,
+    pub moe: Vec<f32>,
+    pub hidden: Vec<f32>,
+    pub selected: Vec<i32>,
+}
+
+#[cfg(feature = "testing")]
+pub(crate) fn run_isolated_layer(
+    model: &Model,
+    plan: &mut PrefillPlan,
+    session: &mut Session,
+    layer: usize,
+    input: &[f32],
+    stream: &Stream,
+) -> Result<IsolatedLayerTrace> {
+    let width = model.dims.hidden();
+    if layer >= model.dims.layers().len() || input.len() != plan.len * width {
+        return Err("invalid isolated layer input".into());
+    }
+    let start = plan.ops.iter().position(|op| matches!(
+        op,
+        PrefillOp::Kernel(Op::Norm { layer: found, name: NormName::Input, .. }) if *found == layer
+    )).ok_or("isolated layer start missing")?;
+    let end = plan
+        .ops
+        .iter()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, op)| {
+            matches!(
+                op,
+                PrefillOp::Kernel(Op::Norm {
+                    name: NormName::Input | NormName::Final,
+                    ..
+                })
+            )
+        })
+        .map(|(index, _)| index)
+        .ok_or("isolated layer end missing")?;
+    if !matches!(
+        plan.ops[end - 1],
+        PrefillOp::Kernel(Op::Add {
+            delta: Slot::MoeDelta,
+            ..
+        })
+    ) {
+        return Err("isolated layer has no final residual".into());
+    }
+    plan.ops = plan.ops[start..end].to_vec();
+    let mut padded = input.to_vec();
+    padded.resize(plan.rows * width, 0.0);
+    plan.buffers[Slot::Residual0.index()] = api::copy_host_vec_to_device(&Arc::new(padded))
+        .reshape(&[plan.rows, width])
+        .sync_on(stream)?;
+    let mut trace = IsolatedLayerTrace {
+        mixer: Vec::new(),
+        moe: Vec::new(),
+        hidden: Vec::new(),
+        selected: Vec::new(),
+    };
+    let last = plan.len - 1;
+    let last_row = |slot: Slot, plan: &PrefillPlan| -> Result<Vec<f32>> {
+        let values: Vec<f32> = plan.buffers[slot.index()]
+            .dup()
+            .to_host_vec()
+            .sync_on(stream)?;
+        Ok(values[last * width..(last + 1) * width].to_vec())
+    };
+    run_inner(
+        model,
+        plan,
+        session,
+        stream,
+        &mut firepit_kernels::sink::Eager(stream),
+        last,
+        |op, plan| {
+            match op {
+                PrefillOp::TopK => {
+                    let width = model.dims.moe().top_k().next_power_of_two();
+                    let ids: Vec<i32> = plan.top_ids.dup().to_host_vec().sync_on(stream)?;
+                    trace.selected =
+                        ids[last * width..last * width + model.dims.moe().top_k()].to_vec();
+                }
+                PrefillOp::Kernel(Op::Add {
+                    delta: Slot::Delta, ..
+                }) => {
+                    trace.mixer = last_row(Slot::Delta, plan)?;
+                }
+                PrefillOp::Kernel(Op::Add {
+                    delta: Slot::MoeDelta,
+                    ..
+                }) => {
+                    trace.moe = last_row(Slot::MoeDelta, plan)?;
+                    trace.hidden = last_row(Slot::Residual0, plan)?;
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    )?;
+    Ok(trace)
+}
+
 fn run_inner(
     model: &Model,
     plan: &mut PrefillPlan,

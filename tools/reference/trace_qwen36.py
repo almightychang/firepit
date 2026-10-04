@@ -66,10 +66,31 @@ def load_engine(model_dir: Path, layers: int, device: str = "cuda"):
     return model.to(device).eval(), norm.to(device).eval()
 
 
-def trace_engine(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
+def trace_engine(model, norm, tokens: list[int], isolate_layers: list[int] | None = None, device: str = "cuda") -> dict[str, torch.Tensor]:
+    routing, moe, mixer = {}, {}, {}
+
+    def keep_routing(layer):
+        return lambda _module, _inputs, output: routing.__setitem__(layer, output[2][-1].float().cpu())
+
+    def keep_moe(layer):
+        return lambda _module, _inputs, output: moe.__setitem__(layer, output[0, -1].float().cpu())
+
+    def keep_mixer(layer, attention):
+        return lambda _module, _inputs, output: mixer.__setitem__(
+            layer, (output[0][0, -1] if attention else output[0, -1]).float().cpu()
+        )
+
+    hooks = []
+    for layer, block in enumerate(model.model.layers):
+        hooks.append(block.mlp.gate.register_forward_hook(keep_routing(layer)))
+        hooks.append(block.mlp.register_forward_hook(keep_moe(layer)))
+        if isolate_layers is not None and layer in isolate_layers:
+            attention = block.block_type != "linear_attention"
+            module = block.self_attn if attention else block.linear_attn
+            hooks.append(module.register_forward_hook(keep_mixer(layer, attention)))
     with torch.inference_mode():
         out = model.model(
-            input_ids=torch.tensor([tokens], device="cuda"),
+            input_ids=torch.tensor([tokens], device=device),
             use_cache=False,
             output_hidden_states=True,
         )
@@ -79,6 +100,16 @@ def trace_engine(model, norm, tokens: list[int]) -> dict[str, torch.Tensor]:
         }
         records["logits"] = model.lm_head(norm(out.hidden_states[-1][:, -1:]))[0, 0].float().cpu().contiguous()
         records["tokens"] = torch.tensor(tokens, dtype=torch.float32)
+        if isolate_layers is not None:
+            for layer in isolate_layers:
+                records[f"layer{layer}/input"] = out.hidden_states[layer][0].contiguous().cpu()
+    for hook in hooks:
+        hook.remove()
+    for layer in routing:
+        records[f"layer{layer}/experts"] = routing[layer].contiguous()
+        records[f"layer{layer}/moe"] = moe[layer].contiguous()
+    for layer in mixer:
+        records[f"layer{layer}/mixer"] = mixer[layer].contiguous()
     return records
 
 
@@ -482,10 +513,15 @@ def main():
     parser.add_argument("--prompt", default="The capital of France is")
     parser.add_argument("--prefill", action="store_true")
     parser.add_argument("--engine", action="store_true")
+    parser.add_argument("--tokens-json", type=Path)
+    parser.add_argument("--isolate-layers", help="comma-separated layer indices to save full inputs and mixer outputs")
+    parser.add_argument("--device", choices=("cuda", "cpu"), default="cuda", help="device for --engine")
     args = parser.parse_args()
 
     if args.engine and args.prefill:
         parser.error("--engine and --prefill are separate modes")
+    if args.isolate_layers and not args.engine:
+        parser.error("--isolate-layers requires --engine")
 
     if args.engine:
         text = json.loads((args.model / "config.json").read_text())["text_config"]
@@ -494,7 +530,14 @@ def main():
         layers = 4 if args.layers is None else args.layers
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    if args.prefill or args.engine:
+    isolate_layers = None
+    if args.isolate_layers:
+        isolate_layers = sorted({int(value) for value in args.isolate_layers.split(",")})
+        if not isolate_layers or isolate_layers[0] < 0 or isolate_layers[-1] >= layers:
+            parser.error("--isolate-layers must contain model layer indices")
+    if args.tokens_json is not None:
+        tokens = json.loads(args.tokens_json.read_text())
+    elif args.prefill or args.engine:
         source = args.prompt * 100
         tokens = tokenizer(source, add_special_tokens=False)["input_ids"][:150]
         if len(tokens) != 150:
@@ -502,11 +545,11 @@ def main():
     else:
         tokens = tokenizer(args.prompt)["input_ids"]
     if args.engine:
-        if not torch.cuda.is_available():
+        if args.device == "cuda" and not torch.cuda.is_available():
             raise SystemExit("--engine requires a CUDA PyTorch build")
         use_torch_reference_kernels()
-        model, norm = load_engine(args.model, layers)
-        records = trace_engine(model, norm, tokens)
+        model, norm = load_engine(args.model, layers, args.device)
+        records = trace_engine(model, norm, tokens, isolate_layers, args.device)
     else:
         model, norm = load_prefix(args.model, layers)
     if args.prefill:
@@ -517,6 +560,8 @@ def main():
     metadata = {"model": MODEL_ID, "layers": str(layers), "prompt": args.prompt, "tokens": json.dumps(tokens)}
     if args.engine:
         metadata["mode"] = "engine"
+        if isolate_layers is not None:
+            metadata["isolate_layers"] = json.dumps(isolate_layers)
     if args.prefill:
         metadata["mode"] = "prefill"
         metadata["max_abs"] = json.dumps(maximum)
