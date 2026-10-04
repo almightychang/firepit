@@ -175,3 +175,7 @@ GB10, 전체 모델, JIT 준비 뒤 두 번째 호출. wall 8.72 s, launch별 GP
 | 5000 | 5.47 s | 8.72 s |
 
 T=5000 상위: gemm 1.70 s(35%), moe_grouped_gemm 1.13 s(23%), causal_attention 0.64 s, moe_host_sort 0.54 s(host, wall), gdn_chunk_second 0.45 s, norm 0.19 s, moe_gather 0.15 s. wall − GPU 합 = 0.61 s 중 0.54 s가 host 정렬 span이다. 이전 측정의 host 정렬 0.22 s보다 커졌고 원인은 확인하지 않았다. 생성 토큰 열("The capital of France is" 32토큰)은 이전과 같다.
+
+## MoE 버퍼 호출당 1회 할당 후 (`234b06b`, T=5000, 2회 측정)
+
+wall 4.970 s, 4.973 s (E3 목표 5 s 이내). `moe_host_sort` wall 0.54 s → 0.048 s. 나머지 op는 직전 측정과 같은 수준(gemm 1.69~1.70 s, moe_grouped_gemm 1.16~1.17 s, causal_attention 0.63 s, gdn_chunk_second 0.44 s, norm 0.19 s, moe_gather 0.14 s). 생성 토큰 열은 이전과 같다.
