@@ -131,3 +131,20 @@ GB10 pod, 전체 Qwen3.6-35B-A3B bf16, `examples/bench --prefill-lengths`. 길�
 - decode 경로로 5071토큰 prompt를 처리한 215 s 대비 약 25배. E3 목표(5000토큰 5 s 이내)에는 못 미친다.
 - `generate`로 prefill 후 decode를 이어 생성한 토큰 열은 decode 경로만 쓴 이전 실행과 같았다("The capital of France is" 32토큰, 5071토큰 prompt 2토큰).
 - op 종류별 분해는 계측 설계 뒤에 잰다. 부품 측정으로 추정한 합(GEMM 약 2 s, attention 0.6 s, conv 0.07 s, GDN chunk 0.63 s)에 MoE가 더해진 값으로 보이며, MoE grouped GEMM이 남은 차이의 주된 후보다(추정).
+
+## 엔진 prefill op별 분해 (`298a0ee`, `bench --profile`, T=5000)
+
+GB10, 전체 모델, JIT 준비 뒤 두 번째 호출. wall 8.72 s, launch별 GPU event 합 8.44 s.
+
+| op 종류 | 횟수 | GPU s | wall s | 비중 |
+|---|---:|---:|---:|---:|
+| moe_grouped_gemm | 80 | 4.855 | 4.865 | 57.5% |
+| gemm (투영) | 350 | 1.731 | 1.741 | 20.5% |
+| causal_attention | 10 | 0.635 | 0.635 | 7.5% |
+| gdn_chunk_second | 30 | 0.442 | 0.442 | 5.2% |
+| moe_host_sort | 40 | 0 | 0.219 | host |
+| norm | 131 | 0.192 | 0.196 | 2.3% |
+| 나머지 16종 | | 0.58 | 0.62 | 7% |
+
+- MoE grouped GEMM: 실제 행 40000(5000×8), H=2048, I=512, 40층 → 약 10.1 TFLOP ÷ 4.86 s ≈ 2.1 TFLOPS. 같은 기기 split GEMM(9~19 TFLOPS)의 1/5~1/9. 5080에서 확인한 레지스터 spill(스레드당 2240 B)과 행 단위 gather가 후보 원인이다.
+- grouped GEMM이 split GEMM 수준(약 13 TFLOPS)에 오면 약 0.8 s → 전체 약 4.6 s(추정).
