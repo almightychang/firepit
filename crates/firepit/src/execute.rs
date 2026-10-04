@@ -131,7 +131,7 @@ pub(crate) fn run(
     let m = d.moe();
     let batch = plan.batch;
     for (op_index, &op) in plan.ops.iter().enumerate() {
-        let result = (|| -> Result<()> {
+        let result = sink.span(op.kind(), |sink| -> Result<()> {
             match op {
                 Op::Embed { out } => sink.run(
                     embedding::embedding(
@@ -523,7 +523,7 @@ pub(crate) fn run(
                 }
             }
             Ok(())
-        })();
+        });
         if let Err(error) = result {
             return Err(format!("op {op_index} {op:?}: {error}").into());
         }

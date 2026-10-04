@@ -15,7 +15,7 @@ use firepit_kernels::gemm::{
 };
 use firepit_kernels::gemv::gemv;
 use firepit_kernels::moe::PrefillPlan as MoePrefillPlan;
-use firepit_kernels::sink::{Eager, Sink};
+use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::Weight;
 use firepit_kernels::{attention, elementwise, embedding, gdn, gdn_chunk, moe, norm, rope, swiglu};
 use std::sync::Arc;
@@ -91,6 +91,32 @@ pub enum PrefillOp {
     ExpertGateUp { layer: usize },
     ExpertDown { layer: usize },
     Combine,
+}
+
+impl PrefillOp {
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            Self::Kernel(Op::Gemv {
+                name: WeightName::LmHead,
+                ..
+            }) => "lm_head",
+            Self::Kernel(Op::Gemv { .. }) => "gemm",
+            Self::Kernel(op) => op.kind(),
+            Self::Conv { .. } => "gdn_conv",
+            Self::PrepareQk | Self::PrepareValueGate { .. } => "gdn_prepare",
+            Self::ChunkMatrices => "gdn_chunk_matrices",
+            Self::ChunkDiagonal => "gdn_chunk_diagonal",
+            Self::ChunkMerge { .. } => "gdn_chunk_merge",
+            Self::ChunkApply => "gdn_chunk_apply",
+            Self::ChunkSecond { .. } => "gdn_chunk_second",
+            Self::CacheAppend { .. } => "cache_append",
+            Self::CausalAttention { .. } => "causal_attention",
+            Self::TopK => "moe_top_k",
+            Self::HostSort => "moe_host_sort",
+            Self::ExpertGateUp { .. } | Self::ExpertDown { .. } => "moe_grouped_gemm",
+            Self::Combine => "moe_combine",
+        }
+    }
 }
 
 struct ChunkSlots {
@@ -278,6 +304,7 @@ pub(crate) fn run(
     plan: &mut PrefillPlan,
     session: &mut Session,
     stream: &Stream,
+    sink: &mut impl Sink,
 ) -> Result<()> {
     let d = &model.dims;
     let g = d.gdn();
@@ -285,9 +312,8 @@ pub(crate) fn run(
     let m = d.moe();
     let rows = plan.rows;
     let len = plan.len;
-    let mut sink = Eager(stream);
     for (index, op) in plan.ops.clone().into_iter().enumerate() {
-        let result = (|| -> Result<()> {
+        let result = sink.span(op.kind(), |sink| -> Result<()> {
             match op {
                 PrefillOp::Kernel(Op::Embed { out }) => sink.run(
                     embedding::embedding(
@@ -415,12 +441,11 @@ pub(crate) fn run(
                             target.partition([1, gemv_tile(output_rows, cols).rows]),
                             gemv_tile(output_rows, cols),
                         )
-                        .submit(&mut sink)?;
+                        .submit(sink)?;
                     } else {
                         let x = source.view(&[rows, cols])?;
                         let tile = gemm_tile(cols, output_rows, false);
-                        gemm(dense, &x, target.partition([tile.m, tile.n]), tile)
-                            .submit(&mut sink)?;
+                        gemm(dense, &x, target.partition([tile.m, tile.n]), tile).submit(sink)?;
                     }
                 }
                 PrefillOp::Kernel(Op::GdnGate) => {
@@ -502,10 +527,10 @@ pub(crate) fn run(
                     )?;
                 }
                 PrefillOp::Kernel(_) => unreachable!(),
-                _ => run_special(model, plan, session, &mut sink, op, stream)?,
+                _ => run_special(model, plan, session, sink, op, stream)?,
             }
             Ok(())
-        })();
+        });
         if let Err(error) = result {
             return Err(format!("prefill op {index} {op:?}: {error}").into());
         }
@@ -517,7 +542,7 @@ fn run_special(
     model: &Model,
     plan: &mut PrefillPlan,
     session: &mut Session,
-    sink: &mut Eager<'_>,
+    sink: &mut impl Sink,
     op: PrefillOp,
     stream: &Stream,
 ) -> Result<()> {

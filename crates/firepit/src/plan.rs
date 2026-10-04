@@ -227,6 +227,32 @@ pub enum Op {
     },
 }
 
+impl Op {
+    pub(crate) fn kind(self) -> &'static str {
+        match self {
+            Self::Embed { .. } => "embedding",
+            Self::Norm { .. } => "norm",
+            Self::Gemv {
+                name: WeightName::LmHead,
+                ..
+            } => "lm_head",
+            Self::Gemv { .. } => "gemv",
+            Self::GdnConv { .. } => "gdn_conv",
+            Self::GdnDelta { .. } => "gdn_delta",
+            Self::GdnGate => "gdn_gate",
+            Self::AttnRope { .. } => "rope",
+            Self::CacheAppend { .. } => "cache_append",
+            Self::OnlineAttention { .. } => "online_attention",
+            Self::OutputGate => "output_gate",
+            Self::TopK { .. } => "moe_top_k",
+            Self::ExpertGateUp { .. } | Self::ExpertDown { .. } => "moe_expert_gemv",
+            Self::ExpertSwiglu | Self::SharedSwiglu => "swiglu",
+            Self::Combine { .. } => "moe_combine",
+            Self::Add { .. } => "add",
+        }
+    }
+}
+
 pub struct StepPlan {
     pub ops: Vec<Op>,
     pub batch: usize,

@@ -10,7 +10,7 @@ use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
 use cutile::api::{self, DeviceOpReshape};
 use firepit_kernels::rope;
-use firepit_kernels::sink::{Eager, Graph};
+use firepit_kernels::sink::{Eager, Graph, Trace, Traced};
 use firepit_kernels::tile::{MIN_ROW_TILE, channel_tile, row_tile};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -87,10 +87,43 @@ impl Engine {
         self.step_with(batch, |model, plan, sessions, stream| {
             run(model, plan, sessions, &mut Eager(stream))
         })
+        .map(|(logits, ())| logits)
+    }
+
+    pub fn step_eager_traced(&mut self, batch: Batch<'_>) -> Result<(Vec<f32>, Trace)> {
+        self.step_with(batch, |model, plan, sessions, stream| {
+            let mut sink = Traced::new(stream);
+            run(model, plan, sessions, &mut sink)?;
+            Ok(sink.into_trace())
+        })
     }
 
     pub fn prefill(&mut self, session: &mut Session, tokens: &[u32]) -> Result<Vec<f32>> {
-        let result = (|| -> Result<Vec<f32>> {
+        self.prefill_with(session, tokens, |model, plan, session, stream| {
+            prefill::run(model, plan, session, stream, &mut Eager(stream))
+        })
+        .map(|(logits, ())| logits)
+    }
+
+    pub fn prefill_traced(
+        &mut self,
+        session: &mut Session,
+        tokens: &[u32],
+    ) -> Result<(Vec<f32>, Trace)> {
+        self.prefill_with(session, tokens, |model, plan, session, stream| {
+            let mut sink = Traced::new(stream);
+            prefill::run(model, plan, session, stream, &mut sink)?;
+            Ok(sink.into_trace())
+        })
+    }
+
+    fn prefill_with<T>(
+        &mut self,
+        session: &mut Session,
+        tokens: &[u32],
+        execute: impl FnOnce(&Model, &mut PrefillPlan, &mut Session, &Stream) -> Result<T>,
+    ) -> Result<(Vec<f32>, T)> {
+        let result = (|| -> Result<(Vec<f32>, T)> {
             if session.engine != self.id
                 || session.poisoned
                 || tokens.is_empty()
@@ -122,13 +155,13 @@ impl Engine {
                 self.gdn_value_tile,
                 &self.stream,
             )?;
-            prefill::run(&self.model, &mut plan, session, &self.stream)?;
-            plan.logits(&self.stream)
+            let output = execute(&self.model, &mut plan, session, &self.stream)?;
+            Ok((plan.logits(&self.stream)?, output))
         })();
         match result {
-            Ok(logits) => {
+            Ok((logits, output)) => {
                 session.position += tokens.len();
-                Ok(logits)
+                Ok((logits, output))
             }
             Err(error) => {
                 session.poisoned = true;
@@ -149,13 +182,14 @@ impl Engine {
             plan.graph.as_ref().unwrap().launch().sync_on(stream)?;
             Ok(())
         })
+        .map(|(logits, ())| logits)
     }
 
-    fn step_with(
+    fn step_with<T>(
         &mut self,
         mut batch: Batch<'_>,
-        execute: impl FnOnce(&Model, &mut StepPlan, &mut [&mut Session], &Stream) -> Result<()>,
-    ) -> Result<Vec<f32>> {
+        execute: impl FnOnce(&Model, &mut StepPlan, &mut [&mut Session], &Stream) -> Result<T>,
+    ) -> Result<(Vec<f32>, T)> {
         if batch.engine != self.id {
             return Err("batch belongs to another engine".into());
         }
@@ -182,7 +216,7 @@ impl Engine {
             );
         }
         let plan = &mut self.plans.get_mut(&size).unwrap().plan;
-        let result = (|| -> Result<Vec<f32>> {
+        let result = (|| -> Result<(Vec<f32>, T)> {
             let mut tokens: Vec<i32> = batch.tokens.iter().map(|&x| x as i32).collect();
             tokens.resize(size, 0);
             let source = api::copy_host_vec_to_device(&Arc::new(tokens)).sync_on(&self.stream)?;
@@ -208,15 +242,15 @@ impl Engine {
                 .sync_on(&self.stream)?;
             api::memcpy(&mut plan.cos, &cosine).sync_on(&self.stream)?;
             api::memcpy(&mut plan.sin, &sine).sync_on(&self.stream)?;
-            execute(&self.model, plan, &mut batch.sessions, &self.stream)?;
+            let output = execute(&self.model, plan, &mut batch.sessions, &self.stream)?;
             #[cfg(test)]
             if self.fail_after_gpu_work {
                 return Err("injected failure after GPU work".into());
             }
-            plan.logits(&self.stream)
+            Ok((plan.logits(&self.stream)?, output))
         })();
-        let canonical = match result {
-            Ok(logits) => logits,
+        let (canonical, output) = match result {
+            Ok(result) => result,
             Err(error) => {
                 for session in &mut batch.sessions {
                     session.poisoned = true;
@@ -233,7 +267,7 @@ impl Engine {
             logits[original_row * vocab..(original_row + 1) * vocab]
                 .copy_from_slice(&canonical[canonical_row * vocab..(canonical_row + 1) * vocab]);
         }
-        Ok(logits)
+        Ok((logits, output))
     }
 }
 
@@ -241,6 +275,10 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::SafetensorsFile;
+    use crate::plan::Op;
+    use crate::session::LayerState;
+    use cutile::tensor::Tensor;
+    use cutile::tile_kernel::ToHostVecOp;
     use std::path::Path;
 
     fn small_model(device: &Arc<Device>) -> Result<Arc<Model>> {
@@ -252,6 +290,148 @@ mod tests {
             7,
             &device.new_stream()?,
         )?))
+    }
+
+    fn assert_tensor_bits(
+        a: &Tensor<f32>,
+        a_stream: &Stream,
+        b: &Tensor<f32>,
+        b_stream: &Stream,
+    ) -> Result<()> {
+        let a: Vec<f32> = a.dup().to_host_vec().sync_on(a_stream)?;
+        let b: Vec<f32> = b.dup().to_host_vec().sync_on(b_stream)?;
+        assert_eq!(
+            a.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            b.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+        );
+        Ok(())
+    }
+
+    fn assert_session_bits(
+        a: &Session,
+        a_stream: &Stream,
+        b: &Session,
+        b_stream: &Stream,
+    ) -> Result<()> {
+        assert_eq!(a.position, b.position);
+        for (left, right) in a.state.iter().zip(&b.state) {
+            match (left, right) {
+                (
+                    LayerState::Gdn {
+                        conv: ac,
+                        recurrent: ar,
+                    },
+                    LayerState::Gdn {
+                        conv: bc,
+                        recurrent: br,
+                    },
+                ) => {
+                    assert_tensor_bits(ac, a_stream, bc, b_stream)?;
+                    assert_tensor_bits(ar, a_stream, br, b_stream)?;
+                }
+                (
+                    LayerState::Attention { k: ak, v: av },
+                    LayerState::Attention { k: bk, v: bv },
+                ) => {
+                    assert_tensor_bits(ak, a_stream, bk, b_stream)?;
+                    assert_tensor_bits(av, a_stream, bv, b_stream)?;
+                }
+                _ => panic!("different layer kinds"),
+            }
+        }
+        Ok(())
+    }
+
+    fn assert_trace(trace: &Trace, expected: impl IntoIterator<Item = &'static str>) {
+        let kinds: Vec<_> = expected.into_iter().collect();
+        assert_eq!(
+            trace.spans.iter().map(|span| span.kind).collect::<Vec<_>>(),
+            kinds
+        );
+        let summary = trace.summary();
+        assert_eq!(
+            summary.iter().map(|row| row.count).sum::<usize>(),
+            trace.spans.len()
+        );
+        for row in summary {
+            let spans: Vec<_> = trace
+                .spans
+                .iter()
+                .filter(|span| span.kind == row.kind)
+                .collect();
+            assert_eq!(
+                row.gpu_ms,
+                spans.iter().map(|span| span.gpu_ms).sum::<f64>()
+            );
+            assert_eq!(
+                row.wall_ms,
+                spans.iter().map(|span| span.wall_ms).sum::<f64>()
+            );
+        }
+    }
+
+    #[test]
+    fn traced_execution_matches_eager_bits_and_plan_order() -> Result<()> {
+        let device = Device::new(0)?;
+        let model = small_model(&device)?;
+        let mut eager = Engine::new(model.clone(), &device)?;
+        let mut traced = Engine::new(model, &device)?;
+        let mut eager_session = eager.new_session(SessionId(1))?;
+        let mut traced_session = traced.new_session(SessionId(1))?;
+
+        let plain_logits = eager.prefill(&mut eager_session, &[1, 2])?;
+        let (traced_logits, trace) = traced.prefill_traced(&mut traced_session, &[1, 2])?;
+        assert_eq!(
+            plain_logits.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            traced_logits
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_session_bits(
+            &eager_session,
+            &eager.stream,
+            &traced_session,
+            &traced.stream,
+        )?;
+        let plan = PrefillPlan::new(
+            &traced.model,
+            &[1, 2],
+            0,
+            traced.gdn_conv_tile,
+            traced.gdn_value_tile,
+            &traced.stream,
+        )?;
+        assert_trace(&trace, plan.ops.iter().map(|op| op.kind()));
+        assert!(
+            trace
+                .spans
+                .iter()
+                .filter(|span| span.kind == "moe_host_sort")
+                .all(|span| span.gpu_ms == 0.0)
+        );
+
+        let plain_logits = eager.step_eager(eager.batch([(&mut eager_session, 3)])?)?;
+        let (traced_logits, trace) =
+            traced.step_eager_traced(traced.batch([(&mut traced_session, 3)])?)?;
+        assert_eq!(
+            plain_logits.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+            traced_logits
+                .iter()
+                .map(|x| x.to_bits())
+                .collect::<Vec<_>>()
+        );
+        assert_session_bits(
+            &eager_session,
+            &eager.stream,
+            &traced_session,
+            &traced.stream,
+        )?;
+        assert_trace(
+            &trace,
+            StepPlan::ops(&traced.model).into_iter().map(Op::kind),
+        );
+        Ok(())
     }
 
     #[test]
