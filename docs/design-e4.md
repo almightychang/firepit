@@ -26,3 +26,8 @@
 - 형식 기준은 NVIDIA ModelOpt 체크포인트다. E6 모델에도 `nvidia/Qwen3.8-Flash-Next-NVFP4`가 있고(expert만 NVFP4/FP8 블록, lm_head 등은 bf16), Blackwell의 NVFP4/FP8 경로와 맞고, 로더가 이미 이 형식을 읽는다.
 - 3.6 기본 구성: NVIDIA NVFP4 혼합 + lm_head bf16. 근거는 [분해 측정](research/measurements/nvfp4-gb10.md): lm_head 4비트가 손실의 약 절반, FP8 투영은 측정 가능한 손실 없음. 다른 체크포인트(RedHat·AWQ·Qwen FP8·unsloth)도 lm_head를 8비트 이상으로 둔다.
 - ds4는 E6에서 같은 GB10의 성능·품질 비교 상대로 쓴다. unsloth의 뒤쪽 layer expert FP8 유지는 필요하면 실험 옵션으로 둔다.
+
+## 4.3 decode GEMV 효율 (Sam 승인 2026-10-05)
+
+1. 양자화 GEMV는 가중치를 `[행, K]` view로 읽는다(`0a29c40`). 근거와 결과는 `research/measurements/gemv-probe-gb10.md`.
+2. shared expert는 항상 선택되는 마지막 expert다. 로드할 때 shared gate_up·down을 routed expert 묶음 끝(index E)에 이어 붙이고, 선택 목록은 토큰마다 k개 + shared 1칸(가중치 `sigmoid(shared_expert_gate)`)이다. decode와 prefill 모두 expert 경로 하나로 계산하고, shared 전용 op·slot·GEMM 경로와 combine의 shared 입력은 없앤다. shared와 routed의 intermediate 크기나 가중치 형식이 다르면 로드에서 실패한다. design-e2.9의 MoE op 목록이 이렇게 바뀌고, "커널 하나 = op 하나"는 그대로다.
