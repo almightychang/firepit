@@ -7,6 +7,7 @@ pub struct QualityChunk {
     pub top_ids: Vec<i32>,
     pub top_logp: Vec<f32>,
     pub tail_log_mass: Vec<f32>,
+    pub target_logp: Option<Vec<f32>>,
     pub chunk_size: usize,
     pub score_start: usize,
     pub top_k: usize,
@@ -41,13 +42,27 @@ impl QualityChunk {
         let top_ids = file.tensor_i32("top_ids")?;
         let top_logp = file.tensor("top_logp")?;
         let tail = file.tensor("tail_log_mass")?;
+        let target_logp = if file.has_tensor("target_logp") {
+            Some(file.tensor("target_logp")?)
+        } else {
+            None
+        };
         let scored = chunk_size - score_start;
         if tokens.shape != [chunk_size]
             || top_ids.shape != [scored, top_k]
             || top_logp.shape != [scored, top_k]
             || tail.shape != [scored]
+            || target_logp
+                .as_ref()
+                .is_some_and(|value| value.shape != [scored - 1])
         {
             return Err("quality reference tensor shapes do not match metadata".into());
+        }
+        if target_logp
+            .as_ref()
+            .is_some_and(|value| value.data.iter().any(|x| !x.is_finite() || *x > 0.0))
+        {
+            return Err("invalid target log probabilities".into());
         }
         let tokens = tokens
             .data
@@ -59,6 +74,7 @@ impl QualityChunk {
             top_ids: top_ids.data,
             top_logp: top_logp.data,
             tail_log_mass: tail.data,
+            target_logp: target_logp.map(|value| value.data),
             chunk_size,
             score_start,
             top_k,
@@ -88,6 +104,18 @@ impl QualityChunk {
             *self.tokens.get(row).ok_or("quality row out of range")?,
         ))
     }
+
+    pub fn target_token(&self, offset: usize) -> Result<Option<u32>> {
+        let (row, _) = self.scored_token(offset)?;
+        Ok(self.tokens.get(row + 1).copied())
+    }
+
+    pub fn target_logp(&self, offset: usize) -> Option<f32> {
+        self.target_logp
+            .as_ref()
+            .and_then(|values| values.get(offset))
+            .copied()
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -99,6 +127,15 @@ pub struct KlResult {
     pub tail_mass: f64,
     pub firepit_tail_mass: f64,
     log_z: f64,
+}
+
+impl KlResult {
+    pub fn target_nll(self, logits: &[f32], target: u32) -> Result<f64> {
+        let logit = logits
+            .get(target as usize)
+            .ok_or("target token outside vocabulary")?;
+        Ok(self.log_z - *logit as f64)
+    }
 }
 
 pub struct KlDiagnosis {
@@ -275,18 +312,34 @@ mod tests {
     fn scored_position_feeds_the_same_token_as_python_forward() -> Result<()> {
         let chunk = QualityChunk {
             tokens: vec![10, 11, 12, 13, 14, 15],
-            top_ids: vec![],
-            top_logp: vec![],
-            tail_log_mass: vec![],
+            top_ids: vec![1, 2, 3],
+            top_logp: vec![-1.0; 3],
+            tail_log_mass: vec![-1.0; 3],
+            target_logp: Some(vec![-2.0, -3.0]),
             chunk_size: 6,
             score_start: 3,
             top_k: 1,
             layers: 1,
         };
         assert_eq!(chunk.scored_token(0)?, (3, 13));
+        assert_eq!(chunk.row(0)?.0, &[1]);
         assert_eq!(chunk.tokens[chunk.scored_token(0)?.0 + 1], 14);
+        assert_eq!(chunk.target_token(0)?, Some(14));
+        assert_eq!(chunk.target_logp(0), Some(-2.0));
         assert_eq!(chunk.scored_token(2)?, (5, 15));
+        assert_eq!(chunk.row(2)?.0, &[3]);
+        assert_eq!(chunk.target_token(2)?, None);
+        assert_eq!(chunk.target_logp(2), None);
         assert!(chunk.scored_token(3).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn target_nll_uses_the_kl_row_distribution() -> Result<()> {
+        let logits = [0.2f32.ln(), 0.3f32.ln(), 0.5f32.ln()];
+        let score = truncated_kl(&[2], &[0.5f32.ln()], 0.5f32.ln(), &logits)?;
+        assert!((score.target_nll(&logits, 1)? + 0.3f64.ln()).abs() < 1e-6);
+        assert!(score.target_nll(&logits, 3).is_err());
         Ok(())
     }
 

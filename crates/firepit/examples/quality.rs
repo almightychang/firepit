@@ -87,6 +87,12 @@ struct TopKlRow {
     diagnosis: KlDiagnosis,
 }
 
+struct RowMeasurement {
+    kl: KlResult,
+    nll: Option<f64>,
+    hf_nll: Option<f64>,
+}
+
 fn score_row(
     chunk: &QualityChunk,
     chunk_index: usize,
@@ -94,7 +100,7 @@ fn score_row(
     logits: &[f32],
     top: &mut Vec<TopKlRow>,
     limit: usize,
-) -> Result<KlResult> {
+) -> Result<RowMeasurement> {
     let (ids, logp, tail) = chunk.row(offset)?;
     let score = truncated_kl(ids, logp, tail, logits)?;
     if limit > 0 && (top.len() < limit || score.kl > top[top.len() - 1].diagnosis.score.kl) {
@@ -108,7 +114,19 @@ fn score_row(
         top.sort_by(|a, b| b.diagnosis.score.kl.total_cmp(&a.diagnosis.score.kl));
         top.truncate(limit);
     }
-    Ok(score)
+    let target = chunk.target_token(offset)?;
+    let nll = target
+        .map(|token| score.target_nll(logits, token))
+        .transpose()?;
+    let hf_nll = chunk.target_logp(offset).map(|value| -value as f64);
+    if target.is_some() && chunk.target_logp.is_some() && hf_nll.is_none() {
+        return Err("missing HF target probability".into());
+    }
+    Ok(RowMeasurement {
+        kl: score,
+        nll,
+        hf_nll,
+    })
 }
 
 fn probabilities<T: std::fmt::Display>(pairs: &[(T, f64)]) -> String {
@@ -162,6 +180,7 @@ fn main() -> Result<()> {
     let vocab = model.dims().vocab();
     let mut engine = Engine::new(model, &device)?;
     let scored = chunk_size - score_start;
+    let has_hf_targets = first.target_logp.is_some();
     let mut first = Some(first);
     let mut chunk_kl = Vec::with_capacity(selected.len());
     let mut chunk_top1 = Vec::with_capacity(selected.len());
@@ -170,6 +189,11 @@ fn main() -> Result<()> {
     let mut quarters_kl: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
     let mut quarters_top1: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
     let mut tail_max = 0.0f64;
+    let mut all_nll = Vec::new();
+    let mut all_hf_nll = Vec::new();
+    let mut chunk_delta = Vec::new();
+    let mut all_dp = Vec::new();
+    let mut quarters_delta: [Vec<f64>; 4] = std::array::from_fn(|_| Vec::new());
     println!("chunk mean_KL top1_match tail_mass_max seconds");
     for (selected_offset, &index) in selected.iter().enumerate() {
         let chunk_started = Instant::now();
@@ -182,6 +206,7 @@ fn main() -> Result<()> {
             || chunk.score_start != score_start
             || chunk.layers != layers
             || chunk.top_k != top_k
+            || chunk.target_logp.is_some() != has_hf_targets
         {
             return Err("quality chunks have inconsistent dimensions".into());
         }
@@ -224,16 +249,30 @@ fn main() -> Result<()> {
             }
         }
         engine.close_session(session)?;
-        let values: Vec<f64> = row_scores.iter().map(|row| row.kl).collect();
+        let values: Vec<f64> = row_scores.iter().map(|row| row.kl.kl).collect();
         let top: Vec<f64> = row_scores
             .iter()
-            .map(|row| f64::from(row.same_top1 as u8))
+            .map(|row| f64::from(row.kl.same_top1 as u8))
             .collect();
+        let mut deltas = Vec::new();
         for (offset, row) in row_scores.iter().enumerate() {
             let quarter = offset * 4 / scored;
-            quarters_kl[quarter].push(row.kl);
-            quarters_top1[quarter].push(f64::from(row.same_top1 as u8));
-            tail_max = tail_max.max(row.tail_mass);
+            quarters_kl[quarter].push(row.kl.kl);
+            quarters_top1[quarter].push(f64::from(row.kl.same_top1 as u8));
+            tail_max = tail_max.max(row.kl.tail_mass);
+            if let Some(nll) = row.nll {
+                all_nll.push(nll);
+                if let Some(hf_nll) = row.hf_nll {
+                    let delta = nll - hf_nll;
+                    all_hf_nll.push(hf_nll);
+                    deltas.push(delta);
+                    quarters_delta[quarter].push(delta);
+                    all_dp.push((-nll).exp() - (-hf_nll).exp());
+                }
+            }
+        }
+        if has_hf_targets {
+            chunk_delta.push(mean(&deltas));
         }
         let kl = mean(&values);
         let top1 = mean(&top);
@@ -245,7 +284,7 @@ fn main() -> Result<()> {
             top1 * 100.0,
             row_scores
                 .iter()
-                .map(|r| r.tail_mass)
+                .map(|r| r.kl.tail_mass)
                 .fold(0.0f64, f64::max),
             chunk_started.elapsed().as_secs_f64()
         );
@@ -272,6 +311,36 @@ fn main() -> Result<()> {
                 mean(&quarters_kl[quarter]),
                 mean(&quarters_top1[quarter]) * 100.0
             );
+        }
+    }
+    println!(
+        "target rows={} firepit_mean_NLL={:.6e} firepit_PPL={:.6e}",
+        all_nll.len(),
+        mean(&all_nll),
+        mean(&all_nll).exp()
+    );
+    if has_hf_targets {
+        all_dp.sort_by(f64::total_cmp);
+        let delta = mean(&chunk_delta);
+        println!(
+            "HF_mean_NLL={:.6e} HF_PPL={:.6e} delta_NLL_95CI={} ln_PPL_ratio={delta:.6e}",
+            mean(&all_hf_nll),
+            mean(&all_hf_nll).exp(),
+            format_ci(&chunk_delta)?
+        );
+        println!(
+            "delta_p (firepit-HF) p01={:.6e} p05={:.6e} p50={:.6e} p95={:.6e} p99={:.6e}",
+            quantile(&all_dp, 0.01),
+            quantile(&all_dp, 0.05),
+            quantile(&all_dp, 0.5),
+            quantile(&all_dp, 0.95),
+            quantile(&all_dp, 0.99)
+        );
+        println!("quarter mean_delta_NLL (firepit-HF)");
+        for (quarter, values) in quarters_delta.iter().enumerate() {
+            if !values.is_empty() {
+                println!("{quarter:>7} {:.6e}", mean(values));
+            }
         }
     }
     if args.top_kl > 0 {

@@ -69,6 +69,15 @@ HF 생성은 CUDA PyTorch와 `transformers==5.17.0`, `safetensors==0.8.0`이 필
 
 원인 진단에는 예를 들어 `--chunks 72 --only-chunks 3,17 --top-kl 10`을 덧붙인다. 선택한 묶음만 채점하고 KL 상위 10개 행의 상위 K 항·나머지 항, 양쪽 top-5 확률과 교차 top-1 확률을 출력한다. 묶음 마지막 행의 다음 토큰은 기준 파일에 없어 `n/a`로 표시한다.
 
+정답 토큰 NLL/PPL 비교는 기준 파일에 `target_logp`를 추가한 뒤 같은 quality 예제를 실행한다. 기존 기준 파일에는 다음 명령으로 `target_logp`만 계산해 원자적으로 덧붙인다. 파일마다 메타데이터와 토큰·텐서 형상을 확인하며, 이미 추가된 파일은 건너뛴다.
+
+```bash
+python3 tools/reference/quality_ref.py --model "$HOME/Models/qwen3.6-35b-a3b" --cache /tmp/wiki.test.raw --out refs/quality-qwen36 --add-target-logp
+scripts/dev.sh run --release -p firepit --example quality -- --model "$HOME/Models/qwen3.6-35b-a3b" --ref refs/quality-qwen36 --chunks 72 --mode prefill
+```
+
+행 `i`의 정답은 같은 묶음의 토큰 `i+1`이다. 마지막 행은 다음 토큰이 기준 파일에 없으므로 NLL/PPL에서 제외하고 기존 KL에는 포함한다. `target_logp`가 없는 기준 파일로 실행하면 firepit NLL/PPL만 표시한다. 기준이 있으면 HF PPL, firepit−HF 평균 ΔNLL과 묶음별 짝지은 t 95% 신뢰구간, ln(PPL 비), 채점 구간별 ΔNLL, 정답 확률 차의 분위수도 표시한다.
+
 ## 판정 기준 현황
 
 | 커널 | 판정 | 근거 |

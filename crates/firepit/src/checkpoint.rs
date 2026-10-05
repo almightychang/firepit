@@ -70,6 +70,10 @@ impl SafetensorsFile {
             .map(String::as_str)
     }
 
+    pub fn has_tensor(&self, name: &str) -> bool {
+        self.header.info(name).is_some()
+    }
+
     pub fn tensor(&self, name: &str) -> Result<HostTensor> {
         let info = self.info(name)?;
         let len = info.shape.iter().product();
