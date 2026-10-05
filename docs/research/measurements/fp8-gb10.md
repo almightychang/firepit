@@ -79,3 +79,7 @@ ncu (8192×2048, 16행·K128, 1회 실행):
 - FP8 품질(72묶음 prefill): KL 9.25e-3(이전 9.26e-3), ΔNLL +3.32e-3 ± 1.14e-3(이전 +3.39e-3 ± 1.07e-3). W 쪽 bf16 반올림 제거는 품질에 측정 가능한 차이를 만들지 않았다. FP8 손실은 포맷 자체에서 온다.
 - SASS 비교는 JIT 캐시 경로가 예상과 달라 추출되지 않았다(미측정).
 - 참고: bf16 prefill 5000이 4.19 s로, E3.7 마감 기록(4.97 s)보다 빠르다. 원인은 확인하지 않았다(`--max-seq 5000` 조건 차이 가능).
+
+## A 묶음 정리 후 (`7a6e650`, GB10)
+
+S1 우회(conv state 갱신을 한 칸 시프트로, 빈 상수 루프 없음), S3 되돌림, F2 되돌림(dense F1·B2·G5 유지). gdn(kernel 2 포함 8개), fp8_oracle, moe_prefill, moe 테스트 모두 통과. FP8 prefill 5000: **3.955 s** (기준 4.201 s). gdn_conv 54.3 ms, gemm 1200.6 ms, moe_grouped_gemm 985.0 ms, moe_combine 70.4 ms.
