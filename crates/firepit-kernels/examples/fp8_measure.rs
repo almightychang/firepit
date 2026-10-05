@@ -21,7 +21,7 @@ fn measure(
 ) -> Result<(), Box<dyn Error>> {
     let fp8 = HostFp8Matrix::from_parts(
         vec![f8e4m3fn(0x38); rows * cols],
-        vec![bf16::from_f32(1.0); (rows / block_n) * (cols / block_k)],
+        vec![1.0; (rows / block_n) * (cols / block_k)],
         rows,
         cols,
         block_n,

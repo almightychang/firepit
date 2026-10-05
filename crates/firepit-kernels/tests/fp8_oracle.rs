@@ -36,7 +36,7 @@ fn grouped_gemm_within_bound(actual: f32, expected: f64, magnitude: f64, cols: u
 fn gpu(
     stream: &Arc<Stream>,
     bits: Vec<f8e4m3fn>,
-    scales: Vec<bf16>,
+    scales: Vec<f32>,
     input: &[f32],
     rows: usize,
     cols: usize,
@@ -131,13 +131,13 @@ fn fp8_gemv_and_gemm_match_dequantized_f64_oracle() {
                         f8e4m3fn(VALUES[(i.wrapping_mul(17) ^ seed as usize) % VALUES.len()].0)
                     })
                     .collect();
-                let scales: Vec<bf16> = (0..rows / 128 * (cols / 128))
-                    .map(|i| bf16::from_f32(SCALES[(i + seed as usize) % SCALES.len()]))
+                let scales: Vec<f32> = (0..rows / 128 * (cols / 128))
+                    .map(|i| SCALES[(i + seed as usize) % SCALES.len()])
                     .collect();
                 let weights: Vec<f32> = (0..rows * cols)
                     .map(|i| {
                         let value = VALUES.iter().find(|entry| entry.0 == bits[i].0).unwrap().1;
-                        value * scales[(i / cols / 128) * (cols / 128) + (i % cols / 128)].to_f32()
+                        value * scales[(i / cols / 128) * (cols / 128) + (i % cols / 128)]
                     })
                     .collect();
                 let input: Vec<f32> = (0..cols)
@@ -172,13 +172,13 @@ fn fp8_expert_kernels_match_f64_oracle() {
             let bits: Vec<f8e4m3fn> = (0..rows * cols)
                 .map(|i| f8e4m3fn(values[(i.wrapping_mul(7) ^ seed as usize) % values.len()].0))
                 .collect();
-            let scales: Vec<bf16> = (0..rows / 128 * (cols / 128))
-                .map(|i| bf16::from_f32([0.8125, 1.203125, 2.25, 0.75][(i + seed as usize) % 4]))
+            let scales: Vec<f32> = (0..rows / 128 * (cols / 128))
+                .map(|i| [0.8125, 1.203125, 2.25, 0.75][(i + seed as usize) % 4])
                 .collect();
             let weights: Vec<f32> = (0..rows * cols)
                 .map(|i| {
                     let value = values.iter().find(|entry| entry.0 == bits[i].0).unwrap().1;
-                    value * scales[(i / cols / 128) * (cols / 128) + (i % cols / 128)].to_f32()
+                    value * scales[(i / cols / 128) * (cols / 128) + (i % cols / 128)]
                 })
                 .collect();
             let matrix = HostFp8Matrix::from_parts(bits, scales, rows, cols, 128, 128)
@@ -255,16 +255,16 @@ fn fp8_extreme_finite_values_match_f64_oracle() {
             .run(&any::<u64>(), |seed| {
                 let (scale, encodings, amplitude) = match case {
                     0 => (
-                        bf16::from_bits(0x0001),
+                        bf16::from_bits(0x0001).to_f32(),
                         [0x7e, 0xfe, 0x7e, 0xfe],
                         2.0f32.powi(20),
                     ),
-                    1 => (bf16::from_bits(0x7f7f), [0x01, 0x81, 0x01, 0x81], 0.5),
-                    _ => (
-                        bf16::from_f32(1.0 / 128.0),
-                        [0x7e, 0xfe, 0x01, 0x81],
-                        2.0f32.powi(20),
+                    1 => (
+                        bf16::from_bits(0x7f7f).to_f32(),
+                        [0x01, 0x81, 0x01, 0x81],
+                        0.5,
                     ),
+                    _ => (1.0 / 128.0, [0x7e, 0xfe, 0x01, 0x81], 2.0f32.powi(20)),
                 };
                 let (rows, cols) = (128usize, 256usize);
                 let bits: Vec<f8e4m3fn> = (0..rows * cols)
@@ -280,7 +280,7 @@ fn fp8_extreme_finite_values_match_f64_oracle() {
                             0x81 => -2.0f32.powi(-9),
                             _ => unreachable!(),
                         };
-                        value * scale.to_f32()
+                        value * scale
                     })
                     .collect();
                 let input: Vec<f32> = (0..cols)

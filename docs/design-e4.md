@@ -10,3 +10,13 @@
 - 커널: decode GEMV(dense, expert)는 FP8 타일을 f32로 바꿔 블록 스케일을 곱해 기존과 같이 누적한다. prefill GEMM(dense, grouped)은 FP8 타일을 bf16으로 풀어 기존 tensor core 경로를 쓴다. activation은 f32 그대로(가중치만 FP8).
 - 검증: 커널은 dequantize한 가중치를 기준으로 기존 f64 판정. 로딩은 Python dequantize 값과 비트 비교. 품질은 기존 HF bf16 기준 72묶음으로 KL·ΔPPL·top-1을 잡음 바닥과 비교. 속도는 GB10 decode tok/s와 5000토큰 prefill.
 - 나중: activation FP8 + `mmaf_scaled`(prefill 계산 이득, 정밀도 변화는 따로 측정), Q8_0·NVFP4 비교, grouped GEMM에 gather view 결합 검토.
+
+## 4.2 NVIDIA NVFP4 혼합 체크포인트 (Sam 승인 2026-10-05)
+
+- 체크포인트: `nvidia/Qwen3.6-35B-A3B-NVFP4` (ModelOpt 0.44, `hf_quant_config.json` `quant_algo: MIXED_PRECISION`, 23.4 GB). 구성: routed expert·shared expert·**lm_head**는 `W4A16_NVFP4`(group 16), GDN `in_proj_qkv`·`in_proj_z`·`out_proj`와 attention q/k/v/o는 `FP8`, router·norm·conv·in_proj_a/b·embedding은 BF16. `kv_cache_quant_algo: FP8`.
+- NVFP4 텐서: `weight` U8 `[N, K/2]`(E2M1 두 개를 한 바이트에), `weight_scale` F8_E4M3 `[N, K/16]`, `weight_scale_2` F32 스칼라, `input_scale` F32 스칼라. dequant `w = e2m1 × weight_scale × weight_scale_2`(니블 순서와 식은 구현 첫 단계에서 ModelOpt/HF 코드로 확인).
+- FP8 텐서: `weight` E4M3, `weight_scale` F32 스칼라(텐서 전체), `input_scale` F32 스칼라. 기존 FP8 경로의 스케일 블록을 "행렬 전체"로 일반화해 받는다.
+- `input_scale`은 쓰지 않는다(activation f32 유지, 가중치 전용). KV cache FP8은 이번 범위에서 제외.
+- `Weight::Nvfp4`를 추가한다. decode GEMV(dense·expert·lm_head)는 니블을 풀어 f32로 바꾸고 16개 블록 부분합에 블록 스케일, 마지막에 전역 스케일. prefill GEMM(dense·grouped)은 bf16으로 풀어 기존 mma. `mmaf_scaled` 하드웨어 경로는 나중.
+- 로딩: `hf_quant_config.json`을 parse 타입으로 읽고 텐서 구성과 대조, 불일치 시 에러.
+- 검증: dequant 가중치 기준 f64 판정, Python dequant 비트 비교, 품질 72묶음(FP8 +0.33%와 비교), GB10 decode·prefill.

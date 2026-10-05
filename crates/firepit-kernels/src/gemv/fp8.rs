@@ -5,7 +5,6 @@ use cuda_async::device_operation::{DeviceOp, GraphNode};
 use cuda_core::f8e4m3fn;
 use cutile::tensor::{Partition, Tensor, TensorView, TensorViewMut};
 use cutile::tile_kernel::{CompileOptions, TileKernel};
-use half::bf16;
 use std::sync::Arc;
 
 #[cutile::module]
@@ -22,7 +21,7 @@ mod kernels {
     >(
         y: &mut Tensor<f32, { [B, BN] }>,
         w: &Tensor<f8e4m3fn, { [-1, -1, 32] }>,
-        scales: &Tensor<bf16, { [-1, -1] }>,
+        scales: &Tensor<f32, { [-1, -1] }>,
         x: &Tensor<f32, { [B, -1, 32] }>,
         blocks: i32,
     ) {
@@ -34,8 +33,7 @@ mod kernels {
         let scale_row = pid.1 * BN / BLOCK_N;
         let steps_per_scale = BLOCK_K / (NB * 32);
         for scale_col in 0i32..(blocks * 32 / BLOCK_K) {
-            let scale: Tile<bf16, { [1, 1] }> = scale_part.load([scale_row, scale_col]);
-            let scale: Tile<f32, { [1, 1] }> = convert_tile(scale);
+            let scale: Tile<f32, { [1, 1] }> = scale_part.load([scale_row, scale_col]);
             let mut sum: Tile<f32, { [B, BN] }> = constant(0.0f32, shape![B, BN]);
             for step in 0i32..steps_per_scale {
                 let kc = scale_col * steps_per_scale + step;
@@ -68,7 +66,7 @@ mod kernels {
     >(
         y: &mut Tensor<f32, { [1, BN] }>,
         w: &Tensor<f8e4m3fn, { [-1, -1, 32] }>,
-        scales: &Tensor<bf16, { [-1, -1] }>,
+        scales: &Tensor<f32, { [-1, -1] }>,
         x: &Tensor<f32, { [-1, -1, 32] }>,
         expert_ids: &Tensor<i32, { [-1, -1] }>,
         blocks: i32,
@@ -87,8 +85,7 @@ mod kernels {
         let scale_row = (expert * rows_per_expert + pid.1 * BN) / BLOCK_N;
         let steps_per_scale = BLOCK_K / (NB * 32);
         for scale_col in 0i32..(blocks * 32 / BLOCK_K) {
-            let scale: Tile<bf16, { [1, 1] }> = scale_part.load([scale_row, scale_col]);
-            let scale: Tile<f32, { [1, 1] }> = convert_tile(scale);
+            let scale: Tile<f32, { [1, 1] }> = scale_part.load([scale_row, scale_col]);
             let mut sum: Tile<f32, { [1, BN] }> = constant(0.0f32, shape![1, BN]);
             for step in 0i32..steps_per_scale {
                 let kc = scale_col * steps_per_scale + step;
@@ -118,7 +115,7 @@ pub(super) fn dense_gemv<'a>(
     Output = (
         Partition<&'a mut Tensor<f32>>,
         Arc<Tensor<f8e4m3fn>>,
-        Arc<Tensor<bf16>>,
+        Arc<Tensor<f32>>,
         &'a TensorView<'a, f32>,
         i32,
     ),
@@ -166,7 +163,7 @@ pub fn expert_gemv_view<'a>(
     Output = (
         Partition<TensorViewMut<'a, f32>>,
         Arc<Tensor<f8e4m3fn>>,
-        Arc<Tensor<bf16>>,
+        Arc<Tensor<f32>>,
         &'a TensorView<'a, f32>,
         &'a Tensor<i32>,
         i32,

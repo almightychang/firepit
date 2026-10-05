@@ -22,7 +22,7 @@ fn dense(
     let fp8 = Weight::Fp8(
         HostFp8Matrix::from_parts(
             vec![f8e4m3fn(0x38); rows * cols],
-            vec![bf16::from_f32(1.0); rows / 128 * (cols / 128)],
+            vec![1.0; rows / 128 * (cols / 128)],
             rows,
             cols,
             128,
@@ -99,7 +99,7 @@ fn expert(
     let fp8 = Weight::Fp8(
         HostFp8Matrix::from_parts(
             vec![f8e4m3fn(0x38); total * cols],
-            vec![bf16::from_f32(1.0); total / 128 * (cols / 128)],
+            vec![1.0; total / 128 * (cols / 128)],
             total,
             cols,
             128,

@@ -158,7 +158,11 @@ fn fp8_host(
     }
     Ok(HostFp8Matrix::from_parts(
         data.data,
-        scales.data,
+        scales
+            .data
+            .into_iter()
+            .map(|scale| scale.to_f32())
+            .collect(),
         shape[0],
         shape[1],
         config.block_n,

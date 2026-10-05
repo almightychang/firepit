@@ -3,20 +3,19 @@ use cuda_async::device_operation::DeviceOp;
 use cuda_core::f8e4m3fn;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::Tensor;
-use half::bf16;
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Fp8Matrix {
     pub weights: DenseMatrix<f8e4m3fn>,
-    pub scales: Arc<Tensor<bf16>>,
+    pub scales: Arc<Tensor<f32>>,
     pub block_n: usize,
     pub block_k: usize,
 }
 
 pub struct HostFp8Matrix {
     pub bits: Vec<f8e4m3fn>,
-    pub scales: Vec<bf16>,
+    pub scales: Vec<f32>,
     pub rows: usize,
     pub cols: usize,
     pub block_n: usize,
@@ -26,7 +25,7 @@ pub struct HostFp8Matrix {
 impl HostFp8Matrix {
     pub fn from_parts(
         bits: Vec<f8e4m3fn>,
-        scales: Vec<bf16>,
+        scales: Vec<f32>,
         rows: usize,
         cols: usize,
         block_n: usize,

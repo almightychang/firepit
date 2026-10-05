@@ -10,7 +10,6 @@ use firepit_kernels::gemv::{GemvTile, expert_gemv_weight_view, gemv};
 use firepit_kernels::moe::{ExpertSelection, MoeDims, PrefillPlan};
 use firepit_kernels::sink::Eager;
 use firepit_kernels::weights::{HostFp8Matrix, Weight};
-use half::bf16;
 use std::sync::Arc;
 
 #[cutile::module]
@@ -45,7 +44,7 @@ fn fp8_gemv_and_gemm_apply_block_scales() -> Result<(), Box<dyn std::error::Erro
     };
     let matrix = HostFp8Matrix::from_parts(
         vec![f8e4m3fn(0x38); 128 * 256],
-        vec![bf16::from_f32(0.5), bf16::from_f32(2.0)],
+        vec![0.5, 2.0],
         128,
         256,
         128,
@@ -102,7 +101,7 @@ fn fp8_expert_gemv_and_grouped_gemm_select_expert() -> Result<(), Box<dyn std::e
     let dims = MoeDims::new(128, 128, 128, 2, 1)?;
     let matrix = HostFp8Matrix::from_parts(
         vec![f8e4m3fn(0x38); 2 * 128 * 128],
-        vec![bf16::from_f32(0.5), bf16::from_f32(2.0)],
+        vec![0.5, 2.0],
         2 * 128,
         128,
         128,

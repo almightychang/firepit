@@ -69,7 +69,7 @@ mod kernels {
         y: &mut Tensor<f32, { [BM, BN] }>,
         x: &Tensor<f32, { [-1, K] }>,
         w: &Tensor<f8e4m3fn, { [-1, K] }>,
-        scales: &Tensor<bf16, { [-1, -1] }>,
+        scales: &Tensor<f32, { [-1, -1] }>,
     ) {
         let x_tiles = x.partition(shape![BM, BK]);
         let w_tiles = w.partition(shape![BN, BK]);
@@ -79,8 +79,7 @@ mod kernels {
         let mut acc: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
         for part in 0i32..(K / BK) {
             let values: Tile<f32, { [BM, BK] }> = x_tiles.load([block.0, part]);
-            let scale: Tile<bf16, { [1, 1] }> = scale_tiles.load([scale_row, part * BK / BLOCK_K]);
-            let scale: Tile<f32, { [1, 1] }> = convert_tile(scale);
+            let scale: Tile<f32, { [1, 1] }> = scale_tiles.load([scale_row, part * BK / BLOCK_K]);
             let values: Tile<f32, { [BM, BK] }> = values * scale.broadcast(shape![BM, BK]);
             let hi: Tile<bf16, { [BM, BK] }> = convert_tile(values);
             let hi_f32: Tile<f32, { [BM, BK] }> = convert_tile(hi);
@@ -99,7 +98,7 @@ mod kernels {
         y: &mut Tensor<f32, { [BM, BN] }>,
         x: &Tensor<f32, { [-1, K] }>,
         w: &Tensor<f8e4m3fn, { [-1, K] }>,
-        scales: &Tensor<bf16, { [-1, -1] }>,
+        scales: &Tensor<f32, { [-1, -1] }>,
         tile_experts: &Tensor<i32, { [-1] }>,
         rows_per_expert: i32,
         block_n: i32,
@@ -122,11 +121,10 @@ mod kernels {
             let weights: Tile<f32, { [BN, BK] }> = convert_tile(weights);
             let weights: Tile<f32, { [BK, BN] }> = weights.transpose();
             let weights: Tile<f32, { [BK, BN] }> = weights.reshape(shape![BK, BN]);
-            let scale: Tile<bf16, { [1, 1] }> = scale_tiles.load([
+            let scale: Tile<f32, { [1, 1] }> = scale_tiles.load([
                 (expert * rows_per_expert + pid.1 * BN) / block_n,
                 part * BK / block_k,
             ]);
-            let scale: Tile<f32, { [1, 1] }> = convert_tile(scale);
             let scales: Tile<f32, { [BK, BN] }> = scale.broadcast(shape![BK, BN]);
             let scales: Tile<f32, { [BK, BN] }> = scales.reshape(shape![BK, BN]);
             let weights: Tile<bf16, { [BK, BN] }> = convert_tile(weights * scales);
