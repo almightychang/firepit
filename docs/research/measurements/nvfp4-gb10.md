@@ -50,3 +50,11 @@
 | 나머지 (delta, norm, combine, top-k, conv 등) | 1.40 | | | |
 
 토큰당 가중치 약 3.0 GB, bf16 GEMV가 내는 약 213~221 GB/s 기준 하한은 약 14 ms. 차이 약 8.8 ms 중 FP8 투영 약 3.6 ms, routed NVFP4 약 2.4 ms, shared NVFP4 약 1.6 ms(작은 행렬이라 대역폭이 아니라 지연에 묶인 것으로 추정).
+
+## shared expert를 항상 선택되는 expert로 (`a045314` → `41bf08d`, GB10 같은 pod, design-e4 4.3)
+
+- 테스트: kernels moe, moe_prefill, fp8_oracle, nvfp4_oracle, fp8_tile, gemm, lib; engine; nvfp4_prefix·reference moe_matches_hf·moe_prefill_matches_hf(ignored) 통과. `loads_prefix_four`는 GB10 `nvidia-smi`가 memory.used를 `[N/A]`로 내서 helper가 실패했다(모델 로드 전, 테스트 helper 문제로 수정).
+- decode batch 1: `qwen3.6:nvfp4` 18.48 → **16.72 ms (54.1 → 59.8 tok/s)**, FP8 18.72 → 18.55 ms, bf16 27.77 → 27.42 ms.
+- `bench --profile`(eager, nvfp4): gemv 350 → 270회, 13.49 → 10.63 ms. moe_expert_gemv 4.86 → 5.11 ms. swiglu 80 → 40회, 0.85 → 0.32 ms.
+- prefill 5000토큰(1회): 4123 → 4258 ms. moe_grouped_gemm +119 ms, gemm +37 ms(호출 −80회). 변경과 무관한 gdn_chunk_second가 −46 ms 움직여 잡음과 구분하지 못했다. 반복 측정 필요. 가설(미확인): shared 칸이 expert 하나에 T행을 몰아 grouped GEMM 부하가 한 그룹에 집중된다.
+- 품질(새 대 기준, 같은 묶음, 모두 CI 안): prefill 72묶음 FP8 ΔNLL 3.304e-3 대 3.537e-3(±1.2e-3), decode 8묶음 NVFP4 1.1448e-2 대 1.1426e-2(±5.9e-3). prefill 72묶음 NVFP4는 두 커밋 출력이 자리수까지 같다(이유 미확인: dense GEMM과 grouped GEMM의 합 순서가 같을 가능성).

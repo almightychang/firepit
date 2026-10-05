@@ -752,14 +752,15 @@ mod tests {
         }
     }
 
-    fn gpu_used_mib() -> Result<usize> {
+    /// None where the device does not report it, such as GB10 unified memory ("[N/A]").
+    fn gpu_used_mib() -> Result<Option<usize>> {
         let output = std::process::Command::new("nvidia-smi")
             .args(["--query-gpu=memory.used", "--format=csv,noheader,nounits"])
             .output()?;
         if !output.status.success() {
             return Err("nvidia-smi failed".into());
         }
-        Ok(std::str::from_utf8(&output.stdout)?.trim().parse()?)
+        Ok(std::str::from_utf8(&output.stdout)?.trim().parse().ok())
     }
 
     #[test]
@@ -777,10 +778,13 @@ mod tests {
             &device,
         )?;
         let after = gpu_used_mib()?;
-        println!(
-            "GPU memory before={before} MiB after={after} MiB delta={} MiB",
-            after.saturating_sub(before)
-        );
+        match (before, after) {
+            (Some(before), Some(after)) => println!(
+                "GPU memory before={before} MiB after={after} MiB delta={} MiB",
+                after.saturating_sub(before)
+            ),
+            _ => println!("GPU memory: not reported by nvidia-smi"),
+        }
         assert_eq!(model.layers.len(), 4);
         assert_eq!(
             model.dims.layers(),
