@@ -81,3 +81,25 @@ probe 제품 경로(ms, 이전 커밋도 같은 pod에서 다시 잼):
 - FP8은 모든 형상에서 load만 하는 R1과 같은 시간이다.
 - NVFP4는 타일 행 64·32에서 느려졌다. SASS: spill은 없다(LOCAL 0). 이 두 타일에서만 tileiras가 packed 가중치를 shared memory에서 `LDS.U8`로 1바이트씩 읽어 f32로 풀고 `F2FP.SATFINITE.E2M1.F32`로 다시 묶어 `STS`하는 왕복 경로를 고른다(4096×2048: 명령 4184 → 10176, `BAR.SYNC` 67 → 807). 타일 행 128과 16·8에는 이 경로가 없다. 어떤 reshape나 레이아웃 변환이 이 경로를 유발하는지는 확인하지 않았다.
 - 모델 영향: routed expert는 타일 행 128이라 영향 밖이다(expert 커널 SASS는 직접 보지 않음). shared expert down(2048×512, 타일 행 32)은 0.021 → 0.028 ms, gate_up(1024×2048, 16)은 0.046 → 0.037 ms로 40층 순효과는 약 −0.08 ms(추정).
+
+## decode GEMV 잔여분 원인 분석 (`1d61b54`~, GB10, nsys 커널 시간, 2026-10-06)
+
+`qwen3.6:nvfp4` decode에서 GEMV는 step당 15.2 ms이고, 가중치 3.0 GB / 257 GB/s 하한 대비 약 3.4 ms 초과다(FP8 1.65, NVFP4 expert 1.12, bf16 소형 0.65). 단계별 보고서는 scratchpad의 gemv-residual-1~7, 예제는 `gemv_*_probe`.
+
+측정 기준
+- 커널 시간은 nsys로 잰다. eager do_bench event 시간에는 host launch 비용(약 70 µs)이 섞인다.
+- L2는 읽기로 비운다(쓰기로 비우면 FP8 2048×4096이 77 µs로 decode 44.7 µs와 다르다).
+- 데이터 값(0·상수·패턴·무작위·실제 가중치)은 시간에 영향이 없다(1% 안).
+- 프로세스가 큰 메모리를 먼저 할당하지 않으면 같은 커널이 약 8% 느리다(lm_head 0 GiB 236, 22 GiB 이상 257 GB/s). decode는 모델 약 23 GB를 할당하므로 257이 기준이다. 메커니즘은 미확인.
+
+확정 원인 (t = 절편 + 반복 수 × 반복당 시간, KT 128)
+| 성분 | 원인 | 대책 | step당 (추정) |
+|---|---|---|---:|
+| launch마다 절편 2~4 µs, 작은 N의 반복당 지연 | 커널 수와 작은 행렬 | 같은 입력·같은 형식 GEMV를 로드 시 이어 붙이기 | 약 0.6 ms |
+| FP8 per-tensor scale | BLOCK_K = cols라 바깥 루프 1회 안의 상수 반복 루프로 컴파일(STACK 최대 1 KB, z에서 +4.3 µs) | per-tensor를 행 scale로 표현하고 평탄한 K 루프 | 약 0.16 ms |
+| FP8 작은 타일(BN 8)에서 반복마다 [1,1] scale 곱 | tileiras lowering: 루프 동기화 2배(BAR 14 → 26) | 평탄 루프(scale을 끝에서), 타일 선택은 E7 | 약 0.3 ms 중 일부 |
+| NVFP4 그룹 scale 곱 | tileiras lowering: E4M3 scale 곱 단계에서 반복당 +21%(F2FP 128 → 408) | 우회 확인 중 | 상한 약 0.6 ms |
+| 독립 GEMV 동시 실행 | safe graph API에 병렬 분기 없음 | cutile-rs 기능(이슈 010) | 상한 약 1 ms |
+
+배제한 가설: pipeline 깊이(`load_pipelined`), 반복마다 끝내는 reduce, CTA 수·메모리 병렬도(8 CTA에서 이미 포화), 데이터 값, eager 대 graph, 지속 부하.
+이슈 초안: 010(graph 병렬 분기), 011(FP8 반복당 scale), 012(FP4 그룹 scale), 008(FP4 unpack 후 reduce).
