@@ -265,6 +265,7 @@ fn main() -> Result<()> {
     if cfg!(debug_assertions) {
         return Err("measurement requires --release".into());
     }
+    cutile::jit_cache::enable_default()?;
     let (rows, cols, tile) = parse_args()?;
     let stream: Arc<Stream> = Device::new(0)?.new_stream()?;
     let blocks = cols / 32;
