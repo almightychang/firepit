@@ -1,4 +1,5 @@
 use cuda_async::device_operation::DeviceOp;
+use cuda_async::scheduling_policies::{SchedulingPolicy, SingleStream};
 use cuda_core::{Device, Stream, f4e2m1fnx2, f8e4m3fn};
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, Tensor};
@@ -8,12 +9,14 @@ use firepit_kernels::sink::Eager;
 use firepit_kernels::weights::{DenseMatrix, HostFp8Matrix, HostNvfp4Matrix, Weight};
 use half::bf16;
 use std::error::Error;
-use std::sync::{Arc, Barrier};
+use std::future::Future;
+use std::sync::Arc;
+use std::task::{Context, Poll, Waker};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
-// Every launch is preceded by a scrub of a buffer twice the L2 size, so each GEMV reads its
-// weights from DRAM as in graph decode. Kernel times are read from nsys, not from events;
+// Every launch is preceded by a read of a buffer twice the L2 size, so each GEMV reads its
+// weights from DRAM into an L2 of clean lines, as in graph decode. Kernel times are read from nsys, not from events;
 // the manifest lines tell the analysis which configuration each instance belongs to.
 const WARMUP: usize = 2;
 const REPS: usize = 8;
@@ -25,9 +28,20 @@ mod probes {
     use cutile::core::*;
 
     #[cutile::entry()]
-    pub fn scrub<const B: i32>(buffer: &mut Tensor<f32, { [B] }>) {
+    pub fn scrub_write<const B: i32>(buffer: &mut Tensor<f32, { [B] }>) {
         let zeros: Tile<f32, { [B] }> = constant(0.0f32, shape![B]);
         buffer.store(zeros);
+    }
+
+    #[cutile::entry()]
+    pub fn scrub_read<const B: i32>(
+        sums: &mut Tensor<f32, { [1] }>,
+        buffer: &Tensor<f32, { [-1] }>,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let values: Tile<f32, { [B] }> = buffer.partition(shape![B]).load([pid.0]);
+        let sum: Tile<f32, { [] }> = reduce_sum(values, 0i32);
+        sums.store(sum.reshape(shape![1]));
     }
 
     #[cutile::entry()]
@@ -130,16 +144,35 @@ fn dense_tile(rows: usize, cols: usize) -> GemvTile {
     tile
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum Scrub {
+    Read,
+    Write,
+}
+
 struct Probe {
     stream: Arc<Stream>,
-    scrub: Tensor<f32>,
+    buffer: Arc<Tensor<f32>>,
+    sums: Tensor<f32>,
+    mode: Scrub,
 }
 
 impl Probe {
     fn scrub(&mut self) -> Result<()> {
-        probes::scrub((&mut self.scrub).partition([SCRUB_TILE]))
-            .generics(vec![SCRUB_TILE.to_string()])
-            .sync_on(&self.stream)?;
+        match self.mode {
+            Scrub::Read => {
+                probes::scrub_read((&mut self.sums).partition([1]), self.buffer.clone())
+                    .generics(vec![SCRUB_TILE.to_string()])
+                    .sync_on(&self.stream)?;
+            }
+            Scrub::Write => {
+                let mut buffer =
+                    api::zeros::<f32>(&[self.buffer.shape()[0] as usize]).sync_on(&self.stream)?;
+                probes::scrub_write((&mut buffer).partition([SCRUB_TILE]))
+                    .generics(vec![SCRUB_TILE.to_string()])
+                    .sync_on(&self.stream)?;
+            }
+        }
         Ok(())
     }
 
@@ -248,43 +281,61 @@ fn pipeline(probe: &mut Probe, rows: usize, cols: usize) -> Result<()> {
     Ok(())
 }
 
-// (a) both GEMVs on one stream, back to back; (b) one GEMV per stream, launched from two
-// threads released by a barrier. The analysis reads start skew and overlap from nsys.
+// Two independent load-only GEMV stand-ins (the same bytes as the product kernels) on
+// (a) one stream back to back, and (b) two streams: the first is scheduled on its own stream
+// and polled once, which launches it without waiting, then the second runs on the probe
+// stream. The analysis reads start skew and overlap from nsys.
+fn rows_op<'a>(
+    y: &'a mut Tensor<f32>,
+    w: &Arc<Tensor<f8e4m3fn>>,
+    rows: usize,
+    cols: usize,
+) -> impl DeviceOp<Output = ()> + use<'a> {
+    let tile = fp8_tile(rows, cols, SCALE_BLOCK, SCALE_BLOCK, 1);
+    let kt = tile.blocks * 32;
+    probes::rows_load(y.partition([1, tile.rows]), w.clone(), (cols / kt) as i32)
+        .generics(vec![tile.rows.to_string(), kt.to_string()])
+        .then(|_| cuda_async::device_operation::value(()))
+}
+
 fn concurrent(
     probe: &mut Probe,
     label: &str,
-    first: (&Weight, GemvTile, usize),
-    second: (&Weight, GemvTile, usize),
+    first: usize,
+    second: usize,
     cols: usize,
 ) -> Result<()> {
-    let device = probe.stream.device().clone();
-    let other = device.new_stream()?;
-    let mut a = product_gemv(first.0, first.1, first.2, cols, &probe.stream)?;
-    let mut b = product_gemv(second.0, second.1, second.2, cols, &probe.stream)?;
+    let policy: Arc<dyn SchedulingPolicy> = Arc::new(SingleStream::new(probe.stream.device())?);
+    let upload = |rows: usize| -> Result<Arc<Tensor<f8e4m3fn>>> {
+        Ok(Arc::new(
+            api::copy_host_vec_to_device(&Arc::new(vec![f8e4m3fn(0x38); rows * cols]))
+                .reshape(&[rows, cols])
+                .sync_on(&probe.stream)?,
+        ))
+    };
+    let (wa, wb) = (upload(first)?, upload(second)?);
+    let mut ya = api::zeros::<f32>(&[1, first]).sync_on(&probe.stream)?;
+    let mut yb = api::zeros::<f32>(&[1, second]).sync_on(&probe.stream)?;
     println!("CFG concurrent-serial {label} launches={}", WARMUP + REPS);
     for _ in 0..WARMUP + REPS {
         probe.scrub()?;
-        a(&probe.stream)?;
-        b(&probe.stream)?;
+        rows_op(&mut ya, &wa, first, cols)
+            .then(|_| rows_op(&mut yb, &wb, second, cols))
+            .sync_on(&probe.stream)?;
     }
     println!("CFG concurrent-parallel {label} launches={}", WARMUP + REPS);
-    let stream = probe.stream.clone();
+    let mut context = Context::from_waker(Waker::noop());
     for _ in 0..WARMUP + REPS {
         probe.scrub()?;
-        let barrier = Barrier::new(2);
-        std::thread::scope(|scope| -> Result<()> {
-            let left = scope.spawn(|| {
-                barrier.wait();
-                a(&stream).map_err(|e| e.to_string())
-            });
-            let right = scope.spawn(|| {
-                barrier.wait();
-                b(&other).map_err(|e| e.to_string())
-            });
-            left.join().expect("left thread")?;
-            right.join().expect("right thread")?;
-            Ok(())
-        })?;
+        let mut pending = Box::pin(rows_op(&mut ya, &wa, first, cols).schedule(&policy)?);
+        let mut done = pending.as_mut().poll(&mut context);
+        rows_op(&mut yb, &wb, second, cols).sync_on(&probe.stream)?;
+        while let Poll::Pending = done {
+            done = pending.as_mut().poll(&mut context);
+        }
+        if let Poll::Ready(result) = done {
+            result?;
+        }
     }
     Ok(())
 }
@@ -299,9 +350,15 @@ fn main() -> Result<()> {
     let scrub_len = ((2 * l2).max(64 << 20) / 4).next_multiple_of(SCRUB_TILE);
     println!("L2 {l2} bytes, scrub {} MiB", scrub_len * 4 >> 20);
     let mut probe = Probe {
-        scrub: api::zeros::<f32>(&[scrub_len]).sync_on(&stream)?,
+        buffer: Arc::new(api::zeros::<f32>(&[scrub_len]).sync_on(&stream)?),
+        sums: api::zeros::<f32>(&[scrub_len / SCRUB_TILE]).sync_on(&stream)?,
         stream,
+        mode: Scrub::Write,
     };
+    println!("SCRUB write");
+    sweep(&mut probe, 2048, 4096)?;
+    probe.mode = Scrub::Read;
+    println!("SCRUB read");
     for rows in [512, 2048] {
         for cols in [128, 256, 512, 1024, 2048, 4096, 8192] {
             sweep(&mut probe, rows, cols)?;
@@ -310,40 +367,13 @@ fn main() -> Result<()> {
     for cols in [128, 2048, 8192] {
         pipeline(&mut probe, 512, cols)?;
     }
-    let cols = 2048;
-    let big = Weights::upload(&probe.stream, 4096, cols)?;
-    let small = Weights::upload(&probe.stream, 512, cols)?;
-    let stream = probe.stream.clone();
-    let tiny = || -> Result<Weight> {
-        Ok(Weight::Dense(DenseMatrix::upload(
-            vec![bf16::from_f32(1.0); 32 * cols],
-            32,
-            cols,
-            &stream,
-        )?))
-    };
-    let (tiny_a, tiny_b) = (tiny()?, tiny()?);
     concurrent(
         &mut probe,
-        "fp8 4096x2048 + fp8 512x2048",
-        (
-            &big.fp8,
-            fp8_tile(4096, cols, SCALE_BLOCK, SCALE_BLOCK, 1),
-            4096,
-        ),
-        (
-            &small.fp8,
-            fp8_tile(512, cols, SCALE_BLOCK, SCALE_BLOCK, 1),
-            512,
-        ),
-        cols,
+        "rows 4096x2048 + rows 512x2048",
+        4096,
+        512,
+        2048,
     )?;
-    concurrent(
-        &mut probe,
-        "bf16 32x2048 + bf16 32x2048",
-        (&tiny_a, dense_tile(32, cols), 32),
-        (&tiny_b, dense_tile(32, cols), 32),
-        cols,
-    )?;
+    concurrent(&mut probe, "rows 32x2048 + rows 32x2048", 32, 32, 2048)?;
     Ok(())
 }
