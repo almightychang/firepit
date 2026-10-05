@@ -242,6 +242,15 @@ impl Checkpoint {
         self.shard_of.contains_key(name)
     }
 
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.shard_of.keys().map(String::as_str)
+    }
+
+    pub fn stored(&self, name: &str) -> Result<(Dtype, Vec<usize>)> {
+        let info = self.shard(name)?.info(name)?;
+        Ok((info.dtype, info.shape.clone()))
+    }
+
     pub fn stacked_bf16(
         &self,
         first: &str,

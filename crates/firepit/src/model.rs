@@ -4,6 +4,7 @@ use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
 use cutile::tensor::Tensor;
 use firepit_kernels::weights::{HostFp8Matrix, HostNvfp4Matrix, NVFP4_GROUP, Weight};
+use safetensors::Dtype;
 use serde_json::Value;
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -260,6 +261,73 @@ impl Sources {
     }
 }
 
+fn check_companions(checkpoint: &Checkpoint, name: &str, format: WeightFormat) -> Result<()> {
+    let present = [".weight_scale_inv", ".weight_scale", ".weight_scale_2"]
+        .map(|suffix| checkpoint.contains(&name.replace(".weight", suffix)));
+    let expected = match format {
+        WeightFormat::Bf16 => [false, false, false],
+        WeightFormat::Fp8Blocks { .. } => [true, false, false],
+        WeightFormat::Fp8Tensor => [false, true, false],
+        WeightFormat::Nvfp4 => [false, true, true],
+    };
+    if present != expected {
+        return Err(format!("{name}: scale tensors contradict {format:?}").into());
+    }
+    Ok(())
+}
+
+pub struct WeightReport {
+    pub name: String,
+    pub format: WeightFormat,
+    pub dtype: Dtype,
+    pub shape: Vec<usize>,
+}
+
+pub fn verify_checkpoint(dir: &Path) -> Result<Vec<WeightReport>> {
+    let source = Source::open(dir)?;
+    let dims = source.config.dims(1, None)?;
+    let mut names: Vec<&str> = source
+        .checkpoint
+        .names()
+        .filter(|name| name.ends_with(".weight"))
+        .collect();
+    names.sort_unstable();
+    let report = names
+        .into_iter()
+        .map(|name| {
+            let format = source.config.format(name);
+            check_companions(&source.checkpoint, name, format)?;
+            let (dtype, shape) = source.checkpoint.stored(name)?;
+            let stored_as_format = match format {
+                WeightFormat::Bf16 => !matches!(dtype, Dtype::U8 | Dtype::F8_E4M3),
+                WeightFormat::Fp8Blocks { .. } | WeightFormat::Fp8Tensor => dtype == Dtype::F8_E4M3,
+                WeightFormat::Nvfp4 => dtype == Dtype::U8,
+            };
+            if !stored_as_format {
+                return Err(format!("{name}: {dtype:?} data contradicts {format:?}").into());
+            }
+            Ok(WeightReport {
+                name: name.to_owned(),
+                format,
+                dtype,
+                shape,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let lm_head = report
+        .iter()
+        .find(|weight| weight.name == "lm_head.weight")
+        .ok_or("checkpoint has no lm_head.weight")?;
+    let stored_cols = match lm_head.format {
+        WeightFormat::Nvfp4 => dims.hidden() / 2,
+        _ => dims.hidden(),
+    };
+    if lm_head.shape != [dims.vocab(), stored_cols] {
+        return Err(format!("lm_head.weight has shape {:?}", lm_head.shape).into());
+    }
+    Ok(report)
+}
+
 enum HostWeight {
     Dense(HostBf16Tensor),
     Fp8(HostFp8Matrix),
@@ -273,18 +341,8 @@ impl HostWeight {
         [rows, cols]: [usize; 2],
         format: WeightFormat,
     ) -> Result<Self> {
+        check_companions(checkpoint, name, format)?;
         let companion = |suffix: &str| name.replace(".weight", suffix);
-        let present = [".weight_scale_inv", ".weight_scale", ".weight_scale_2"]
-            .map(|suffix| checkpoint.contains(&companion(suffix)));
-        let expected = match format {
-            WeightFormat::Bf16 => [false, false, false],
-            WeightFormat::Fp8Blocks { .. } => [true, false, false],
-            WeightFormat::Fp8Tensor => [false, true, false],
-            WeightFormat::Nvfp4 => [false, true, true],
-        };
-        if present != expected {
-            return Err(format!("{name}: scale tensors contradict {format:?}").into());
-        }
         let shape_error = || format!("{name}: invalid {format:?} data or scale shape");
         match format {
             WeightFormat::Bf16 => {
@@ -641,6 +699,32 @@ mod tests {
         );
         assert!(sources.host(PROJECTION, [8, shape[1]]).is_err());
         std::fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn verification_reports_formats_and_rejects_stray_scales() -> Result<()> {
+        let dir = std::env::temp_dir().join(format!("firepit-verify-{}", std::process::id()));
+        write_checkpoint(&dir, 1.0)?;
+        let report = verify_checkpoint(&dir)?;
+        let lm_head = report
+            .iter()
+            .find(|weight| weight.name == "lm_head.weight")
+            .ok_or("missing lm_head")?;
+        assert_eq!(
+            (lm_head.format, lm_head.dtype, lm_head.shape.clone()),
+            (
+                WeightFormat::Bf16,
+                Dtype::BF16,
+                lm_head_shape(&small_config()).to_vec()
+            )
+        );
+        let index_path = dir.join("model.safetensors.index.json");
+        let mut index: Value = serde_json::from_str(&std::fs::read_to_string(&index_path)?)?;
+        index["weight_map"]["lm_head.weight_scale"] = "model.safetensors".into();
+        std::fs::write(&index_path, index.to_string())?;
+        assert!(verify_checkpoint(&dir).is_err());
+        std::fs::remove_dir_all(&dir)?;
         Ok(())
     }
 
