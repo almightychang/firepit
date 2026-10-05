@@ -2,7 +2,7 @@ use cuda_core::Device;
 use firepit::quality::{
     KlDiagnosis, KlResult, QualityChunk, diagnose_kl, mean, quantile, t95, truncated_kl,
 };
-use firepit::{Engine, LoadOptions, Model, Result, ScoredRows, SessionId};
+use firepit::{Engine, LoadOptions, Model, Result, ScoredRows, SessionId, WeightOverride};
 use std::collections::BTreeSet;
 use std::env;
 use std::path::PathBuf;
@@ -23,6 +23,7 @@ struct Args {
     layers: Option<usize>,
     top_kl: usize,
     only_chunks: Option<BTreeSet<usize>>,
+    overrides: Vec<WeightOverride>,
 }
 
 fn args() -> Result<Args> {
@@ -30,6 +31,7 @@ fn args() -> Result<Args> {
     let (mut model, mut reference, mut chunks, mut mode, mut layers) =
         (None, None, None, None, None);
     let (mut top_kl, mut only_chunks) = (0, None);
+    let mut overrides = Vec::new();
     while let Some(flag) = values.next() {
         let value = values.next().ok_or(format!("missing value for {flag}"))?;
         match flag.as_str() {
@@ -45,6 +47,7 @@ fn args() -> Result<Args> {
             }
             "--layers" => layers = Some(value.parse::<usize>()?),
             "--top-kl" => top_kl = value.parse()?,
+            "--override" => overrides.push(value.parse()?),
             "--only-chunks" => {
                 if value.is_empty() {
                     return Err("--only-chunks requires comma-separated indices".into());
@@ -77,6 +80,7 @@ fn args() -> Result<Args> {
         layers,
         top_kl,
         only_chunks,
+        overrides,
     })
 }
 
@@ -166,12 +170,13 @@ fn main() -> Result<()> {
         first.layers,
     );
     let device = Device::new(0)?;
-    let model = Arc::new(Model::from_checkpoint(
+    let model = Arc::new(Model::from_checkpoint_with_overrides(
         &args.model,
         LoadOptions {
             max_seq: chunk_size,
             layers: args.layers,
         },
+        &args.overrides,
         &device,
     )?);
     if layers != model.dims().layers().len() {

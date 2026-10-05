@@ -1,5 +1,5 @@
 use cuda_core::Device;
-use firepit::{Engine, LoadOptions, Model, Result, SessionId};
+use firepit::{Engine, LoadOptions, Model, Result, SessionId, WeightOverride};
 use firepit_kernels::sink::Trace;
 use std::env;
 use std::path::PathBuf;
@@ -15,6 +15,7 @@ struct Args {
     layers: Option<usize>,
     prefill_lengths: Option<Vec<usize>>,
     profile: bool,
+    overrides: Vec<WeightOverride>,
 }
 
 fn parse_args() -> Result<Args> {
@@ -29,6 +30,7 @@ fn parse_args() -> Result<Args> {
         mut prefill_lengths,
         mut profile,
     ) = (None, None, None, None, None, None, None, false);
+    let mut overrides = Vec::new();
     while let Some(flag) = values.next() {
         if flag == "--profile" {
             profile = true;
@@ -49,6 +51,7 @@ fn parse_args() -> Result<Args> {
             "--warmup" => warmup = Some(value.parse()?),
             "--max-seq" => max_seq = Some(value.parse()?),
             "--layers" => layers = Some(value.parse()?),
+            "--override" => overrides.push(value.parse()?),
             "--prefill-lengths" => {
                 prefill_lengths = Some(
                     value
@@ -81,6 +84,7 @@ fn parse_args() -> Result<Args> {
         layers,
         prefill_lengths,
         profile,
+        overrides,
     })
 }
 
@@ -119,12 +123,13 @@ fn main() -> Result<()> {
     }
     let device = Device::new(0)?;
     let loading = Instant::now();
-    let model = Arc::new(Model::from_checkpoint(
+    let model = Arc::new(Model::from_checkpoint_with_overrides(
         &args.model,
         LoadOptions {
             max_seq: args.max_seq,
             layers: args.layers,
         },
+        &args.overrides,
         &device,
     )?);
     println!("load {:.1}s", loading.elapsed().as_secs_f64());
