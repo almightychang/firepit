@@ -58,3 +58,23 @@
 - `bench --profile`(eager, nvfp4): gemv 350 → 270회, 13.49 → 10.63 ms. moe_expert_gemv 4.86 → 5.11 ms. swiglu 80 → 40회, 0.85 → 0.32 ms.
 - prefill 5000토큰(1회): 4123 → 4258 ms. moe_grouped_gemm +119 ms, gemm +37 ms(호출 −80회). 변경과 무관한 gdn_chunk_second가 −46 ms 움직여 잡음과 구분하지 못했다. 반복 측정 필요. 가설(미확인): shared 칸이 expert 하나에 T행을 몰아 grouped GEMM 부하가 한 그룹에 집중된다.
 - 품질(새 대 기준, 같은 묶음, 모두 CI 안): prefill 72묶음 FP8 ΔNLL 3.304e-3 대 3.537e-3(±1.2e-3), decode 8묶음 NVFP4 1.1448e-2 대 1.1426e-2(±5.9e-3). prefill 72묶음 NVFP4는 두 커밋 출력이 자리수까지 같다(이유 미확인: dense GEMM과 grouped GEMM의 합 순서가 같을 가능성).
+
+### shared expert 통합의 prefill 영향 (6회 교대 측정)
+
+- wall 중앙값(ms): T=1000 636 → 663, T=2000 1285 → 1324, T=5000 4102 → 4158(profile 없음). 처음 1회의 +135 ms는 잡음이었고 실제는 +1~4%다.
+- "한 그룹에 부하 집중"은 아니다(nsys): grouped GEMM 행 tile이 ceil(T/32)만큼 늘었고 tile당 시간은 같다(1.56 → 1.54 µs). shared 몫이 dense NVFP4 GEMM(BM 64)에서 grouped GEMM(BM 32)으로 옮겨 가중치 tile을 두 배 읽는다(T=1000 13.0 → 22.7 ms, T=5000 103.0 → 112.3 ms, gather +2.8 / +16 ms). T=1000 차이 중 약 12.5 ms만 이것으로 설명되고 나머지는 확인하지 않았다.
+
+## decode 분해 (`1d923cd`, nsys 2025.3.2 `--cuda-graph-trace=node`, 32 step 평균)
+
+`qwen3.6:nvfp4` 조립본, batch 1, max-seq 256. nsys 없는 step 16.71 ms, 커널 합 16.49 ms.
+
+| 커널 | step당 ms | step당 호출 | 읽는 가중치 (계산) | 유효 GB/s |
+|---|---:|---:|---:|---:|
+| dense_fp8 (GDN·attention 투영) | 6.67 | 130 | 1.29 GB | 193 |
+| dense_gemv bf16 (lm_head, router, in_proj_a/b, shared gate) | 4.87 | 141 | 1.07 GB | 220 |
+| expert_nvfp4 (routed 8 + shared 1) | 3.69 | 80 | 0.64 GB | 174 |
+| 원소별·세션 op 합 | 1.39 | | | |
+
+원소별·세션 op: delta 0.39(30회), rms_norm 0.26(131), combine 0.17(40), top_k 0.14(40), conv1d_silu 0.11(30), add 0.10(80), attention 0.07(10), swiglu 0.05(40), 나머지 0.1 미만.
+
+하한(가중치 3.0 GB / 220 GB/s ≈ 13.6 ms) 대비 약 3.1 ms 중 GEMV 초과 약 1.6 ms(FP8 +0.81, NVFP4 expert +0.78), 원소별·세션 op 1.4 ms, 커널 사이 공백 약 0.2 ms(추정).
