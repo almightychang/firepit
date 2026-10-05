@@ -4,7 +4,7 @@ use crate::weights::{Fp8Matrix, Q8_BLOCK};
 use cuda_async::device_operation::{DeviceOp, GraphNode};
 use cuda_core::f8e4m3fn;
 use cutile::tensor::{Partition, Tensor, TensorView, TensorViewMut};
-use cutile::tile_kernel::TileKernel;
+use cutile::tile_kernel::{CompileOptions, TileKernel};
 use half::bf16;
 use std::sync::Arc;
 
@@ -113,6 +113,7 @@ pub(super) fn dense_gemv<'a>(
     x: &'a TensorView<'a, f32>,
     y: Partition<&'a mut Tensor<f32>>,
     tile: GemvTile,
+    options: Option<CompileOptions>,
 ) -> impl DeviceOp<
     Output = (
         Partition<&'a mut Tensor<f32>>,
@@ -149,6 +150,7 @@ pub(super) fn dense_gemv<'a>(
         w.block_n.to_string(),
         w.block_k.to_string(),
     ])
+    .compile_options(options.unwrap_or_default())
 }
 
 pub fn expert_gemv_view<'a>(
@@ -159,6 +161,7 @@ pub fn expert_gemv_view<'a>(
     rows_per_expert: usize,
     input_stride: usize,
     tile: GemvTile,
+    options: Option<CompileOptions>,
 ) -> impl DeviceOp<
     Output = (
         Partition<TensorViewMut<'a, f32>>,
@@ -196,4 +199,5 @@ pub fn expert_gemv_view<'a>(
         w.block_n.to_string(),
         w.block_k.to_string(),
     ])
+    .compile_options(options.unwrap_or_default())
 }

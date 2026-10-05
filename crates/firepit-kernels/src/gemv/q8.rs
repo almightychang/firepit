@@ -46,7 +46,7 @@ use super::GemvTile;
 use crate::weights::{Q8_BLOCK, Q8Matrix};
 use cuda_async::device_operation::{DeviceOp, GraphNode};
 use cutile::tensor::{Partition, Tensor, TensorView};
-use cutile::tile_kernel::TileKernel;
+use cutile::tile_kernel::{CompileOptions, TileKernel};
 use half::f16;
 use std::sync::Arc;
 
@@ -55,6 +55,7 @@ pub(super) fn q8_gemv<'a>(
     x: &'a TensorView<'a, f32>,
     y: Partition<&'a mut Tensor<f32>>,
     tile: GemvTile,
+    options: Option<CompileOptions>,
 ) -> impl DeviceOp<
     Output = (
         Partition<&'a mut Tensor<f32>>,
@@ -84,4 +85,5 @@ pub(super) fn q8_gemv<'a>(
         tile.rows.to_string(),
         tile.blocks.to_string(),
     ])
+    .compile_options(options.unwrap_or_default())
 }

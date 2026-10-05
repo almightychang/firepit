@@ -5,7 +5,7 @@ use cuda_async::device_operation::{DeviceOp, GraphNode};
 use cutile::DType;
 use cutile::core::ElementType;
 use cutile::tensor::{Partition, Tensor, TensorView, TensorViewMut};
-use cutile::tile_kernel::TileKernel;
+use cutile::tile_kernel::{CompileOptions, TileKernel};
 use std::sync::Arc;
 
 #[cutile::module]
@@ -116,6 +116,39 @@ pub fn expert_gemv_view<'a, T: DType + ElementType>(
     ),
 > + GraphNode
 + 'a {
+    expert_gemv_view_with_options(
+        w,
+        x,
+        selection,
+        y,
+        rows_per_expert,
+        input_stride,
+        tile,
+        None,
+    )
+}
+
+pub(super) fn expert_gemv_view_with_options<'a, T: DType + ElementType>(
+    w: &DenseMatrix<T>,
+    x: &'a TensorView<'a, f32>,
+    selection: &'a ExpertSelection,
+    y: Partition<TensorViewMut<'a, f32>>,
+    rows_per_expert: usize,
+    input_stride: usize,
+    tile: GemvTile,
+    options: Option<CompileOptions>,
+) -> impl DeviceOp<
+    Output = (
+        Partition<TensorViewMut<'a, f32>>,
+        Arc<Tensor<T>>,
+        &'a TensorView<'a, f32>,
+        &'a Tensor<i32>,
+        i32,
+        i32,
+        i32,
+    ),
+> + GraphNode
++ 'a {
     let dims = selection.dims();
     assert!(rows_per_expert > 0 && input_stride <= 1);
     assert_eq!(w.rows, dims.experts() * rows_per_expert);
@@ -134,4 +167,5 @@ pub fn expert_gemv_view<'a, T: DType + ElementType>(
         tile.rows.to_string(),
         tile.blocks.to_string(),
     ])
+    .compile_options(options.unwrap_or_default())
 }

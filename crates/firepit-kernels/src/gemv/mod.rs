@@ -8,6 +8,7 @@ pub use expert::{expert_gemv, expert_gemv_view};
 use crate::moe::ExpertSelection;
 use crate::sink::Sink;
 use cutile::tensor::{Partition, Tensor, TensorView, TensorViewMut};
+use cutile::tile_kernel::CompileOptions;
 
 use crate::weights::{Q8_BLOCK, Weight};
 
@@ -62,6 +63,7 @@ pub struct Gemv<'a> {
     x: &'a TensorView<'a, f32>,
     y: Partition<&'a mut Tensor<f32>>,
     tile: GemvTile,
+    compile_options: Option<CompileOptions>,
 }
 
 pub fn gemv<'a>(
@@ -70,20 +72,49 @@ pub fn gemv<'a>(
     y: Partition<&'a mut Tensor<f32>>,
     tile: GemvTile,
 ) -> Gemv<'a> {
-    Gemv { weight, x, y, tile }
+    Gemv {
+        weight,
+        x,
+        y,
+        tile,
+        compile_options: None,
+    }
 }
 
 impl Gemv<'_> {
+    pub fn compile_options(mut self, options: CompileOptions) -> Self {
+        self.compile_options = Some(options);
+        self
+    }
+
     pub fn submit<S: Sink>(self, sink: &mut S) -> Result<(), cuda_async::error::DeviceError> {
         match self.weight {
             Weight::Dense(w) => {
-                sink.run(dense::dense_gemv(w, self.x, self.y, self.tile))?;
+                sink.run(dense::dense_gemv(
+                    w,
+                    self.x,
+                    self.y,
+                    self.tile,
+                    self.compile_options,
+                ))?;
             }
             Weight::Q8(w) => {
-                sink.run(q8::q8_gemv(w, self.x, self.y, self.tile))?;
+                sink.run(q8::q8_gemv(
+                    w,
+                    self.x,
+                    self.y,
+                    self.tile,
+                    self.compile_options,
+                ))?;
             }
             Weight::Fp8(w) => {
-                sink.run(fp8::dense_gemv(w, self.x, self.y, self.tile))?;
+                sink.run(fp8::dense_gemv(
+                    w,
+                    self.x,
+                    self.y,
+                    self.tile,
+                    self.compile_options,
+                ))?;
             }
         }
         Ok(())
@@ -98,6 +129,7 @@ pub struct ExpertGemvView<'a> {
     rows_per_expert: usize,
     input_stride: usize,
     tile: GemvTile,
+    compile_options: Option<CompileOptions>,
 }
 
 pub fn expert_gemv_weight_view<'a>(
@@ -117,13 +149,19 @@ pub fn expert_gemv_weight_view<'a>(
         rows_per_expert,
         input_stride,
         tile,
+        compile_options: None,
     }
 }
 
 impl ExpertGemvView<'_> {
+    pub fn compile_options(mut self, options: CompileOptions) -> Self {
+        self.compile_options = Some(options);
+        self
+    }
+
     pub fn submit<S: Sink>(self, sink: &mut S) -> Result<(), cuda_async::error::DeviceError> {
         match self.weight {
-            Weight::Dense(w) => sink.run(expert::expert_gemv_view(
+            Weight::Dense(w) => sink.run(expert::expert_gemv_view_with_options(
                 w,
                 self.x,
                 self.selection,
@@ -131,6 +169,7 @@ impl ExpertGemvView<'_> {
                 self.rows_per_expert,
                 self.input_stride,
                 self.tile,
+                self.compile_options,
             ))?,
             Weight::Fp8(w) => sink.run(fp8::expert_gemv_view(
                 w,
@@ -140,6 +179,7 @@ impl ExpertGemvView<'_> {
                 self.rows_per_expert,
                 self.input_stride,
                 self.tile,
+                self.compile_options,
             ))?,
             Weight::Q8(_) => {
                 return Err(cuda_async::error::DeviceError::Internal(
