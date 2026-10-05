@@ -56,6 +56,22 @@ impl HostFp8Matrix {
         })
     }
 
+    pub fn stack(parts: Vec<Self>) -> Result<Self, &'static str> {
+        let mut parts = parts.into_iter();
+        let mut stacked = parts.next().ok_or("no FP8 matrices to stack")?;
+        for part in parts {
+            if (part.cols, part.block_n, part.block_k)
+                != (stacked.cols, stacked.block_n, stacked.block_k)
+            {
+                return Err("stacked FP8 matrices differ in columns or scale blocks");
+            }
+            stacked.bits.extend(part.bits);
+            stacked.scales.extend(part.scales);
+            stacked.rows += part.rows;
+        }
+        Ok(stacked)
+    }
+
     pub fn upload(
         self,
         stream: &Arc<cuda_core::Stream>,

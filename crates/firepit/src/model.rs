@@ -1,10 +1,9 @@
-use crate::checkpoint::{Checkpoint, Stream};
-use crate::config::Fp8Config;
-use crate::{LayerKind, ModelConfig, ModelDims, Result};
+use crate::checkpoint::{Checkpoint, HostBf16Tensor, Stream};
+use crate::{LayerKind, ModelConfig, ModelDims, Result, WeightFormat};
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
 use cutile::tensor::Tensor;
-use firepit_kernels::weights::{HostFp8Matrix, Weight};
+use firepit_kernels::weights::{HostFp8Matrix, HostNvfp4Matrix, NVFP4_GROUP, Weight};
 use serde_json::Value;
 use std::fs::File;
 use std::path::Path;
@@ -78,11 +77,16 @@ impl Model {
     ) -> Result<Self> {
         let stream = device.new_stream()?;
         let dir = dir.as_ref();
-        let config = ModelConfig::try_from(serde_json::from_reader::<_, Value>(File::open(
-            dir.join("config.json"),
-        )?)?)?;
+        let json = |name: &str| -> Result<Value> {
+            Ok(serde_json::from_reader(File::open(dir.join(name))?)?)
+        };
+        let modelopt = dir
+            .join("hf_quant_config.json")
+            .exists()
+            .then(|| json("hf_quant_config.json"))
+            .transpose()?;
+        let config = ModelConfig::new(json("config.json")?, modelopt)?;
         let dims = config.dims(options.max_seq, options.layers)?;
-        let fp8 = config.fp8();
         let checkpoint = Checkpoint::open(dir)?;
         let h = dims.hidden();
         let embedding = checkpoint.embedding(
@@ -98,13 +102,13 @@ impl Model {
                 checkpoint.vector(&format!("{prefix}.input_layernorm.weight"), h, 1.0, &stream)?;
             let mixer = match kind {
                 LayerKind::Gdn => {
-                    MixerWeights::Gdn(load_gdn(&checkpoint, &prefix, &dims, fp8, &stream)?)
+                    MixerWeights::Gdn(load_gdn(&checkpoint, &prefix, &dims, &config, &stream)?)
                 }
                 LayerKind::Attention => MixerWeights::Attention(load_attention(
                     &checkpoint,
                     &prefix,
                     &dims,
-                    fp8,
+                    &config,
                     &stream,
                 )?),
             };
@@ -114,7 +118,7 @@ impl Model {
                 1.0,
                 &stream,
             )?;
-            let moe = load_moe(&checkpoint, &prefix, &dims, fp8, &stream)?;
+            let moe = load_moe(&checkpoint, &prefix, &dims, &config, &stream)?;
             layers.push(LayerWeights {
                 input_norm,
                 mixer,
@@ -126,8 +130,8 @@ impl Model {
         let lm_head = matrix(
             &checkpoint,
             "lm_head.weight",
-            &[dims.vocab(), h],
-            fp8,
+            [dims.vocab(), h],
+            &config,
             &stream,
         )?;
         Ok(Self {
@@ -141,61 +145,159 @@ impl Model {
     }
 }
 
-fn fp8_host(
+enum HostWeight {
+    Dense(HostBf16Tensor),
+    Fp8(HostFp8Matrix),
+    Nvfp4(HostNvfp4Matrix),
+}
+
+impl HostWeight {
+    fn load(
+        checkpoint: &Checkpoint,
+        name: &str,
+        [rows, cols]: [usize; 2],
+        format: WeightFormat,
+    ) -> Result<Self> {
+        let companion = |suffix: &str| name.replace(".weight", suffix);
+        let present = [".weight_scale_inv", ".weight_scale", ".weight_scale_2"]
+            .map(|suffix| checkpoint.contains(&companion(suffix)));
+        let expected = match format {
+            WeightFormat::Bf16 => [false, false, false],
+            WeightFormat::Fp8Blocks { .. } => [true, false, false],
+            WeightFormat::Fp8Tensor => [false, true, false],
+            WeightFormat::Nvfp4 => [false, true, true],
+        };
+        if present != expected {
+            return Err(format!("{name}: scale tensors contradict {format:?}").into());
+        }
+        let shape_error = || format!("{name}: invalid {format:?} data or scale shape");
+        match format {
+            WeightFormat::Bf16 => {
+                let data = checkpoint.tensor_bf16(name)?;
+                if data.shape != [rows, cols] {
+                    return Err(shape_error().into());
+                }
+                Ok(Self::Dense(data))
+            }
+            WeightFormat::Fp8Blocks { block_n, block_k } => {
+                let data = checkpoint.tensor_fp8(name)?;
+                let scales = checkpoint.tensor_bf16(&companion(".weight_scale_inv"))?;
+                if data.shape != [rows, cols] || scales.shape != [rows / block_n, cols / block_k] {
+                    return Err(shape_error().into());
+                }
+                Ok(Self::Fp8(HostFp8Matrix::from_parts(
+                    data.data,
+                    scales
+                        .data
+                        .into_iter()
+                        .map(|scale| scale.to_f32())
+                        .collect(),
+                    rows,
+                    cols,
+                    block_n,
+                    block_k,
+                )?))
+            }
+            WeightFormat::Fp8Tensor => {
+                let data = checkpoint.tensor_fp8(name)?;
+                if data.shape != [rows, cols] {
+                    return Err(shape_error().into());
+                }
+                let scale = checkpoint.scalar_f32(&companion(".weight_scale"))?;
+                Ok(Self::Fp8(HostFp8Matrix::from_parts(
+                    data.data,
+                    vec![scale],
+                    rows,
+                    cols,
+                    rows,
+                    cols,
+                )?))
+            }
+            WeightFormat::Nvfp4 => {
+                let packed = checkpoint.tensor_nvfp4(name)?;
+                let scales = checkpoint.tensor_fp8(&companion(".weight_scale"))?;
+                if packed.shape != [rows, cols / 2] || scales.shape != [rows, cols / NVFP4_GROUP] {
+                    return Err(shape_error().into());
+                }
+                Ok(Self::Nvfp4(HostNvfp4Matrix::from_parts(
+                    packed.data,
+                    scales.data,
+                    checkpoint.scalar_f32(&companion(".weight_scale_2"))?,
+                    rows,
+                    cols,
+                )?))
+            }
+        }
+    }
+
+    fn stack(parts: Vec<Self>) -> Result<Self> {
+        fn all<T>(parts: Vec<HostWeight>, pick: fn(HostWeight) -> Option<T>) -> Result<Vec<T>> {
+            parts
+                .into_iter()
+                .map(|part| pick(part).ok_or_else(|| "stacked weights mix formats".into()))
+                .collect()
+        }
+        Ok(match parts.first().ok_or("no weights to stack")? {
+            Self::Dense(_) => {
+                let parts = all(parts, |part| match part {
+                    Self::Dense(tensor) => Some(tensor),
+                    _ => None,
+                })?;
+                let cols = parts[0].shape[1];
+                if parts.iter().any(|part| part.shape[1] != cols) {
+                    return Err("stacked dense weights differ in columns".into());
+                }
+                Self::Dense(HostBf16Tensor {
+                    shape: vec![parts.iter().map(|part| part.shape[0]).sum(), cols],
+                    data: parts.into_iter().flat_map(|part| part.data).collect(),
+                })
+            }
+            Self::Fp8(_) => Self::Fp8(HostFp8Matrix::stack(all(parts, |part| match part {
+                Self::Fp8(matrix) => Some(matrix),
+                _ => None,
+            })?)?),
+            Self::Nvfp4(_) => {
+                Self::Nvfp4(HostNvfp4Matrix::stack(all(parts, |part| match part {
+                    Self::Nvfp4(matrix) => Some(matrix),
+                    _ => None,
+                })?)?)
+            }
+        })
+    }
+
+    fn upload(self, stream: &Stream) -> Result<Weight> {
+        Ok(match self {
+            Self::Dense(tensor) => Weight::Dense(tensor.upload_matrix(stream)?),
+            Self::Fp8(matrix) => Weight::Fp8(matrix.upload(stream)?),
+            Self::Nvfp4(matrix) => Weight::Nvfp4(matrix.upload(stream)?),
+        })
+    }
+}
+
+fn host(
     checkpoint: &Checkpoint,
     name: &str,
-    shape: &[usize],
-    config: &Fp8Config,
-) -> Result<HostFp8Matrix> {
-    if !config.expects_fp8(name) || shape.len() != 2 {
-        return Err(format!("{name}: FP8 tensor contradicts configuration").into());
-    }
-    let data = checkpoint.tensor_fp8(name)?;
-    let scales = checkpoint.tensor_bf16(&name.replace(".weight", ".weight_scale_inv"))?;
-    if data.shape != shape || scales.shape != [shape[0] / config.block_n, shape[1] / config.block_k]
-    {
-        return Err(format!("{name}: invalid FP8 data or scale shape").into());
-    }
-    Ok(HostFp8Matrix::from_parts(
-        data.data,
-        scales
-            .data
-            .into_iter()
-            .map(|scale| scale.to_f32())
-            .collect(),
-        shape[0],
-        shape[1],
-        config.block_n,
-        config.block_k,
-    )?)
+    shape: [usize; 2],
+    config: &ModelConfig,
+) -> Result<HostWeight> {
+    HostWeight::load(checkpoint, name, shape, config.format(name))
 }
 
 fn matrix(
     checkpoint: &Checkpoint,
     name: &str,
-    shape: &[usize],
-    fp8: Option<&Fp8Config>,
+    shape: [usize; 2],
+    config: &ModelConfig,
     stream: &Stream,
 ) -> Result<Weight> {
-    let scale_name = name.replace(".weight", ".weight_scale_inv");
-    let has_scale = checkpoint.contains(&scale_name);
-    if has_scale != fp8.is_some_and(|config| config.expects_fp8(name)) {
-        return Err(format!("{name}: FP8 scale presence contradicts configuration").into());
-    }
-    if has_scale {
-        let config = fp8.ok_or("FP8 scale without quantization configuration")?;
-        let host = fp8_host(checkpoint, name, shape, config)?;
-        Ok(Weight::Fp8(host.upload(stream)?))
-    } else {
-        Ok(Weight::Dense(checkpoint.matrix_bf16(name, shape, stream)?))
-    }
+    host(checkpoint, name, shape, config)?.upload(stream)
 }
 
 fn load_gdn(
     checkpoint: &Checkpoint,
     prefix: &str,
     dims: &ModelDims,
-    fp8: Option<&Fp8Config>,
+    config: &ModelConfig,
     stream: &Stream,
 ) -> Result<GdnWeights> {
     let d = dims.gdn();
@@ -204,8 +306,8 @@ fn load_gdn(
         matrix(
             checkpoint,
             &format!("{path}.in_proj_{name}.weight"),
-            &[rows, dims.hidden()],
-            fp8,
+            [rows, dims.hidden()],
+            config,
             &stream,
         )
     };
@@ -234,8 +336,8 @@ fn load_gdn(
         out: matrix(
             checkpoint,
             &format!("{path}.out_proj.weight"),
-            &[dims.hidden(), d.value_dim()],
-            fp8,
+            [dims.hidden(), d.value_dim()],
+            config,
             &stream,
         )?,
     })
@@ -245,7 +347,7 @@ fn load_attention(
     checkpoint: &Checkpoint,
     prefix: &str,
     dims: &ModelDims,
-    fp8: Option<&Fp8Config>,
+    config: &ModelConfig,
     stream: &Stream,
 ) -> Result<AttentionWeights> {
     let d = dims.attention();
@@ -256,22 +358,22 @@ fn load_attention(
         q_gate: matrix(
             checkpoint,
             &format!("{path}.q_proj.weight"),
-            &[2 * q, dims.hidden()],
-            fp8,
+            [2 * q, dims.hidden()],
+            config,
             &stream,
         )?,
         k: matrix(
             checkpoint,
             &format!("{path}.k_proj.weight"),
-            &[kv, dims.hidden()],
-            fp8,
+            [kv, dims.hidden()],
+            config,
             &stream,
         )?,
         v: matrix(
             checkpoint,
             &format!("{path}.v_proj.weight"),
-            &[kv, dims.hidden()],
-            fp8,
+            [kv, dims.hidden()],
+            config,
             &stream,
         )?,
         q_norm: checkpoint.vector(&format!("{path}.q_norm.weight"), d.head_dim(), 1.0, &stream)?,
@@ -279,8 +381,8 @@ fn load_attention(
         out: matrix(
             checkpoint,
             &format!("{path}.o_proj.weight"),
-            &[dims.hidden(), q],
-            fp8,
+            [dims.hidden(), q],
+            config,
             &stream,
         )?,
     })
@@ -290,113 +392,71 @@ fn load_moe(
     checkpoint: &Checkpoint,
     prefix: &str,
     dims: &ModelDims,
-    fp8: Option<&Fp8Config>,
+    config: &ModelConfig,
     stream: &Stream,
 ) -> Result<MoeWeights> {
     let d = dims.moe();
+    let h = dims.hidden();
     let path = format!("{prefix}.mlp");
     let shared_path = format!("{path}.shared_expert");
-    let shared_gate_up = if let Some(config) = fp8 {
-        let mut gate = fp8_host(
-            checkpoint,
-            &format!("{shared_path}.gate_proj.weight"),
-            &[d.shared_intermediate(), dims.hidden()],
-            config,
-        )?;
-        let up = fp8_host(
-            checkpoint,
-            &format!("{shared_path}.up_proj.weight"),
-            &[d.shared_intermediate(), dims.hidden()],
-            config,
-        )?;
-        gate.bits.extend(up.bits);
-        gate.scales.extend(up.scales);
-        Weight::Fp8(
-            HostFp8Matrix::from_parts(
-                gate.bits,
-                gate.scales,
-                2 * d.shared_intermediate(),
-                dims.hidden(),
-                config.block_n,
-                config.block_k,
-            )?
-            .upload(stream)?,
-        )
-    } else {
-        let gate_up = checkpoint.stacked_bf16(
-            &format!("{shared_path}.gate_proj.weight"),
-            &format!("{shared_path}.up_proj.weight"),
-            d.shared_intermediate(),
-            dims.hidden(),
-        )?;
-        Weight::Dense(gate_up.upload_matrix(stream)?)
-    };
-    let (gate_up, down) = if let Some(config) = fp8 {
-        let mut gate_up_bits = Vec::new();
-        let mut gate_up_scales = Vec::new();
-        let mut down_bits = Vec::new();
-        let mut down_scales = Vec::new();
-        for expert in 0..d.experts() {
-            let path = format!("{path}.experts.{expert}");
-            for projection in ["gate_proj", "up_proj"] {
-                let host = fp8_host(
+    let shared_gate_up = HostWeight::stack(
+        ["gate_proj", "up_proj"]
+            .map(|projection| {
+                host(
                     checkpoint,
-                    &format!("{path}.{projection}.weight"),
-                    &[d.intermediate(), dims.hidden()],
+                    &format!("{shared_path}.{projection}.weight"),
+                    [d.shared_intermediate(), h],
                     config,
-                )?;
-                gate_up_bits.extend(host.bits);
-                gate_up_scales.extend(host.scales);
-            }
-            let host = fp8_host(
-                checkpoint,
-                &format!("{path}.down_proj.weight"),
-                &[dims.hidden(), d.intermediate()],
-                config,
-            )?;
-            down_bits.extend(host.bits);
-            down_scales.extend(host.scales);
-        }
-        let gate_up = HostFp8Matrix::from_parts(
-            gate_up_bits,
-            gate_up_scales,
-            d.experts() * 2 * d.intermediate(),
-            dims.hidden(),
-            config.block_n,
-            config.block_k,
-        )?
-        .upload(stream)?;
-        let down = HostFp8Matrix::from_parts(
-            down_bits,
-            down_scales,
-            d.experts() * dims.hidden(),
-            d.intermediate(),
-            config.block_n,
-            config.block_k,
-        )?
-        .upload(stream)?;
-        (Weight::Fp8(gate_up), Weight::Fp8(down))
-    } else {
-        (
-            Weight::Dense(checkpoint.matrix_bf16(
-                &format!("{path}.experts.gate_up_proj"),
-                &[d.experts(), 2 * d.intermediate(), dims.hidden()],
-                stream,
-            )?),
-            Weight::Dense(checkpoint.matrix_bf16(
-                &format!("{path}.experts.down_proj"),
-                &[d.experts(), dims.hidden(), d.intermediate()],
-                stream,
-            )?),
+                )
+            })
+            .into_iter()
+            .collect::<Result<_>>()?,
+    )?
+    .upload(stream)?;
+    let expert = |expert: usize, projection: &str, shape: [usize; 2]| {
+        host(
+            checkpoint,
+            &format!("{path}.experts.{expert}.{projection}.weight"),
+            shape,
+            config,
         )
     };
+    let (gate_up, down) =
+        if config.format(&format!("{path}.experts.0.gate_proj.weight")) == WeightFormat::Bf16 {
+            (
+                Weight::Dense(checkpoint.matrix_bf16(
+                    &format!("{path}.experts.gate_up_proj"),
+                    &[d.experts(), 2 * d.intermediate(), h],
+                    stream,
+                )?),
+                Weight::Dense(checkpoint.matrix_bf16(
+                    &format!("{path}.experts.down_proj"),
+                    &[d.experts(), h, d.intermediate()],
+                    stream,
+                )?),
+            )
+        } else {
+            let gate_up = (0..d.experts())
+                .flat_map(|e| {
+                    ["gate_proj", "up_proj"]
+                        .map(|projection| expert(e, projection, [d.intermediate(), h]))
+                })
+                .collect::<Result<_>>()?;
+            let down = (0..d.experts())
+                .map(|e| expert(e, "down_proj", [h, d.intermediate()]))
+                .collect::<Result<_>>()?;
+            (
+                HostWeight::stack(gate_up)?.upload(stream)?,
+                HostWeight::stack(down)?.upload(stream)?,
+            )
+        };
     Ok(MoeWeights {
         router: matrix(
             checkpoint,
             &format!("{path}.gate.weight"),
-            &[d.experts(), dims.hidden()],
-            fp8,
-            &stream,
+            [d.experts(), h],
+            config,
+            stream,
         )?,
         gate_up,
         down,
@@ -404,16 +464,16 @@ fn load_moe(
         shared_down: matrix(
             checkpoint,
             &format!("{shared_path}.down_proj.weight"),
-            &[dims.hidden(), d.shared_intermediate()],
-            fp8,
-            &stream,
+            [h, d.shared_intermediate()],
+            config,
+            stream,
         )?,
         shared_gate: matrix(
             checkpoint,
             &format!("{path}.shared_expert_gate.weight"),
-            &[1, dims.hidden()],
-            fp8,
-            &stream,
+            [1, h],
+            config,
+            stream,
         )?,
     })
 }

@@ -1,6 +1,6 @@
 use crate::Result;
 use cuda_async::device_operation::DeviceOp;
-use cuda_core::f8e4m3fn;
+use cuda_core::{f4e2m1fnx2, f8e4m3fn};
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::Tensor;
 use firepit_kernels::weights::DenseMatrix;
@@ -28,6 +28,11 @@ pub struct HostI32Tensor {
 pub struct HostFp8Tensor {
     pub shape: Vec<usize>,
     pub data: Vec<f8e4m3fn>,
+}
+
+pub struct HostNvfp4Tensor {
+    pub shape: Vec<usize>,
+    pub data: Vec<f4e2m1fnx2>,
 }
 
 #[derive(Clone)]
@@ -90,15 +95,9 @@ impl SafetensorsFile {
     }
 
     pub fn tensor_i32(&self, name: &str) -> Result<HostI32Tensor> {
-        let info = self.info(name)?;
-        if info.dtype != Dtype::I32 {
-            return Err(format!("{name}: expected I32, got {:?}", info.dtype).into());
-        }
-        let mut bytes = vec![0u8; info.data_offsets.1 - info.data_offsets.0];
-        self.file
-            .read_exact_at(&mut bytes, self.data_start + info.data_offsets.0 as u64)?;
+        let (shape, bytes) = self.bytes(name, Dtype::I32)?;
         Ok(HostI32Tensor {
-            shape: info.shape.clone(),
+            shape,
             data: bytes
                 .chunks_exact(4)
                 .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]))
@@ -107,15 +106,9 @@ impl SafetensorsFile {
     }
 
     pub fn tensor_bf16(&self, name: &str) -> Result<HostBf16Tensor> {
-        let info = self.info(name)?;
-        if info.dtype != Dtype::BF16 {
-            return Err(format!("{name}: expected BF16, got {:?}", info.dtype).into());
-        }
-        let mut bytes = vec![0u8; info.data_offsets.1 - info.data_offsets.0];
-        self.file
-            .read_exact_at(&mut bytes, self.data_start + info.data_offsets.0 as u64)?;
+        let (shape, bytes) = self.bytes(name, Dtype::BF16)?;
         Ok(HostBf16Tensor {
-            shape: info.shape.clone(),
+            shape,
             data: bytes
                 .chunks_exact(2)
                 .map(|b| bf16::from_le_bytes([b[0], b[1]]))
@@ -124,17 +117,38 @@ impl SafetensorsFile {
     }
 
     pub fn tensor_fp8(&self, name: &str) -> Result<HostFp8Tensor> {
+        let (shape, bytes) = self.bytes(name, Dtype::F8_E4M3)?;
+        Ok(HostFp8Tensor {
+            shape,
+            data: bytes.into_iter().map(f8e4m3fn).collect(),
+        })
+    }
+
+    pub fn tensor_nvfp4(&self, name: &str) -> Result<HostNvfp4Tensor> {
+        let (shape, bytes) = self.bytes(name, Dtype::U8)?;
+        Ok(HostNvfp4Tensor {
+            shape,
+            data: bytes.into_iter().map(f4e2m1fnx2::from_bits).collect(),
+        })
+    }
+
+    pub fn scalar_f32(&self, name: &str) -> Result<f32> {
+        let (shape, bytes) = self.bytes(name, Dtype::F32)?;
+        match (shape.as_slice(), bytes.as_slice()) {
+            ([], &[a, b, c, d]) => Ok(f32::from_le_bytes([a, b, c, d])),
+            _ => Err(format!("{name}: expected an F32 scalar, got shape {shape:?}").into()),
+        }
+    }
+
+    fn bytes(&self, name: &str, dtype: Dtype) -> Result<(Vec<usize>, Vec<u8>)> {
         let info = self.info(name)?;
-        if info.dtype != Dtype::F8_E4M3 {
-            return Err(format!("{name}: expected F8_E4M3, got {:?}", info.dtype).into());
+        if info.dtype != dtype {
+            return Err(format!("{name}: expected {dtype:?}, got {:?}", info.dtype).into());
         }
         let mut bytes = vec![0u8; info.data_offsets.1 - info.data_offsets.0];
         self.file
             .read_exact_at(&mut bytes, self.data_start + info.data_offsets.0 as u64)?;
-        Ok(HostFp8Tensor {
-            shape: info.shape.clone(),
-            data: bytes.into_iter().map(f8e4m3fn).collect(),
-        })
+        Ok((info.shape.clone(), bytes))
     }
 
     pub fn row(&self, name: &str, row: usize) -> Result<HostTensor> {
@@ -214,6 +228,14 @@ impl Checkpoint {
 
     pub fn tensor_fp8(&self, name: &str) -> Result<HostFp8Tensor> {
         self.shard(name)?.tensor_fp8(name)
+    }
+
+    pub fn tensor_nvfp4(&self, name: &str) -> Result<HostNvfp4Tensor> {
+        self.shard(name)?.tensor_nvfp4(name)
+    }
+
+    pub fn scalar_f32(&self, name: &str) -> Result<f32> {
+        self.shard(name)?.scalar_f32(name)
     }
 
     pub fn contains(&self, name: &str) -> bool {
@@ -301,7 +323,7 @@ impl Checkpoint {
 }
 
 #[cfg(test)]
-mod fp8_tests {
+mod dequant_tests {
     use super::*;
 
     fn fp8_to_f32(bits: u8) -> f32 {
@@ -348,6 +370,55 @@ mod fp8_tests {
                     "{name} [{row}, {col}]"
                 );
             }
+        }
+        Ok(())
+    }
+
+    fn e2m1(code: u8) -> f32 {
+        let magnitude = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][(code & 0x7) as usize];
+        if code & 0x8 == 0 {
+            magnitude
+        } else {
+            -magnitude
+        }
+    }
+
+    #[test]
+    #[ignore = "needs local ModelOpt NVFP4 shards"]
+    fn modelopt_dequant_matches_python_bits() -> Result<()> {
+        let model_dir = std::env::var_os("FIREPIT_NVFP4_MODEL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("HOME")).join("Models/qwen3.6-35b-a3b-nvfp4"));
+        let checkpoint = Checkpoint::open(&model_dir)?;
+        let fixture = include_str!("../tests/modelopt_dequant_samples.txt");
+        for line in fixture.lines() {
+            let values: Vec<&str> = line.split_whitespace().collect();
+            let (name, row, col, python_bits) = (
+                values[0],
+                values[1].parse::<usize>()?,
+                values[2].parse::<usize>()?,
+                values[3].parse::<u32>()?,
+            );
+            let companion = |suffix: &str| name.replace(".weight", suffix);
+            let value = if checkpoint.contains(&companion(".weight_scale_2")) {
+                let packed = checkpoint.tensor_nvfp4(name)?;
+                let scales = checkpoint.tensor_fp8(&companion(".weight_scale"))?;
+                let global = checkpoint.scalar_f32(&companion(".weight_scale_2"))?;
+                let cols = packed.shape[1] * 2;
+                let pair = packed.data[(row * cols + col) / 2];
+                let code = if col % 2 == 0 {
+                    pair.low()
+                } else {
+                    pair.high()
+                };
+                let scale = fp8_to_f32(scales.data[row * scales.shape[1] + col / 16].0);
+                e2m1(code.0) * (scale * global)
+            } else {
+                let weights = checkpoint.tensor_fp8(name)?;
+                let scale = checkpoint.scalar_f32(&companion(".weight_scale"))?;
+                fp8_to_f32(weights.data[row * weights.shape[1] + col].0) * scale
+            };
+            assert_eq!(value.to_bits(), python_bits, "{name} [{row}, {col}]");
         }
         Ok(())
     }

@@ -11,7 +11,7 @@ mod session;
 mod testing;
 
 pub use checkpoint::{Checkpoint, HostBf16Tensor, HostI32Tensor, HostTensor, SafetensorsFile};
-pub use config::{LayerKind, ModelConfig, ModelDims};
+pub use config::{LayerKind, ModelConfig, ModelDims, WeightFormat};
 pub use engine::Engine;
 #[cfg(feature = "testing")]
 pub use engine::{IsolatedLayerTrace, RoutingLayerTrace, SessionStateSnapshot, VerificationFault};

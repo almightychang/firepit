@@ -4,20 +4,25 @@ use firepit_kernels::gdn::GdnDims;
 use firepit_kernels::moe::MoeDims;
 use firepit_kernels::rope::RopeDims;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightFormat {
+    Bf16,
+    Fp8Blocks { block_n: usize, block_k: usize },
+    Fp8Tensor,
+    Nvfp4,
+}
 
 pub struct Fp8Config {
-    pub block_n: usize,
-    pub block_k: usize,
+    block_n: usize,
+    block_k: usize,
     excluded: HashSet<String>,
 }
 
 impl Fp8Config {
     fn parse(value: &Value) -> Result<Self> {
-        if value["quant_method"] != "fp8"
-            || value["fmt"] != "e4m3"
-            || value["activation_scheme"] != "dynamic"
-        {
+        if value["fmt"] != "e4m3" || value["activation_scheme"] != "dynamic" {
             return Err("unsupported FP8 quantization configuration".into());
         }
         let blocks = value["weight_block_size"]
@@ -60,36 +65,123 @@ impl Fp8Config {
         })
     }
 
-    pub fn expects_fp8(&self, weight: &str) -> bool {
+    fn format(&self, module: &str) -> WeightFormat {
+        if self.excluded.contains(module) {
+            WeightFormat::Bf16
+        } else {
+            WeightFormat::Fp8Blocks {
+                block_n: self.block_n,
+                block_k: self.block_k,
+            }
+        }
+    }
+}
+
+pub struct ModelOptConfig {
+    layers: HashMap<String, WeightFormat>,
+}
+
+impl ModelOptConfig {
+    fn parse(value: &Value) -> Result<Self> {
+        let quantization = &value["quantization"];
+        if value["producer"]["name"] != "modelopt"
+            || quantization["quant_algo"] != "MIXED_PRECISION"
+        {
+            return Err("unsupported ModelOpt quantization configuration".into());
+        }
+        let layers = quantization["quantized_layers"]
+            .as_object()
+            .ok_or("missing ModelOpt quantized layers")?
+            .iter()
+            .map(|(module, layer)| {
+                let format = match (layer["quant_algo"].as_str(), layer["group_size"].as_u64()) {
+                    (Some("FP8"), None) => WeightFormat::Fp8Tensor,
+                    (Some("W4A16_NVFP4"), Some(group))
+                        if group == firepit_kernels::weights::NVFP4_GROUP as u64 =>
+                    {
+                        WeightFormat::Nvfp4
+                    }
+                    _ => return Err(format!("{module}: unsupported ModelOpt layer quantization")),
+                };
+                Ok((module.clone(), format))
+            })
+            .collect::<std::result::Result<_, _>>()?;
+        Ok(Self { layers })
+    }
+
+    fn format(&self, module: &str) -> WeightFormat {
+        let module = match module.split_once(".experts.") {
+            Some((base, _)) => format!("{base}.experts"),
+            None => module.to_owned(),
+        };
+        self.layers
+            .get(&module)
+            .copied()
+            .unwrap_or(WeightFormat::Bf16)
+    }
+}
+
+pub enum Quantization {
+    Fp8(Fp8Config),
+    ModelOpt(ModelOptConfig),
+}
+
+impl Quantization {
+    fn parse(config: &Value, modelopt: Option<&Value>) -> Result<Option<Self>> {
+        let method = config
+            .get("quantization_config")
+            .map(|q| {
+                q["quant_method"]
+                    .as_str()
+                    .ok_or("invalid quantization method")
+            })
+            .transpose()?;
+        match (method, modelopt) {
+            (None, None) => Ok(None),
+            (Some("fp8"), None) => Ok(Some(Self::Fp8(Fp8Config::parse(
+                &config["quantization_config"],
+            )?))),
+            (Some("modelopt"), Some(modelopt)) => {
+                Ok(Some(Self::ModelOpt(ModelOptConfig::parse(modelopt)?)))
+            }
+            _ => Err("quantization method and ModelOpt configuration disagree".into()),
+        }
+    }
+
+    pub fn format(&self, weight: &str) -> WeightFormat {
         let module = weight.strip_suffix(".weight").unwrap_or(weight);
-        !self.excluded.contains(module)
+        match self {
+            Self::Fp8(config) => config.format(module),
+            Self::ModelOpt(config) => config.format(module),
+        }
     }
 }
 
 pub struct ModelConfig {
     text: Value,
-    fp8: Option<Fp8Config>,
+    quantization: Option<Quantization>,
 }
 
 impl TryFrom<Value> for ModelConfig {
     type Error = Box<dyn std::error::Error>;
 
     fn try_from(value: Value) -> Result<Self> {
-        let fp8 = value
-            .get("quantization_config")
-            .map(Fp8Config::parse)
-            .transpose()?;
+        Self::new(value, None)
+    }
+}
+
+impl ModelConfig {
+    pub fn new(value: Value, modelopt: Option<Value>) -> Result<Self> {
+        let quantization = Quantization::parse(&value, modelopt.as_ref())?;
         let text = if value.get("text_config").is_some() {
             value["text_config"].clone()
         } else {
             value
         };
         ModelDims::parse(&text, 1, None)?;
-        Ok(Self { text, fp8 })
+        Ok(Self { text, quantization })
     }
-}
 
-impl ModelConfig {
     pub fn dims(&self, max_seq: usize, prefix_layers: Option<usize>) -> Result<ModelDims> {
         ModelDims::parse(&self.text, max_seq, prefix_layers)
     }
@@ -98,8 +190,12 @@ impl ModelConfig {
         &self.text
     }
 
-    pub fn fp8(&self) -> Option<&Fp8Config> {
-        self.fp8.as_ref()
+    pub fn format(&self, weight: &str) -> WeightFormat {
+        self.quantization
+            .as_ref()
+            .map_or(WeightFormat::Bf16, |quantization| {
+                quantization.format(weight)
+            })
     }
 }
 
@@ -250,5 +346,68 @@ impl ModelDims {
     }
     pub fn max_seq(&self) -> usize {
         self.max_seq
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn modelopt(layers: Value) -> Value {
+        json!({
+            "producer": {"name": "modelopt"},
+            "quantization": {"quant_algo": "MIXED_PRECISION", "quantized_layers": layers},
+        })
+    }
+
+    fn modelopt_method() -> Value {
+        json!({"quantization_config": {"quant_method": "modelopt"}})
+    }
+
+    #[test]
+    fn modelopt_layers_select_weight_formats() -> Result<()> {
+        let layers = json!({
+            "model.language_model.layers.0.mlp.experts": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
+            "model.language_model.layers.0.linear_attn.in_proj_qkv": {"quant_algo": "FP8"},
+            "lm_head": {"quant_algo": "W4A16_NVFP4", "group_size": 16},
+        });
+        let quantization = Quantization::parse(&modelopt_method(), Some(&modelopt(layers)))?
+            .ok_or("missing quantization")?;
+        let layer = "model.language_model.layers.0";
+        for (weight, format) in [
+            (
+                format!("{layer}.mlp.experts.7.down_proj.weight"),
+                WeightFormat::Nvfp4,
+            ),
+            (
+                format!("{layer}.linear_attn.in_proj_qkv.weight"),
+                WeightFormat::Fp8Tensor,
+            ),
+            ("lm_head.weight".to_owned(), WeightFormat::Nvfp4),
+            (format!("{layer}.mlp.gate.weight"), WeightFormat::Bf16),
+            (
+                format!("{layer}.linear_attn.in_proj_a.weight"),
+                WeightFormat::Bf16,
+            ),
+        ] {
+            assert_eq!(quantization.format(&weight), format, "{weight}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_inconsistent_quantization() {
+        let layer = |algo: Value| modelopt(json!({"lm_head": algo}));
+        let nvfp4 = layer(json!({"quant_algo": "W4A16_NVFP4", "group_size": 16}));
+        assert!(Quantization::parse(&modelopt_method(), None).is_err());
+        assert!(Quantization::parse(&json!({}), Some(&nvfp4)).is_err());
+        for algo in [
+            json!({"quant_algo": "W4A16_NVFP4", "group_size": 32}),
+            json!({"quant_algo": "W4A16_NVFP4"}),
+            json!({"quant_algo": "W4A8_AWQ"}),
+        ] {
+            assert!(Quantization::parse(&modelopt_method(), Some(&layer(algo))).is_err());
+        }
     }
 }
