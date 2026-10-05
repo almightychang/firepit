@@ -98,7 +98,7 @@ probe 제품 경로(ms, 이전 커밋도 같은 pod에서 다시 잼):
 | launch마다 절편 2~4 µs, 작은 N의 반복당 지연 | 커널 수와 작은 행렬 | 같은 입력·같은 형식 GEMV를 로드 시 이어 붙이기 | 약 0.6 ms |
 | FP8 per-tensor scale | BLOCK_K = cols라 바깥 루프 1회 안의 상수 반복 루프로 컴파일(STACK 최대 1 KB, z에서 +4.3 µs) | per-tensor를 행 scale로 표현하고 평탄한 K 루프 | 약 0.16 ms |
 | FP8 작은 타일(BN 8)에서 반복마다 [1,1] scale 곱 | tileiras lowering: 루프 동기화 2배(BAR 14 → 26) | 평탄 루프(scale을 끝에서), 타일 선택은 E7 | 약 0.3 ms 중 일부 |
-| NVFP4 그룹 scale 곱 | tileiras lowering: E4M3 scale 곱 단계에서 반복당 +21%(F2FP 128 → 408) | 우회 확인 중 | 상한 약 0.6 ms |
+| NVFP4 그룹 scale 곱 | tileiras lowering: [BN, KT/16] 피연산자가 합류할 때 unpack된 FP4 값을 다시 변환(사전 할당 조건 반복당 +15.5%, F2FP 128 → 408). scale을 정수로 디코드해 convert를 없애도 F2FP 384 | 없음: 원소별 펼침·정수 디코드·bf16/f32 미리 변환 모두 같거나 느림 | 약 0.34 ms |
 | 독립 GEMV 동시 실행 | safe graph API에 병렬 분기 없음 | cutile-rs 기능(이슈 010) | 상한 약 1 ms |
 
 배제한 가설: pipeline 깊이(`load_pipelined`), 반복마다 끝내는 reduce, CTA 수·메모리 병렬도(8 CTA에서 이미 포화), 데이터 값, eager 대 graph, 지속 부하.
