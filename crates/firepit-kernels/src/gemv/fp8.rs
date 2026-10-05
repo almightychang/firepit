@@ -13,45 +13,59 @@ mod kernels {
     use cutile::core::*;
 
     #[cutile::entry()]
-    pub fn dense_fp8_kernel<const B: i32, const BN: i32, const NB: i32>(
+    pub fn dense_fp8_kernel<
+        const B: i32,
+        const BN: i32,
+        const NB: i32,
+        const BLOCK_N: i32,
+        const BLOCK_K: i32,
+    >(
         y: &mut Tensor<f32, { [B, BN] }>,
         w: &Tensor<f8e4m3fn, { [-1, -1, 32] }>,
         scales: &Tensor<bf16, { [-1, -1] }>,
         x: &Tensor<f32, { [B, -1, 32] }>,
         blocks: i32,
-        block_n: i32,
-        block_k: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
         let w_part = w.partition(shape![BN, NB, 32]);
         let x_part = x.partition(shape![B, NB, 32]);
         let scale_part = scales.partition(shape![1, 1]);
         let mut acc: Tile<f32, { [B, BN] }> = constant(0.0f32, shape![B, BN]);
-        for kc in 0i32..(blocks / NB) {
-            let weights: Tile<f8e4m3fn, { [BN, NB, 32] }> = w_part.load([pid.1, kc, 0]);
-            let weights: Tile<f32, { [BN, NB, 32] }> = convert_tile(weights);
-            let scale: Tile<bf16, { [1, 1] }> =
-                scale_part.load([pid.1 * BN / block_n, kc * NB * 32 / block_k]);
+        let scale_row = pid.1 * BN / BLOCK_N;
+        let steps_per_scale = BLOCK_K / (NB * 32);
+        for scale_col in 0i32..(blocks * 32 / BLOCK_K) {
+            let scale: Tile<bf16, { [1, 1] }> = scale_part.load([scale_row, scale_col]);
             let scale: Tile<f32, { [1, 1] }> = convert_tile(scale);
-            let weights: Tile<f32, { [B, BN, NB, 32] }> = weights
-                .reshape(shape![1, BN, NB, 32])
-                .broadcast(shape![B, BN, NB, 32]);
-            let xb: Tile<f32, { [B, NB, 32] }> = x_part.load([0, kc, 0]);
-            let xb: Tile<f32, { [B, BN, NB, 32] }> = xb
-                .reshape(shape![B, 1, NB, 32])
-                .broadcast(shape![B, BN, NB, 32]);
-            let part: Tile<f32, { [B, BN, NB] }> = reduce_sum(weights * xb, 3i32);
-            let part: Tile<f32, { [B, BN, NB] }> = part.reshape(shape![B, BN, NB]);
-            let part: Tile<f32, { [B, BN] }> = reduce_sum(part, 2i32);
-            let part: Tile<f32, { [B, BN] }> = part.reshape(shape![B, BN]);
+            let mut sum: Tile<f32, { [B, BN] }> = constant(0.0f32, shape![B, BN]);
+            for step in 0i32..steps_per_scale {
+                let kc = scale_col * steps_per_scale + step;
+                let weights: Tile<f8e4m3fn, { [BN, NB, 32] }> = w_part.load([pid.1, kc, 0]);
+                let weights: Tile<f32, { [BN, NB, 32] }> = convert_tile(weights);
+                let weights: Tile<f32, { [B, BN, NB, 32] }> = weights
+                    .reshape(shape![1, BN, NB, 32])
+                    .broadcast(shape![B, BN, NB, 32]);
+                let xb: Tile<f32, { [B, NB, 32] }> = x_part.load([0, kc, 0]);
+                let xb: Tile<f32, { [B, BN, NB, 32] }> = xb
+                    .reshape(shape![B, 1, NB, 32])
+                    .broadcast(shape![B, BN, NB, 32]);
+                let part: Tile<f32, { [B, BN, NB] }> = reduce_sum(weights * xb, 3i32);
+                let part: Tile<f32, { [B, BN, NB] }> = part.reshape(shape![B, BN, NB]);
+                let part: Tile<f32, { [B, BN] }> = reduce_sum(part, 2i32);
+                sum = sum + part.reshape(shape![B, BN]);
+            }
             let scale: Tile<f32, { [B, BN] }> = scale.broadcast(shape![B, BN]);
-            acc = acc + part * scale;
+            acc = acc + sum * scale;
         }
         y.store(acc);
     }
 
     #[cutile::entry()]
-    pub fn expert_fp8_kernel<const BN: i32, const NB: i32>(
+    pub fn expert_fp8_kernel<
+        const BN: i32,
+        const NB: i32,
+        const BLOCK_N: i32,
+        const BLOCK_K: i32,
+    >(
         y: &mut Tensor<f32, { [1, BN] }>,
         w: &Tensor<f8e4m3fn, { [-1, -1, 32] }>,
         scales: &Tensor<bf16, { [-1, -1] }>,
@@ -61,8 +75,6 @@ mod kernels {
         row_tiles: i32,
         rows_per_expert: i32,
         input_stride: i32,
-        block_n: i32,
-        block_k: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
         let expert_tile: Tile<i32, { [1, 1] }> =
@@ -72,21 +84,25 @@ mod kernels {
         let x_part = x.partition(shape![1, NB, 32]);
         let scale_part = scales.partition(shape![1, 1]);
         let mut acc: Tile<f32, { [1, BN] }> = constant(0.0f32, shape![1, BN]);
-        for kc in 0i32..(blocks / NB) {
-            let weights: Tile<f8e4m3fn, { [BN, NB, 32] }> =
-                w_part.load([expert * row_tiles + pid.1, kc, 0]);
-            let weights: Tile<f32, { [BN, NB, 32] }> = convert_tile(weights);
-            let scale: Tile<bf16, { [1, 1] }> = scale_part.load([
-                (expert * rows_per_expert + pid.1 * BN) / block_n,
-                kc * NB * 32 / block_k,
-            ]);
+        let scale_row = (expert * rows_per_expert + pid.1 * BN) / BLOCK_N;
+        let steps_per_scale = BLOCK_K / (NB * 32);
+        for scale_col in 0i32..(blocks * 32 / BLOCK_K) {
+            let scale: Tile<bf16, { [1, 1] }> = scale_part.load([scale_row, scale_col]);
             let scale: Tile<f32, { [1, 1] }> = convert_tile(scale);
-            let xb: Tile<f32, { [1, NB, 32] }> = x_part.load([pid.0 * input_stride, kc, 0]);
-            let xb: Tile<f32, { [BN, NB, 32] }> = xb.broadcast(shape![BN, NB, 32]);
-            let products: Tile<f32, { [BN, NB] }> = reduce_sum(weights * xb, 2);
-            let products: Tile<f32, { [BN] }> = reduce_sum(products, 1);
+            let mut sum: Tile<f32, { [1, BN] }> = constant(0.0f32, shape![1, BN]);
+            for step in 0i32..steps_per_scale {
+                let kc = scale_col * steps_per_scale + step;
+                let weights: Tile<f8e4m3fn, { [BN, NB, 32] }> =
+                    w_part.load([expert * row_tiles + pid.1, kc, 0]);
+                let weights: Tile<f32, { [BN, NB, 32] }> = convert_tile(weights);
+                let xb: Tile<f32, { [1, NB, 32] }> = x_part.load([pid.0 * input_stride, kc, 0]);
+                let xb: Tile<f32, { [BN, NB, 32] }> = xb.broadcast(shape![BN, NB, 32]);
+                let products: Tile<f32, { [BN, NB] }> = reduce_sum(weights * xb, 2);
+                let products: Tile<f32, { [BN] }> = reduce_sum(products, 1);
+                sum = sum + products.reshape(shape![1, BN]);
+            }
             let scale: Tile<f32, { [1, BN] }> = scale.broadcast(shape![1, BN]);
-            acc = acc + products.reshape(shape![1, BN]) * scale;
+            acc = acc + sum * scale;
         }
         y.store(acc);
     }
@@ -103,8 +119,6 @@ pub(super) fn dense_gemv<'a>(
         Arc<Tensor<f8e4m3fn>>,
         Arc<Tensor<bf16>>,
         &'a TensorView<'a, f32>,
-        i32,
-        i32,
         i32,
     ),
 > + GraphNode
@@ -127,13 +141,13 @@ pub(super) fn dense_gemv<'a>(
         w.scales.clone(),
         x,
         (w.weights.cols / Q8_BLOCK) as i32,
-        w.block_n as i32,
-        w.block_k as i32,
     )
     .generics(vec![
         batch.to_string(),
         tile.rows.to_string(),
         tile.blocks.to_string(),
+        w.block_n.to_string(),
+        w.block_k.to_string(),
     ])
 }
 
@@ -152,8 +166,6 @@ pub fn expert_gemv_view<'a>(
         Arc<Tensor<bf16>>,
         &'a TensorView<'a, f32>,
         &'a Tensor<i32>,
-        i32,
-        i32,
         i32,
         i32,
         i32,
@@ -177,8 +189,11 @@ pub fn expert_gemv_view<'a>(
         (rows_per_expert / tile.rows) as i32,
         rows_per_expert as i32,
         input_stride as i32,
-        w.block_n as i32,
-        w.block_k as i32,
     )
-    .generics(vec![tile.rows.to_string(), tile.blocks.to_string()])
+    .generics(vec![
+        tile.rows.to_string(),
+        tile.blocks.to_string(),
+        w.block_n.to_string(),
+        w.block_k.to_string(),
+    ])
 }

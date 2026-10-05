@@ -6,7 +6,7 @@ use cutile::tile_kernel::ToHostVecOp;
 use firepit_kernels::gemm::{
     DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, fp8_gemm, fp8_grouped_gemm_view,
 };
-use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, expert_gemv_weight_view, gemv};
+use firepit_kernels::gemv::{GemvTile, expert_gemv_weight_view, gemv};
 use firepit_kernels::moe::{ExpertSelection, MoeDims, PrefillPlan};
 use firepit_kernels::sink::Eager;
 use firepit_kernels::weights::{HostFp8Matrix, Weight};
@@ -39,6 +39,10 @@ fn fp8_tile_converts_to_f32() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn fp8_gemv_and_gemm_apply_block_scales() -> Result<(), Box<dyn std::error::Error>> {
     let stream = Device::new(0)?.new_stream()?;
+    let gemv_tile = GemvTile {
+        rows: 16,
+        blocks: 2,
+    };
     let matrix = HostFp8Matrix::from_parts(
         vec![f8e4m3fn(0x38); 128 * 256],
         vec![bf16::from_f32(0.5), bf16::from_f32(2.0)],
@@ -56,8 +60,8 @@ fn fp8_gemv_and_gemm_apply_block_scales() -> Result<(), Box<dyn std::error::Erro
     gemv(
         &Weight::Fp8(matrix.clone()),
         &x_view,
-        (&mut y).partition([1, DEFAULT_GEMV_TILE.rows]),
-        DEFAULT_GEMV_TILE,
+        (&mut y).partition([1, gemv_tile.rows]),
+        gemv_tile,
     )
     .submit(&mut Eager(&stream))?;
     let gemv_output: Vec<f32> = y.dup().to_host_vec().sync_on(&stream)?;
@@ -91,6 +95,10 @@ fn fp8_gemv_and_gemm_apply_block_scales() -> Result<(), Box<dyn std::error::Erro
 #[test]
 fn fp8_expert_gemv_and_grouped_gemm_select_expert() -> Result<(), Box<dyn std::error::Error>> {
     let stream = Device::new(0)?.new_stream()?;
+    let gemv_tile = GemvTile {
+        rows: 16,
+        blocks: 2,
+    };
     let dims = MoeDims::new(128, 128, 128, 2, 1)?;
     let matrix = HostFp8Matrix::from_parts(
         vec![f8e4m3fn(0x38); 2 * 128 * 128],
@@ -110,11 +118,10 @@ fn fp8_expert_gemv_and_grouped_gemm_select_expert() -> Result<(), Box<dyn std::e
         &Weight::Fp8(matrix.clone()),
         &x.view(&[1, 4, 32])?,
         &selection,
-        y.slice_mut(&[0..1, 0..128])?
-            .partition([1, DEFAULT_GEMV_TILE.rows]),
+        y.slice_mut(&[0..1, 0..128])?.partition([1, gemv_tile.rows]),
         128,
         0,
-        DEFAULT_GEMV_TILE,
+        gemv_tile,
     )
     .submit(&mut Eager(&stream))?;
     let actual: Vec<f32> = y.to_host_vec().sync_on(&stream)?;
