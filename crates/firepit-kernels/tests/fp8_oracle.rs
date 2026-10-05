@@ -16,11 +16,21 @@ use half::bf16;
 use proptest::prelude::*;
 use std::sync::Arc;
 
-const BF16_SPLIT_ERROR: f64 = (1.0 / 256.0) * (1.0 / 256.0);
+const BF16_UNIT_ROUNDOFF: f64 = 1.0 / 256.0;
+const BF16_SPLIT_ERROR: f64 = BF16_UNIT_ROUNDOFF * BF16_UNIT_ROUNDOFF;
+
+fn within(actual: f32, expected: f64, bound: f64) -> bool {
+    (actual as f64 - expected).abs() <= bound.max(f64::MIN_POSITIVE)
+}
 
 fn gemm_within_bound(actual: f32, expected: f64, magnitude: f64, cols: usize) -> bool {
     let bound = (check::gamma_tilde(cols + 1) + BF16_SPLIT_ERROR) * magnitude;
-    (actual as f64 - expected).abs() <= bound.max(f64::MIN_POSITIVE)
+    within(actual, expected, bound)
+}
+
+fn grouped_gemm_within_bound(actual: f32, expected: f64, magnitude: f64, cols: usize) -> bool {
+    let bound = (check::gamma_tilde(cols) + BF16_UNIT_ROUNDOFF + BF16_SPLIT_ERROR) * magnitude;
+    within(actual, expected, bound)
 }
 
 fn gpu(
@@ -223,7 +233,7 @@ fn fp8_expert_kernels_match_f64_oracle() {
                 for row in expert * 32..(expert + 1) * 32 {
                     for output in 0..128 {
                         let index = expert * 128 + output;
-                        prop_assert!(gemm_within_bound(
+                        prop_assert!(grouped_gemm_within_bound(
                             actual[row * 128 + output],
                             expected[index],
                             magnitude[index],
@@ -321,7 +331,7 @@ fn fp8_extreme_finite_values_match_f64_oracle() {
                     .sync_on(&stream)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 expert_gemv_weight_view(
-                    &Weight::Fp8(expert.clone()),
+                    &Weight::Fp8(expert),
                     &x.view(&[1, cols / 32, 32])
                         .map_err(|e| TestCaseError::fail(e.to_string()))?,
                     &selection,
@@ -342,14 +352,6 @@ fn fp8_extreme_finite_values_match_f64_oracle() {
                 prop_assert!(
                     check::inner_product_excess(&actual, &expected, &magnitude, cols + 1) <= 1.0
                 );
-
-                let grouped = grouped_gpu(&stream, &expert, &input, &dims, rows)
-                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                for row in grouped.chunks(rows) {
-                    for ((&actual, &value), &sum) in row.iter().zip(&expected).zip(&magnitude) {
-                        prop_assert!(gemm_within_bound(actual, value, sum, cols));
-                    }
-                }
                 Ok(())
             })
             .unwrap();

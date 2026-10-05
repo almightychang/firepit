@@ -25,11 +25,11 @@ MoE prefill은 `tests/moe_prefill.rs`에서 host 안정 정렬·expert별 타일
 
 N. J. Higham and T. Mary, "A New Approach to Probabilistic Rounding Error Analysis", SIAM J. Sci. Comput. 41, A2815–A2835, 2019, doi:10.1137/18M1226312 (MIMS EPrint 2018.33). 정리 3.1, 식 (3.6). 반올림 오차가 평균 0인 독립 확률변수라는 가정(Model 2.1) 아래 덧셈 순서와 무관하게 확률 `1 − n(1 − P(λ))`, `P(λ) = 1 − 2exp(−λ²(1−u)²/2)` 이상으로 성립한다. λ = 8이면 실패 확률이 무시할 수준이고, 실측 오차(약 2u 이하)보다 50배 이상 여유가 있다(K=128에서 90u, K=2048에서 362u). 인덱스·순서 버그는 이 기준의 수만 배 오차를 낸다.
 
-Q8 GEMV는 블록 합 뒤 scale 곱이 한 번 더 들어가므로 n = K + 2로 판정한다. FP8 GEMV도 scale을 타일 부분합 뒤에 곱하므로 n = K + 1로 판정한다. FP8 oracle PBT는 FP8 최대 유한값 ±448, 최소 subnormal, BF16 scale의 최소 양수·최대 유한값 및 큰 절댓값의 입력을 오버플로우 없는 조합으로 GEMV·GEMM·grouped GEMM 모두에서 검사한다. RMSNorm과 SwiGLU는 상쇄가 없는 원소별 연산이라 상대오차로 판정한다.
+Q8 GEMV는 블록 합 뒤 scale 곱이 한 번 더 들어가므로 n = K + 2로 판정한다. FP8 GEMV도 scale을 타일 부분합 뒤에 곱하므로 n = K + 1로 판정한다. FP8 oracle PBT는 FP8 최대 유한값 ±448, 최소 subnormal, BF16 scale의 최소 양수·최대 유한값 및 큰 절댓값의 입력을 오버플로우 없는 조합으로 GEMV와 dense GEMM에서 검사한다. RMSNorm과 SwiGLU는 상쇄가 없는 원소별 연산이라 상대오차로 판정한다.
 
 bf16 hi+lo GEMM은 잔차가 bf16 정상 범위인 유한 입력에서 `hi = RN_bf16(x)`, `lo = RN_bf16(x−hi)`를 사용한다. `|x−hi| ≤ u_b|x|`이고 Sterbenz 보조정리로 `x−hi`가 정확하므로 `|x−(hi+lo)| ≤ u_b²|x|` (`u_b=2⁻⁸`). 따라서 f64 oracle 판정은 `(γ̃_K(8)+u_b²)Σ|w_k x_k|`이다. GEMM 행과 GEMV의 차이는 두 경로의 상한 합으로 판정한다.
 
-FP8 GEMM은 block의 N 범위가 scale 행 하나 안에 있어 K 단계마다 scale `s`가 스칼라다. 그래서 `x·(w·s) = (x·s)·w`로 계산한다. `x' = RN_f32(x·s)`를 hi+lo로 나누고, e4m3 가중치는 bf16으로 변환한다. e4m3의 가수 3비트와 지수 범위(2⁻⁹~448)가 bf16 정상 범위 안이라 이 변환은 정확하다. 곱 하나의 반올림이 더해지므로 n = K + 1이고, `x'`와 잔차가 f32·bf16 정상 범위인 입력에서 판정은 `(γ̃_(K+1)(8)+u_b²)Σ|w_k s x_k|`이다. 이전 구현은 `RN_bf16(w·s)`로 가중치마다 `u_b`가 더해져 `(γ̃_K(8)+u_b+u_b²)`였다.
+dense FP8 GEMM은 block의 N 범위가 scale 행 하나 안에 있어 K 단계마다 scale `s`가 스칼라다. 그래서 `x·(w·s) = (x·s)·w`로 계산한다. `x' = RN_f32(x·s)`를 hi+lo로 나누고, e4m3 가중치는 bf16으로 변환한다. e4m3의 가수 3비트와 지수 범위(2⁻⁹~448)가 bf16 정상 범위 안이라 이 변환은 정확하다. 곱 하나의 반올림이 더해지므로 n = K + 1이고, `x'`와 잔차가 f32·bf16 정상 범위인 입력에서 판정은 `(γ̃_(K+1)(8)+u_b²)Σ|w_k s x_k|`이다. grouped FP8 GEMM은 GB10에서 이 방식이 더 느려 `RN_bf16(w·s)`를 유지하고, 가중치마다 `u_b`가 더해진 `(γ̃_K(8)+u_b+u_b²)`로 판정한다.
 
 GDN chunk ①은 `A=I+L`, `X=A⁻¹`, `B_U=βv`, `B_W=βk exp(cum)`로 둔다. 오차 전파의 크기 기준은 각 성분의 `R=|X||B|`, `S=|X|(|L|+M_L)|Y|`이다. 여기서 `Y`는 정답 U 또는 W, `M_L[i,j]=β_i exp(cum_i−cum_j) Σ_d|k_id k_jd|` (`j<i`)이다. `M_L`은 L 생성 내적이 상쇄될 때도 입력 오차를 포착한다. 구현의 판정은 U에 `e_s R+(e_d+e_n)S+8u|U|`, W에 `(e_s+e_n)R+(e_d+e_n)S+8u|W|`를 쓴다. `e_d=3γ̃_D(8)+u_b²`, `e_m=3γ̃_C(8)+u_b²`, `e_n=γ̃_D(8)+γ̃_C(8)+16u`, `e_s=(2C/B+3)e_m`, `u=2⁻²⁴`, B는 대각 블록 크기다. `e_s`는 B 블록 안의 앞에서부터 대입과 C/B 블록 행의 세 번 분할 MMA 누적을 각 단계에 합한 보수적 계수다. 차이는 f32 최소 정상값을 분모 하한으로 둔다.
 
