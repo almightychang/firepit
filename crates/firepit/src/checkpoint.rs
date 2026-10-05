@@ -374,14 +374,10 @@ mod dequant_tests {
         Ok(())
     }
 
-    fn e2m1(code: u8) -> f32 {
-        let magnitude = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0][(code & 0x7) as usize];
-        if code & 0x8 == 0 {
-            magnitude
-        } else {
-            -magnitude
-        }
-    }
+    // ModelOpt's e2m1_values table, which decodes 0b1000 as +0.
+    const E2M1: [f32; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, 0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
 
     #[test]
     #[ignore = "needs local ModelOpt NVFP4 shards"]
@@ -412,7 +408,7 @@ mod dequant_tests {
                     pair.high()
                 };
                 let scale = fp8_to_f32(scales.data[row * scales.shape[1] + col / 16].0);
-                e2m1(code.0) * (scale * global)
+                E2M1[code.0 as usize] * (scale * global)
             } else {
                 let weights = checkpoint.tensor_fp8(name)?;
                 let scale = checkpoint.scalar_f32(&companion(".weight_scale"))?;
