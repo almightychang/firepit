@@ -36,7 +36,7 @@ mod kernels {
         x: &Tensor<f32, { [-1, K] }>,
         w: &Tensor<bf16, { [-1, K] }>,
         tile_experts: &Tensor<i32, { [-1] }>,
-        rows_per_expert: i32,
+        row_tiles: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
         let expert_tile: Tile<i32, { [1] }> = tile_experts.partition(shape![1]).load([pid.0]);
@@ -49,9 +49,8 @@ mod kernels {
             let hi: Tile<bf16, { [BM, BK] }> = convert_tile(values);
             let hi_f32: Tile<f32, { [BM, BK] }> = convert_tile(hi);
             let lo: Tile<bf16, { [BM, BK] }> = convert_tile(values - hi_f32);
-            let weights: Tile<bf16, { [BK, BN] }> = w_tiles
-                .load([expert * (rows_per_expert / BN) + pid.1, part])
-                .transpose();
+            let weights: Tile<bf16, { [BK, BN] }> =
+                w_tiles.load([expert * row_tiles + pid.1, part]).transpose();
             acc = mma(hi, weights, acc);
             acc = mma(lo, weights, acc);
         }
@@ -216,7 +215,7 @@ impl GroupedGemm<'_> {
                 self.x,
                 &w,
                 self.plan.tile_experts(),
-                self.rows_per_expert as i32,
+                (self.rows_per_expert / self.tile.n) as i32,
             )
             .generics(vec![
                 self.tile.m.to_string(),
@@ -288,7 +287,7 @@ impl GroupedGemmView<'_> {
                 self.x,
                 &w,
                 self.plan.tile_experts(),
-                self.rows_per_expert as i32,
+                (self.rows_per_expert / self.tile.n) as i32,
             )
             .generics(vec![
                 self.tile.m.to_string(),
