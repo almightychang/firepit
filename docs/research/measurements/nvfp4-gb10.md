@@ -29,3 +29,10 @@
 - lm_head 4비트가 ΔNLL의 약 절반(+2.04e-2 → +1.08e-2)이다. decode에서는 lm_head가 약 2.1 ms를 아낀다.
 - FP8 투영은 측정 가능한 손실을 더하지 않는다(V2 ≈ V3, CI 겹침). 텐서 전체 스케일과 128 블록 스케일의 차이도 CI 안이다(V2 vs V4).
 - 남는 약 +1.1e-2(PPL +1.1%)는 expert·shared NVFP4에서 온다. Qwen FP8 전체(+3.3e-3)의 약 3배다.
+
+## `firepit pull qwen3.6` 조립본 확인 (`a95dd0a`, GB10)
+
+- `firepit pull qwen3.6`: NVIDIA NVFP4 전체 + bf16 원본의 `lm_head.weight`만 범위 요청(1,017,118,720 B)으로 받아 조립, 23 GB. 두 번째 pull은 건너뜀.
+- 72묶음 품질은 `--override lm_head=` V2와 **같은 값**: KL 2.534196e-2, top-1 93.33%, ΔNLL +1.076081e-2 ± 2.24e-3. 조립본과 실행 시 조합이 같은 가중치를 쓴다.
+- decode batch 1 (max-seq 256): 23.20 ms (43.1 tok/s), V2 측정 22.90 ms와 같은 수준.
+- `firepit run` 첫 실행은 JIT 포함이라 prefill 5토큰 24.7 s, decode 4.0 tok/s로 보인다(측정값과 다름).
