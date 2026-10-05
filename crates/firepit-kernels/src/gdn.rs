@@ -44,14 +44,11 @@ mod kernels {
 
         let slots: Tile<i32, { [CHANNEL_TILE, KERNEL_TILE] }> =
             columns.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]);
-        let mut shifted: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> = current
-            .reshape(shape![CHANNEL_TILE, 1])
-            .broadcast(shape![CHANNEL_TILE, KERNEL_TILE]);
-        for slot in 0i32..(KERNEL - 2i32) {
-            let next: Tile<f32, { [CHANNEL_TILE, 1] }> = extract(
-                previous,
-                [scalar_to_tile(0i32), scalar_to_tile(slot + 1i32)],
-            );
+        let mut shifted: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> = window;
+        // KERNEL >= 2 keeps this const range non-empty (issues/cutile-rs/006).
+        for slot in 0i32..(KERNEL - 1i32) {
+            let next: Tile<f32, { [CHANNEL_TILE, 1] }> =
+                extract(window, [scalar_to_tile(0i32), scalar_to_tile(slot + 1i32)]);
             let at_slot: Tile<bool, { [CHANNEL_TILE, KERNEL_TILE] }> =
                 eq_tile(slots, slot.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]));
             shifted = select(
@@ -113,12 +110,11 @@ mod kernels {
             out.partition_mut(shape![1, CHANNEL_TILE])
                 .store(activated.reshape(shape![1, CHANNEL_TILE]), [time, 0]);
 
-            let mut shifted = current;
-            for slot in 0i32..(KERNEL - 2i32) {
-                let next: Tile<f32, { [CHANNEL_TILE, 1] }> = extract(
-                    previous,
-                    [scalar_to_tile(0i32), scalar_to_tile(slot + 1i32)],
-                );
+            let mut shifted = window;
+            // KERNEL >= 2 keeps this const range non-empty (issues/cutile-rs/006).
+            for slot in 0i32..(KERNEL - 1i32) {
+                let next: Tile<f32, { [CHANNEL_TILE, 1] }> =
+                    extract(window, [scalar_to_tile(0i32), scalar_to_tile(slot + 1i32)]);
                 let at_slot = eq_tile(slots, slot.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]));
                 shifted = select(
                     at_slot,
