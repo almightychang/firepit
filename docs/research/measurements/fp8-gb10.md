@@ -59,3 +59,23 @@ ncu (8192×2048, 16행·K128, 1회 실행):
 - 유효 대역폭(토큰당 가중치 바이트 ÷ step 시간, 계산): bf16 5.89 GB / 27.69 ms ≈ 213 GB/s, FP8 약 3.5 GB / 24.25 ms ≈ 144 GB/s. FP8 경로가 같은 시간에 읽는 바이트가 bf16 경로보다 적다.
 - eager trace(`--profile`, op마다 동기화라 작은 op는 launch 지연이 섞임) GPU ms: gemv 15.1(FP8) vs 16.4(bf16), moe_expert_gemv 8.4 vs 10.1, lm_head 4.4 vs 4.2(둘 다 bf16).
 - 다음 가설(미확인): FP8 GEMV는 타일 한 행이 128 B(K128, 1바이트 원소)로 bf16의 절반이라, 메모리 요청 하나가 나르는 바이트가 작아 요청 수에 묶인다. 판별: 한 타일이 K 방향으로 스케일 블록 2개(256 B/행)를 덮게 해 같은 요청 수로 2배 바이트를 읽는 변형.
+
+## 커널 스캔 A 묶음 GB10 검증 (기준 `70271df` → `9695e83`, 2026-10-05)
+
+- 테스트: fp8_oracle·fp8_tile·gemm·moe_prefill·moe·gdn_delta·gdn_chunk·FP8 shard 비트 비교 통과. **gdn 3개 실패**(S1, `d78143c`): JIT 단계 `cuda_tile.assume: bounded endpoints must be ordered and fit the signed operand range` (`gdn.rs:50`, `:117`). 실패 입력은 kernel 크기 2로, const가 된 `0..(KERNEL−2)`가 빈 범위가 되는 경우로 추정(모델은 kernel 4). workspace의 trybuild 실패는 이전과 같은 pod 툴체인 차이.
+- 속도(같은 pod, 연속 측정):
+
+| 지표 | 기준 | A 묶음 |
+|---|---:|---:|
+| decode bf16 | 27.91 ms | 27.83 ms |
+| decode FP8 | 24.02 ms | 24.27 ms |
+| prefill 5000 bf16 | 4.190 s | 4.143 s |
+| prefill 5000 FP8 | 4.201 s | 4.206 s |
+| FP8 gdn_conv (30회) | 72.4 ms | 53.5 ms |
+| FP8 gemm (350회) | 1460 ms | 1419 ms |
+| FP8 moe_grouped_gemm (80회) | 965 ms | 1019 ms |
+| FP8 moe_combine (40회) | 69.9 ms | 81.8 ms |
+
+- FP8 품질(72묶음 prefill): KL 9.25e-3(이전 9.26e-3), ΔNLL +3.32e-3 ± 1.14e-3(이전 +3.39e-3 ± 1.07e-3). W 쪽 bf16 반올림 제거는 품질에 측정 가능한 차이를 만들지 않았다. FP8 손실은 포맷 자체에서 온다.
+- SASS 비교는 JIT 캐시 경로가 예상과 달라 추출되지 않았다(미측정).
+- 참고: bf16 prefill 5000이 4.19 s로, E3.7 마감 기록(4.97 s)보다 빠르다. 원인은 확인하지 않았다(`--max-seq 5000` 조건 차이 가능).
