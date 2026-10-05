@@ -12,7 +12,7 @@ use cutile::tensor::{IntoPartition, PartitionMut, Tensor};
 use cutile::tile_kernel::TileKernel;
 #[cfg(feature = "testing")]
 use cutile::tile_kernel::ToHostVecOp;
-use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile, expert_gemv_view, gemv};
+use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile, expert_gemv_weight_view, gemv};
 use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::{Q8_BLOCK, Weight};
 use firepit_kernels::{attention, elementwise, embedding, gdn, moe, norm, rope, swiglu};
@@ -509,7 +509,7 @@ fn run_inner(
                             0..2 * m.intermediate(),
                         ])?;
                         let tile = gemv_tile(2 * m.intermediate(), d.hidden());
-                        sink.run(expert_gemv_view(
+                        expert_gemv_weight_view(
                             &model.layers[layer].moe.gate_up,
                             &x,
                             &plan.selections[layer][b],
@@ -517,7 +517,8 @@ fn run_inner(
                             2 * m.intermediate(),
                             0,
                             tile,
-                        ))?;
+                        )
+                        .submit(sink)?;
                     }
                 }
                 Op::ExpertSwiglu => {
@@ -549,7 +550,7 @@ fn run_inner(
                         let y = target
                             .slice_mut(&[b * m.top_k()..(b + 1) * m.top_k(), 0..d.hidden()])?;
                         let tile = gemv_tile(d.hidden(), m.intermediate());
-                        sink.run(expert_gemv_view(
+                        expert_gemv_weight_view(
                             &model.layers[layer].moe.down,
                             &x,
                             &plan.selections[layer][b],
@@ -557,7 +558,8 @@ fn run_inner(
                             d.hidden(),
                             1,
                             tile,
-                        ))?;
+                        )
+                        .submit(sink)?;
                     }
                 }
                 Op::SharedSwiglu => {

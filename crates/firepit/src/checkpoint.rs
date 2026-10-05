@@ -1,5 +1,6 @@
 use crate::Result;
 use cuda_async::device_operation::DeviceOp;
+use cuda_core::f8e4m3fn;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::Tensor;
 use firepit_kernels::weights::DenseMatrix;
@@ -22,6 +23,11 @@ pub struct HostTensor {
 pub struct HostI32Tensor {
     pub shape: Vec<usize>,
     pub data: Vec<i32>,
+}
+
+pub struct HostFp8Tensor {
+    pub shape: Vec<usize>,
+    pub data: Vec<f8e4m3fn>,
 }
 
 #[derive(Clone)]
@@ -117,6 +123,20 @@ impl SafetensorsFile {
         })
     }
 
+    pub fn tensor_fp8(&self, name: &str) -> Result<HostFp8Tensor> {
+        let info = self.info(name)?;
+        if info.dtype != Dtype::F8_E4M3 {
+            return Err(format!("{name}: expected F8_E4M3, got {:?}", info.dtype).into());
+        }
+        let mut bytes = vec![0u8; info.data_offsets.1 - info.data_offsets.0];
+        self.file
+            .read_exact_at(&mut bytes, self.data_start + info.data_offsets.0 as u64)?;
+        Ok(HostFp8Tensor {
+            shape: info.shape.clone(),
+            data: bytes.into_iter().map(f8e4m3fn).collect(),
+        })
+    }
+
     pub fn row(&self, name: &str, row: usize) -> Result<HostTensor> {
         let info = self.info(name)?;
         let (&rows, row_shape) = info
@@ -190,6 +210,14 @@ impl Checkpoint {
 
     pub fn tensor_bf16(&self, name: &str) -> Result<HostBf16Tensor> {
         self.shard(name)?.tensor_bf16(name)
+    }
+
+    pub fn tensor_fp8(&self, name: &str) -> Result<HostFp8Tensor> {
+        self.shard(name)?.tensor_fp8(name)
+    }
+
+    pub fn contains(&self, name: &str) -> bool {
+        self.shard_of.contains_key(name)
     }
 
     pub fn stacked_bf16(
@@ -269,5 +297,58 @@ impl Checkpoint {
         self.shards
             .get(shard)
             .ok_or_else(|| format!("{name} is in {shard}, which is not downloaded").into())
+    }
+}
+
+#[cfg(test)]
+mod fp8_tests {
+    use super::*;
+
+    fn fp8_to_f32(bits: u8) -> f32 {
+        let sign = if bits & 0x80 == 0 { 1.0 } else { -1.0 };
+        let exponent = (bits >> 3) & 0x0f;
+        let fraction = bits & 0x07;
+        if exponent == 0 {
+            sign * (fraction as f32) * 2.0f32.powi(-9)
+        } else {
+            sign * (1.0 + (fraction as f32) / 8.0) * 2.0f32.powi(exponent as i32 - 7)
+        }
+    }
+
+    #[test]
+    #[ignore = "needs local official FP8 shards"]
+    fn official_fp8_dequant_matches_python_bits() -> Result<()> {
+        let model_dir = std::env::var_os("FIREPIT_FP8_MODEL")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| Path::new(env!("HOME")).join("Models/qwen3.6-35b-a3b-fp8"));
+        let fixture = include_str!("../tests/fp8_dequant_samples.txt");
+        let checkpoint = Checkpoint::open(&model_dir)?;
+        for name in [
+            "model.language_model.layers.0.linear_attn.in_proj_qkv.weight",
+            "model.language_model.layers.0.mlp.experts.0.gate_proj.weight",
+            "model.language_model.layers.0.mlp.experts.0.down_proj.weight",
+        ] {
+            let weights = checkpoint.tensor_fp8(name)?;
+            let scales = checkpoint.tensor_bf16(&name.replace(".weight", ".weight_scale_inv"))?;
+            let cols = weights.shape[1];
+            let block_n = weights.shape[0] / scales.shape[0];
+            let block_k = cols / scales.shape[1];
+            for line in fixture.lines().filter(|line| line.starts_with(name)) {
+                let values: Vec<&str> = line.split_whitespace().collect();
+                let (row, col, python_bits) = (
+                    values[1].parse::<usize>()?,
+                    values[2].parse::<usize>()?,
+                    values[3].parse::<u32>()?,
+                );
+                let weight = fp8_to_f32(weights.data[row * cols + col].0);
+                let scale = scales.data[(row / block_n) * scales.shape[1] + col / block_k].to_f32();
+                assert_eq!(
+                    (weight * scale).to_bits(),
+                    python_bits,
+                    "{name} [{row}, {col}]"
+                );
+            }
+        }
+        Ok(())
     }
 }

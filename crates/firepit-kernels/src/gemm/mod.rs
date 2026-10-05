@@ -1,6 +1,6 @@
 use crate::moe::PrefillPlan;
 use crate::sink::Sink;
-use crate::weights::DenseMatrix;
+use crate::weights::{DenseMatrix, Fp8Matrix};
 use cutile::tensor::{Partition, Tensor, TensorView, TensorViewMut};
 use half::bf16;
 
@@ -52,6 +52,83 @@ mod kernels {
             let weights: Tile<bf16, { [BK, BN] }> = w_tiles
                 .load([expert * (rows_per_expert / BN) + pid.1, part])
                 .transpose();
+            acc = mma(hi, weights, acc);
+            acc = mma(lo, weights, acc);
+        }
+        y.store(acc);
+    }
+
+    #[cutile::entry()]
+    pub fn fp8_gemm_kernel<const BM: i32, const BN: i32, const BK: i32, const K: i32>(
+        y: &mut Tensor<f32, { [BM, BN] }>,
+        x: &Tensor<f32, { [-1, K] }>,
+        w: &Tensor<f8e4m3fn, { [-1, K] }>,
+        scales: &Tensor<bf16, { [-1, -1] }>,
+        block_n: i32,
+        block_k: i32,
+    ) {
+        let x_tiles = x.partition(shape![BM, BK]);
+        let w_tiles = w.partition(shape![BN, BK]);
+        let scale_tiles = scales.partition(shape![1, 1]);
+        let block: (i32, i32, i32) = get_tile_block_id();
+        let mut acc: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+        for part in 0i32..(K / BK) {
+            let values: Tile<f32, { [BM, BK] }> = x_tiles.load([block.0, part]);
+            let hi: Tile<bf16, { [BM, BK] }> = convert_tile(values);
+            let hi_f32: Tile<f32, { [BM, BK] }> = convert_tile(hi);
+            let lo: Tile<bf16, { [BM, BK] }> = convert_tile(values - hi_f32);
+            let weights: Tile<f8e4m3fn, { [BN, BK] }> = w_tiles.load([block.1, part]);
+            let weights: Tile<f32, { [BN, BK] }> = convert_tile(weights);
+            let weights: Tile<f32, { [BK, BN] }> = weights.transpose();
+            let weights: Tile<f32, { [BK, BN] }> = weights.reshape(shape![BK, BN]);
+            let scale: Tile<bf16, { [1, 1] }> =
+                scale_tiles.load([block.1 * BN / block_n, part * BK / block_k]);
+            let scale: Tile<f32, { [1, 1] }> = convert_tile(scale);
+            let scales: Tile<f32, { [BK, BN] }> = scale.broadcast(shape![BK, BN]);
+            let scales: Tile<f32, { [BK, BN] }> = scales.reshape(shape![BK, BN]);
+            let weights: Tile<bf16, { [BK, BN] }> = convert_tile(weights * scales);
+            acc = mma(hi, weights, acc);
+            acc = mma(lo, weights, acc);
+        }
+        y.store(acc);
+    }
+
+    #[cutile::entry()]
+    pub fn grouped_fp8_gemm_kernel<const BM: i32, const BN: i32, const BK: i32, const K: i32>(
+        y: &mut Tensor<f32, { [BM, BN] }>,
+        x: &Tensor<f32, { [-1, K] }>,
+        w: &Tensor<f8e4m3fn, { [-1, K] }>,
+        scales: &Tensor<bf16, { [-1, -1] }>,
+        tile_experts: &Tensor<i32, { [-1] }>,
+        rows_per_expert: i32,
+        block_n: i32,
+        block_k: i32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let expert_tile: Tile<i32, { [1] }> = tile_experts.partition(shape![1]).load([pid.0]);
+        let expert: i32 = tile_to_scalar(expert_tile.reshape(shape![]));
+        let x_tiles = x.partition(shape![BM, BK]);
+        let w_tiles = w.partition(shape![BN, BK]);
+        let scale_tiles = scales.partition(shape![1, 1]);
+        let mut acc: Tile<f32, { [BM, BN] }> = constant(0.0f32, shape![BM, BN]);
+        for part in 0i32..(K / BK) {
+            let values: Tile<f32, { [BM, BK] }> = x_tiles.load([pid.0, part]);
+            let hi: Tile<bf16, { [BM, BK] }> = convert_tile(values);
+            let hi_f32: Tile<f32, { [BM, BK] }> = convert_tile(hi);
+            let lo: Tile<bf16, { [BM, BK] }> = convert_tile(values - hi_f32);
+            let weights: Tile<f8e4m3fn, { [BN, BK] }> =
+                w_tiles.load([expert * (rows_per_expert / BN) + pid.1, part]);
+            let weights: Tile<f32, { [BN, BK] }> = convert_tile(weights);
+            let weights: Tile<f32, { [BK, BN] }> = weights.transpose();
+            let weights: Tile<f32, { [BK, BN] }> = weights.reshape(shape![BK, BN]);
+            let scale: Tile<bf16, { [1, 1] }> = scale_tiles.load([
+                (expert * rows_per_expert + pid.1 * BN) / block_n,
+                part * BK / block_k,
+            ]);
+            let scale: Tile<f32, { [1, 1] }> = convert_tile(scale);
+            let scales: Tile<f32, { [BK, BN] }> = scale.broadcast(shape![BK, BN]);
+            let scales: Tile<f32, { [BK, BN] }> = scales.reshape(shape![BK, BN]);
+            let weights: Tile<bf16, { [BK, BN] }> = convert_tile(weights * scales);
             acc = mma(hi, weights, acc);
             acc = mma(lo, weights, acc);
         }
@@ -263,6 +340,127 @@ impl Gemm<'_> {
             self.tile.k.to_string(),
             self.weight.cols.to_string(),
         ]))?;
+        Ok(())
+    }
+}
+
+pub struct Fp8Gemm<'a> {
+    weight: &'a Fp8Matrix,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<&'a mut Tensor<f32>>,
+    tile: GemmTile,
+}
+
+pub fn fp8_gemm<'a>(
+    weight: &'a Fp8Matrix,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<&'a mut Tensor<f32>>,
+    tile: GemmTile,
+) -> Fp8Gemm<'a> {
+    let m = x.shape()[0] as usize;
+    assert!(m > 0 && m % tile.m == 0);
+    assert_eq!(x.shape(), &[m as i32, weight.weights.cols as i32]);
+    assert!(weight.weights.rows % tile.n == 0 && weight.weights.cols % tile.k == 0);
+    assert!(weight.block_n % tile.n == 0 && weight.block_k % tile.k == 0);
+    assert_eq!(y.partition_shape, vec![tile.m, tile.n]);
+    Fp8Gemm { weight, x, y, tile }
+}
+
+impl Fp8Gemm<'_> {
+    pub fn submit<S: Sink>(self, sink: &mut S) -> Result<(), cuda_async::error::DeviceError> {
+        use cutile::tile_kernel::TileKernel;
+        let w = self
+            .weight
+            .weights
+            .weights
+            .view(&[self.weight.weights.rows, self.weight.weights.cols])
+            .expect("FP8 matrix shape");
+        sink.run(
+            kernels::fp8_gemm_kernel(
+                self.y,
+                self.x,
+                &w,
+                &self.weight.scales,
+                self.weight.block_n as i32,
+                self.weight.block_k as i32,
+            )
+            .generics(vec![
+                self.tile.m.to_string(),
+                self.tile.n.to_string(),
+                self.tile.k.to_string(),
+                self.weight.weights.cols.to_string(),
+            ]),
+        )?;
+        Ok(())
+    }
+}
+
+pub struct Fp8GroupedGemmView<'a> {
+    weight: &'a Fp8Matrix,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<TensorViewMut<'a, f32>>,
+    plan: &'a PrefillPlan,
+    rows_per_expert: usize,
+    tile: GemmTile,
+}
+
+pub fn fp8_grouped_gemm_view<'a>(
+    weight: &'a Fp8Matrix,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<TensorViewMut<'a, f32>>,
+    plan: &'a PrefillPlan,
+    rows_per_expert: usize,
+    tile: GemmTile,
+) -> Fp8GroupedGemmView<'a> {
+    assert_eq!(tile.m, plan.layout().tile_rows());
+    assert_eq!(weight.weights.rows, plan.dims().experts() * rows_per_expert);
+    assert_eq!(
+        x.shape(),
+        &[
+            plan.layout().padded_rows() as i32,
+            weight.weights.cols as i32
+        ]
+    );
+    assert!(rows_per_expert % tile.n == 0 && rows_per_expert % weight.block_n == 0);
+    assert!(weight.block_n % tile.n == 0 && weight.block_k % tile.k == 0);
+    assert_eq!(y.partition_shape, vec![tile.m, tile.n]);
+    Fp8GroupedGemmView {
+        weight,
+        x,
+        y,
+        plan,
+        rows_per_expert,
+        tile,
+    }
+}
+
+impl Fp8GroupedGemmView<'_> {
+    pub fn submit<S: Sink>(self, sink: &mut S) -> Result<(), cuda_async::error::DeviceError> {
+        use cutile::tile_kernel::TileKernel;
+        let w = self
+            .weight
+            .weights
+            .weights
+            .view(&[self.weight.weights.rows, self.weight.weights.cols])
+            .expect("FP8 matrix shape");
+        sink.run(
+            kernels::grouped_fp8_gemm_kernel(
+                self.y,
+                self.x,
+                &w,
+                &self.weight.scales,
+                self.plan.tile_experts(),
+                self.rows_per_expert as i32,
+                self.weight.block_n as i32,
+                self.weight.block_k as i32,
+            )
+            .generics(vec![
+                self.tile.m.to_string(),
+                self.tile.n.to_string(),
+                self.tile.k.to_string(),
+                self.weight.weights.cols.to_string(),
+            ]),
+        )?;
         Ok(())
     }
 }

@@ -1,11 +1,13 @@
 mod dense;
 mod expert;
+mod fp8;
 mod q8;
 
 pub use expert::{expert_gemv, expert_gemv_view};
 
+use crate::moe::ExpertSelection;
 use crate::sink::Sink;
-use cutile::tensor::{Partition, Tensor, TensorView};
+use cutile::tensor::{Partition, Tensor, TensorView, TensorViewMut};
 
 use crate::weights::{Q8_BLOCK, Weight};
 
@@ -50,6 +52,70 @@ impl Gemv<'_> {
             }
             Weight::Q8(w) => {
                 sink.run(q8::q8_gemv(w, self.x, self.y, self.tile))?;
+            }
+            Weight::Fp8(w) => {
+                sink.run(fp8::dense_gemv(w, self.x, self.y, self.tile))?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct ExpertGemvView<'a> {
+    weight: &'a Weight,
+    x: &'a TensorView<'a, f32>,
+    selection: &'a ExpertSelection,
+    y: Partition<TensorViewMut<'a, f32>>,
+    rows_per_expert: usize,
+    input_stride: usize,
+    tile: GemvTile,
+}
+
+pub fn expert_gemv_weight_view<'a>(
+    weight: &'a Weight,
+    x: &'a TensorView<'a, f32>,
+    selection: &'a ExpertSelection,
+    y: Partition<TensorViewMut<'a, f32>>,
+    rows_per_expert: usize,
+    input_stride: usize,
+    tile: GemvTile,
+) -> ExpertGemvView<'a> {
+    ExpertGemvView {
+        weight,
+        x,
+        selection,
+        y,
+        rows_per_expert,
+        input_stride,
+        tile,
+    }
+}
+
+impl ExpertGemvView<'_> {
+    pub fn submit<S: Sink>(self, sink: &mut S) -> Result<(), cuda_async::error::DeviceError> {
+        match self.weight {
+            Weight::Dense(w) => sink.run(expert::expert_gemv_view(
+                w,
+                self.x,
+                self.selection,
+                self.y,
+                self.rows_per_expert,
+                self.input_stride,
+                self.tile,
+            ))?,
+            Weight::Fp8(w) => sink.run(fp8::expert_gemv_view(
+                w,
+                self.x,
+                self.selection,
+                self.y,
+                self.rows_per_expert,
+                self.input_stride,
+                self.tile,
+            ))?,
+            Weight::Q8(_) => {
+                return Err(cuda_async::error::DeviceError::Internal(
+                    "Q8 expert GEMV is unsupported".into(),
+                ));
             }
         }
         Ok(())

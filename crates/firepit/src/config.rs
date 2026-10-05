@@ -4,22 +4,88 @@ use firepit_kernels::gdn::GdnDims;
 use firepit_kernels::moe::MoeDims;
 use firepit_kernels::rope::RopeDims;
 use serde_json::Value;
+use std::collections::HashSet;
+
+pub struct Fp8Config {
+    pub block_n: usize,
+    pub block_k: usize,
+    excluded: HashSet<String>,
+}
+
+impl Fp8Config {
+    fn parse(value: &Value) -> Result<Self> {
+        if value["quant_method"] != "fp8"
+            || value["fmt"] != "e4m3"
+            || value["activation_scheme"] != "dynamic"
+        {
+            return Err("unsupported FP8 quantization configuration".into());
+        }
+        let blocks = value["weight_block_size"]
+            .as_array()
+            .ok_or("missing FP8 block size")?;
+        if blocks.len() != 2 {
+            return Err("FP8 block size must have two dimensions".into());
+        }
+        let block_n: usize = blocks[0]
+            .as_u64()
+            .ok_or("invalid FP8 block rows")?
+            .try_into()?;
+        let block_k: usize = blocks[1]
+            .as_u64()
+            .ok_or("invalid FP8 block columns")?
+            .try_into()?;
+        let gemm = firepit_kernels::gemm::DEFAULT_GEMM_TILE;
+        let gemv = firepit_kernels::gemv::DEFAULT_GEMV_TILE;
+        if block_n == 0
+            || block_k == 0
+            || block_n % gemm.n != 0
+            || block_k % (gemv.blocks * firepit_kernels::weights::Q8_BLOCK) != 0
+        {
+            return Err("unsupported FP8 block shape".into());
+        }
+        let excluded = value["modules_to_not_convert"]
+            .as_array()
+            .ok_or("missing excluded FP8 modules")?
+            .iter()
+            .map(|name| {
+                name.as_str()
+                    .map(str::to_owned)
+                    .ok_or("invalid excluded FP8 module")
+            })
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        Ok(Self {
+            block_n,
+            block_k,
+            excluded,
+        })
+    }
+
+    pub fn expects_fp8(&self, weight: &str) -> bool {
+        let module = weight.strip_suffix(".weight").unwrap_or(weight);
+        !self.excluded.contains(module)
+    }
+}
 
 pub struct ModelConfig {
     text: Value,
+    fp8: Option<Fp8Config>,
 }
 
 impl TryFrom<Value> for ModelConfig {
     type Error = Box<dyn std::error::Error>;
 
     fn try_from(value: Value) -> Result<Self> {
+        let fp8 = value
+            .get("quantization_config")
+            .map(Fp8Config::parse)
+            .transpose()?;
         let text = if value.get("text_config").is_some() {
             value["text_config"].clone()
         } else {
             value
         };
         ModelDims::parse(&text, 1, None)?;
-        Ok(Self { text })
+        Ok(Self { text, fp8 })
     }
 }
 
@@ -30,6 +96,10 @@ impl ModelConfig {
 
     pub fn text(&self) -> &Value {
         &self.text
+    }
+
+    pub fn fp8(&self) -> Option<&Fp8Config> {
+        self.fp8.as_ref()
     }
 }
 

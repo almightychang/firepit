@@ -313,11 +313,11 @@ impl Engine {
             }
             for op in StepPlan::ops(&self.model) {
                 if let crate::plan::Op::Gemv { layer, name, .. } = op {
-                    if !matches!(
+                    if matches!(
                         crate::execute::weight(&self.model, layer, name),
-                        firepit_kernels::weights::Weight::Dense(_)
+                        firepit_kernels::weights::Weight::Q8(_)
                     ) {
-                        return Err("prefill requires dense bf16 weights".into());
+                        return Err("Q8 prefill is unsupported".into());
                     }
                 }
             }

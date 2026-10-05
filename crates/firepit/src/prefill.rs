@@ -13,7 +13,8 @@ use cutile::tensor::{IntoPartition, PartitionMut, Reshape, Tensor};
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit_kernels::attention::DEFAULT_PREFILL_TILE;
 use firepit_kernels::gemm::{
-    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, gemm, grouped_gemm_view,
+    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, fp8_gemm, fp8_grouped_gemm_view, gemm,
+    grouped_gemm_view,
 };
 use firepit_kernels::gemv::gemv;
 use firepit_kernels::moe::{PrefillLayout as MoePrefillLayout, PrefillPlan as MoePrefillPlan};
@@ -744,16 +745,13 @@ fn run_inner(
                 }) => {
                     let (source, target) = input_output(&mut plan.buffers, input, out);
                     let w = weight(model, layer, name);
-                    let Weight::Dense(dense) = w else {
-                        return Err("prefill requires dense bf16 weights".into());
-                    };
                     let cols = source
                         .shape()
                         .iter()
                         .map(|&x| x as usize)
                         .product::<usize>()
                         / rows;
-                    let output_rows = dense.rows;
+                    let output_rows = w.rows();
                     if matches!(name, WeightName::LmHead) {
                         let shaped = source.view(&[rows, cols])?;
                         if plan.scored.len() == 1 {
@@ -774,13 +772,35 @@ fn run_inner(
                         } else {
                             let selected = shaped.slice(&[plan.scored.outer(), 0..cols])?;
                             let tile = gemm_tile(cols, output_rows, false);
-                            gemm(dense, &selected, target.partition([tile.m, tile.n]), tile)
-                                .submit(sink)?;
+                            match w {
+                                Weight::Dense(dense) => {
+                                    gemm(dense, &selected, target.partition([tile.m, tile.n]), tile)
+                                        .submit(sink)?
+                                }
+                                Weight::Fp8(fp8) => fp8_gemm(
+                                    fp8,
+                                    &selected,
+                                    target.partition([tile.m, tile.n]),
+                                    tile,
+                                )
+                                .submit(sink)?,
+                                Weight::Q8(_) => return Err("Q8 prefill is unsupported".into()),
+                            }
                         }
                     } else {
                         let x = source.view(&[rows, cols])?;
                         let tile = gemm_tile(cols, output_rows, false);
-                        gemm(dense, &x, target.partition([tile.m, tile.n]), tile).submit(sink)?;
+                        match w {
+                            Weight::Dense(dense) => {
+                                gemm(dense, &x, target.partition([tile.m, tile.n]), tile)
+                                    .submit(sink)?
+                            }
+                            Weight::Fp8(fp8) => {
+                                fp8_gemm(fp8, &x, target.partition([tile.m, tile.n]), tile)
+                                    .submit(sink)?
+                            }
+                            Weight::Q8(_) => return Err("Q8 prefill is unsupported".into()),
+                        }
                     }
                 }
                 PrefillOp::Kernel(Op::GdnGate) => {
@@ -1191,15 +1211,27 @@ fn run_special(
             let target = &mut plan.buffers[Slot::ExpertUp.index()];
             let y = target.slice_mut(&[0..count, 0..2 * m.intermediate()])?;
             let tile = gemm_tile(d.hidden(), 2 * m.intermediate(), true);
-            grouped_gemm_view(
-                &model.layers[layer].moe.gate_up,
-                &x,
-                y.partition([tile.m, tile.n]),
-                layout,
-                2 * m.intermediate(),
-                tile,
-            )
-            .submit(sink)?;
+            match &model.layers[layer].moe.gate_up {
+                Weight::Dense(w) => grouped_gemm_view(
+                    w,
+                    &x,
+                    y.partition([tile.m, tile.n]),
+                    layout,
+                    2 * m.intermediate(),
+                    tile,
+                )
+                .submit(sink)?,
+                Weight::Fp8(w) => fp8_grouped_gemm_view(
+                    w,
+                    &x,
+                    y.partition([tile.m, tile.n]),
+                    layout,
+                    2 * m.intermediate(),
+                    tile,
+                )
+                .submit(sink)?,
+                Weight::Q8(_) => return Err("Q8 expert prefill is unsupported".into()),
+            }
         }
         PrefillOp::ExpertDown { layer } => {
             let layout = plan.moe.as_ref().ok_or("missing MoE layout")?;
@@ -1209,15 +1241,27 @@ fn run_special(
             let x = source.slice(&[0..count, 0..m.intermediate()])?;
             let y = target.slice_mut(&[0..count, 0..d.hidden()])?;
             let tile = gemm_tile(m.intermediate(), d.hidden(), true);
-            grouped_gemm_view(
-                &model.layers[layer].moe.down,
-                &x,
-                y.partition([tile.m, tile.n]),
-                layout,
-                d.hidden(),
-                tile,
-            )
-            .submit(sink)?;
+            match &model.layers[layer].moe.down {
+                Weight::Dense(w) => grouped_gemm_view(
+                    w,
+                    &x,
+                    y.partition([tile.m, tile.n]),
+                    layout,
+                    d.hidden(),
+                    tile,
+                )
+                .submit(sink)?,
+                Weight::Fp8(w) => fp8_grouped_gemm_view(
+                    w,
+                    &x,
+                    y.partition([tile.m, tile.n]),
+                    layout,
+                    d.hidden(),
+                    tile,
+                )
+                .submit(sink)?,
+                Weight::Q8(_) => return Err("Q8 expert prefill is unsupported".into()),
+            }
         }
         PrefillOp::Combine => {
             let layout = plan.moe.as_ref().ok_or("missing MoE layout")?;
