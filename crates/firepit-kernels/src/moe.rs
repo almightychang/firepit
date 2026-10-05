@@ -80,7 +80,7 @@ mod kernels {
     }
 
     #[cutile::entry()]
-    pub fn combine_prefill_kernel<const H: i32, const TOP: i32>(
+    pub fn combine_prefill_kernel<const H: i32>(
         out: &mut Tensor<f32, { [1, H] }>,
         routed: &Tensor<f32, { [-1, H] }>,
         inverse: &Tensor<i32, { [-1, -1] }>,
@@ -90,17 +90,13 @@ mod kernels {
         k: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
-        let locations: Tile<i32, { [1, TOP] }> = inverse.partition(shape![1, TOP]).load([pid.0, 0]);
-        let rank_weights: Tile<f32, { [1, TOP] }> =
-            weights.partition(shape![1, TOP]).load([pid.0, 0]);
         let mut sum: Tile<f32, { [1, H] }> = constant(0.0f32, shape![1, H]);
         for rank in 0i32..k {
             let location: Tile<i32, { [1, 1] }> =
-                extract(locations, [scalar_to_tile(0i32), scalar_to_tile(rank)]);
+                inverse.partition(shape![1, 1]).load([pid.0, rank]);
             let row: i32 = tile_to_scalar(location.reshape(shape![]));
             let value: Tile<f32, { [1, H] }> = routed.partition(shape![1, H]).load([row, 0]);
-            let weight: Tile<f32, { [1, 1] }> =
-                extract(rank_weights, [scalar_to_tile(0i32), scalar_to_tile(rank)]);
+            let weight: Tile<f32, { [1, 1] }> = weights.partition(shape![1, 1]).load([pid.0, rank]);
             sum = sum + value * weight.broadcast(shape![1, H]);
         }
         let shared: Tile<f32, { [1, H] }> = shared.partition(shape![1, H]).load([pid.0, 0]);
@@ -188,10 +184,7 @@ impl MoeDims {
         ]
     }
     pub fn combine_generics(self) -> Vec<String> {
-        vec![
-            self.hidden.to_string(),
-            self.top_k.next_power_of_two().to_string(),
-        ]
+        vec![self.hidden.to_string()]
     }
 
     pub fn hidden(self) -> usize {
