@@ -254,12 +254,13 @@ mod kernels {
         let decay = exp(exp(a_log) * softplus * negative);
 
         let old: Tile<f32, { [1, DK, T] }> = state.load();
-        let decayed = old * decay.reshape(shape![1, 1, 1]).broadcast(shape![1, DK, T]);
-        let memory: Tile<f32, { [1, 1, T] }> = reduce_sum(decayed * k, 1);
-        let memory: Tile<f32, { [1, T] }> = memory.reshape(shape![1, T]);
+        let memory: Tile<f32, { [1, 1, T] }> = reduce_sum(old * k, 1);
+        let memory: Tile<f32, { [1, T] }> =
+            memory.reshape(shape![1, T]) * decay.reshape(shape![1, 1]).broadcast(shape![1, T]);
         let v: Tile<f32, { [1, T] }> = value.partition(shape![1, T]).load([head, pid.2]);
         let delta = (v - memory) * beta.reshape(shape![1, 1]).broadcast(shape![1, T]);
-        let next = decayed + k * delta.reshape(shape![1, 1, T]).broadcast(shape![1, DK, T]);
+        let next = old * decay.reshape(shape![1, 1, 1]).broadcast(shape![1, DK, T])
+            + k * delta.reshape(shape![1, 1, T]).broadcast(shape![1, DK, T]);
         state.store(next);
         let result: Tile<f32, { [1, 1, T] }> = reduce_sum(next * q, 1);
         let result: Tile<f32, { [1, T] }> = result.reshape(shape![1, T]);
