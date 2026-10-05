@@ -684,11 +684,13 @@ name = "firepit-cli"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "cuda-core",
  "firepit",
  "half",
  "safetensors",
  "serde_json",
  "sha2",
+ "tokenizers",
  "ureq",
 ]
 
