@@ -25,7 +25,7 @@ MoE prefill은 `tests/moe_prefill.rs`에서 host 안정 정렬·expert별 타일
 
 N. J. Higham and T. Mary, "A New Approach to Probabilistic Rounding Error Analysis", SIAM J. Sci. Comput. 41, A2815–A2835, 2019, doi:10.1137/18M1226312 (MIMS EPrint 2018.33). 정리 3.1, 식 (3.6). 반올림 오차가 평균 0인 독립 확률변수라는 가정(Model 2.1) 아래 덧셈 순서와 무관하게 확률 `1 − n(1 − P(λ))`, `P(λ) = 1 − 2exp(−λ²(1−u)²/2)` 이상으로 성립한다. λ = 8이면 실패 확률이 무시할 수준이고, 실측 오차(약 2u 이하)보다 50배 이상 여유가 있다(K=128에서 90u, K=2048에서 362u). 인덱스·순서 버그는 이 기준의 수만 배 오차를 낸다.
 
-Q8 GEMV는 블록 합 뒤 scale 곱이 한 번 더 들어가므로 n = K + 2로 판정한다. RMSNorm과 SwiGLU는 상쇄가 없는 원소별 연산이라 상대오차로 판정한다.
+Q8 GEMV는 블록 합 뒤 scale 곱이 한 번 더 들어가므로 n = K + 2로 판정한다. FP8 GEMV도 scale을 타일 부분합 뒤에 곱하므로 n = K + 1로 판정한다. FP8 oracle PBT는 FP8 최대 유한값 ±448, 최소 subnormal, BF16 scale의 최소 양수·최대 유한값 및 큰 절댓값의 입력을 오버플로우 없는 조합으로 검사한다. RMSNorm과 SwiGLU는 상쇄가 없는 원소별 연산이라 상대오차로 판정한다.
 
 bf16 hi+lo GEMM은 잔차가 bf16 정상 범위인 유한 입력에서 `hi = RN_bf16(x)`, `lo = RN_bf16(x−hi)`를 사용한다. `|x−hi| ≤ u_b|x|`이고 Sterbenz 보조정리로 `x−hi`가 정확하므로 `|x−(hi+lo)| ≤ u_b²|x|` (`u_b=2⁻⁸`). 따라서 f64 oracle 판정은 `(γ̃_K(8)+u_b²)Σ|w_k x_k|`이다. GEMM 행과 GEMV의 차이는 두 경로의 상한 합으로 판정한다.
 

@@ -33,9 +33,7 @@ mod kernels {
             let scale: Tile<bf16, { [1, 1] }> =
                 scale_part.load([pid.1 * BN / block_n, kc * NB * 32 / block_k]);
             let scale: Tile<f32, { [1, 1] }> = convert_tile(scale);
-            let scales: Tile<f32, { [BN, NB, 32] }> =
-                scale.reshape(shape![1, 1, 1]).broadcast(shape![BN, NB, 32]);
-            let weights: Tile<f32, { [B, BN, NB, 32] }> = (weights * scales)
+            let weights: Tile<f32, { [B, BN, NB, 32] }> = weights
                 .reshape(shape![1, BN, NB, 32])
                 .broadcast(shape![B, BN, NB, 32]);
             let xb: Tile<f32, { [B, NB, 32] }> = x_part.load([0, kc, 0]);
@@ -46,7 +44,8 @@ mod kernels {
             let part: Tile<f32, { [B, BN, NB] }> = part.reshape(shape![B, BN, NB]);
             let part: Tile<f32, { [B, BN] }> = reduce_sum(part, 2i32);
             let part: Tile<f32, { [B, BN] }> = part.reshape(shape![B, BN]);
-            acc = acc + part;
+            let scale: Tile<f32, { [B, BN] }> = scale.broadcast(shape![B, BN]);
+            acc = acc + part * scale;
         }
         y.store(acc);
     }
@@ -82,13 +81,12 @@ mod kernels {
                 kc * NB * 32 / block_k,
             ]);
             let scale: Tile<f32, { [1, 1] }> = convert_tile(scale);
-            let scales: Tile<f32, { [BN, NB, 32] }> =
-                scale.reshape(shape![1, 1, 1]).broadcast(shape![BN, NB, 32]);
             let xb: Tile<f32, { [1, NB, 32] }> = x_part.load([pid.0 * input_stride, kc, 0]);
             let xb: Tile<f32, { [BN, NB, 32] }> = xb.broadcast(shape![BN, NB, 32]);
-            let products: Tile<f32, { [BN, NB] }> = reduce_sum((weights * scales) * xb, 2);
+            let products: Tile<f32, { [BN, NB] }> = reduce_sum(weights * xb, 2);
             let products: Tile<f32, { [BN] }> = reduce_sum(products, 1);
-            acc = acc + products.reshape(shape![1, BN]);
+            let scale: Tile<f32, { [1, BN] }> = scale.broadcast(shape![1, BN]);
+            acc = acc + products.reshape(shape![1, BN]) * scale;
         }
         y.store(acc);
     }

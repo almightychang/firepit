@@ -2,8 +2,9 @@ use crate::Result;
 use crate::checkpoint::Stream;
 #[cfg(feature = "testing")]
 use crate::engine::RoutingLayerTrace;
-use crate::execute::gemv_tile;
-use crate::execute::{input_output, three_inputs_output, two_inputs_output, weight};
+use crate::execute::{
+    input_output, three_inputs_output, two_inputs_output, weight, weight_gemv_tile,
+};
 use crate::model::{MixerWeights, Model};
 use crate::plan::{NormName, Op, Slot, StepPlan, WeightName};
 use crate::session::{GdnStateLayout, LayerState, Session};
@@ -762,13 +763,8 @@ fn run_inner(
                                 cols / firepit_kernels::weights::Q8_BLOCK,
                                 firepit_kernels::weights::Q8_BLOCK,
                             ])?;
-                            gemv(
-                                w,
-                                &x,
-                                target.partition([1, gemv_tile(output_rows, cols).rows]),
-                                gemv_tile(output_rows, cols),
-                            )
-                            .submit(sink)?;
+                            let tile = weight_gemv_tile(w, output_rows, cols, 1);
+                            gemv(w, &x, target.partition([1, tile.rows]), tile).submit(sink)?;
                         } else {
                             let selected = shaped.slice(&[plan.scored.outer(), 0..cols])?;
                             let tile = gemm_tile(cols, output_rows, false);

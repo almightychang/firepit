@@ -22,6 +22,35 @@ pub const DEFAULT_GEMV_TILE: GemvTile = GemvTile {
     blocks: 4,
 };
 
+const FP8_TARGET_ROW_TILES: usize = 64;
+const FP8_MAX_ROW_TILE: usize = 128;
+
+pub fn fp8_tile(
+    rows: usize,
+    cols: usize,
+    block_n: usize,
+    block_k: usize,
+    groups: usize,
+) -> GemvTile {
+    assert!(rows > 0 && cols > 0 && block_n > 0 && block_k > 0 && groups > 0);
+    let target = rows
+        .saturating_mul(groups)
+        .div_ceil(FP8_TARGET_ROW_TILES)
+        .clamp(1, FP8_MAX_ROW_TILE)
+        .next_power_of_two();
+    let mut tile = GemvTile {
+        rows: target,
+        blocks: DEFAULT_GEMV_TILE.blocks,
+    };
+    while rows % tile.rows != 0 || block_n % tile.rows != 0 {
+        tile.rows /= 2;
+    }
+    while (cols / Q8_BLOCK) % tile.blocks != 0 || block_k % (tile.blocks * Q8_BLOCK) != 0 {
+        tile.blocks /= 2;
+    }
+    tile
+}
+
 impl GemvTile {
     pub fn fits(self, rows: usize, cols: usize) -> bool {
         rows % self.rows == 0 && cols % Q8_BLOCK == 0 && (cols / Q8_BLOCK) % self.blocks == 0
@@ -119,5 +148,29 @@ impl ExpertGemvView<'_> {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fp8_tiles_cover_scale_blocks_and_model_shapes() {
+        for (rows, cols, groups, expected_rows) in [
+            (8192, 2048, 1, 128),
+            (4096, 2048, 1, 64),
+            (2048, 4096, 1, 32),
+            (512, 2048, 1, 8),
+            (1024, 2048, 8, 128),
+            (2048, 512, 8, 128),
+        ] {
+            let tile = fp8_tile(rows, cols, 128, 128, groups);
+            assert_eq!(tile.rows, expected_rows);
+            assert_eq!(tile.blocks, 4);
+            assert!(tile.fits(rows, cols));
+            assert_eq!(128 % tile.rows, 0);
+            assert_eq!(128 % (tile.blocks * Q8_BLOCK), 0);
+        }
     }
 }

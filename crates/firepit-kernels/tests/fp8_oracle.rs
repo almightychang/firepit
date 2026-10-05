@@ -96,7 +96,7 @@ fn fp8_gemv_and_gemm_match_dequantized_f64_oracle() {
                 let expected = oracle::dense(&weights, &input, rows, cols);
                 let magnitude = oracle::dense_magnitude(&weights, &input, rows, cols);
                 prop_assert!(
-                    check::inner_product_excess(&gemv, &expected, &magnitude, cols) <= 1.0
+                    check::inner_product_excess(&gemv, &expected, &magnitude, cols + 1) <= 1.0
                 );
                 for ((&actual, &value), &sum) in gemm.iter().zip(&expected).zip(&magnitude) {
                     let bound =
@@ -173,7 +173,7 @@ fn fp8_expert_kernels_match_f64_oracle() {
                     &actual,
                     &expected[selected * 128..(selected + 1) * 128],
                     &magnitude[selected * 128..(selected + 1) * 128],
-                    cols,
+                    cols + 1,
                 ) <= 1.0
             );
 
@@ -229,4 +229,129 @@ fn fp8_expert_kernels_match_f64_oracle() {
             Ok(())
         })
         .unwrap();
+}
+
+#[test]
+fn fp8_gemv_extreme_finite_values_match_f64_oracle() {
+    let stream = common::stream();
+    for case in 0..3 {
+        common::runner(8, file!())
+            .run(&any::<u64>(), |seed| {
+                let (scale, encodings, amplitude) = match case {
+                    0 => (
+                        bf16::from_bits(0x0001),
+                        [0x7e, 0xfe, 0x7e, 0xfe],
+                        2.0f32.powi(20),
+                    ),
+                    1 => (bf16::from_bits(0x7f7f), [0x01, 0x81, 0x01, 0x81], 0.5),
+                    _ => (
+                        bf16::from_f32(1.0 / 128.0),
+                        [0x7e, 0xfe, 0x01, 0x81],
+                        2.0f32.powi(20),
+                    ),
+                };
+                let (rows, cols) = (128usize, 256usize);
+                let bits: Vec<f8e4m3fn> = (0..rows * cols)
+                    .map(|i| f8e4m3fn(encodings[(i.wrapping_mul(7) ^ seed as usize) % 4]))
+                    .collect();
+                let weights: Vec<f32> = bits
+                    .iter()
+                    .map(|bit| {
+                        let value = match bit.0 {
+                            0x7e => 448.0,
+                            0xfe => -448.0,
+                            0x01 => 2.0f32.powi(-9),
+                            0x81 => -2.0f32.powi(-9),
+                            _ => unreachable!(),
+                        };
+                        value * scale.to_f32()
+                    })
+                    .collect();
+                let input: Vec<f32> = (0..cols)
+                    .map(|i| {
+                        if (i + seed as usize) % 3 == 0 {
+                            -amplitude
+                        } else {
+                            amplitude
+                        }
+                    })
+                    .collect();
+                let matrix =
+                    HostFp8Matrix::from_parts(bits.clone(), vec![scale; 2], rows, cols, 128, 128)
+                        .map_err(|e| TestCaseError::fail(e.to_string()))?
+                        .upload(&stream)
+                        .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let x = api::copy_host_vec_to_device(&Arc::new(input.clone()))
+                    .reshape(&[1, cols / 32, 32])
+                    .sync_on(&stream)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let mut y = api::zeros::<f32>(&[1, rows])
+                    .sync_on(&stream)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                gemv(
+                    &Weight::Fp8(matrix),
+                    &x.view(&[1, cols / 32, 32])
+                        .map_err(|e| TestCaseError::fail(e.to_string()))?,
+                    (&mut y).partition([1, DEFAULT_GEMV_TILE.rows]),
+                    DEFAULT_GEMV_TILE,
+                )
+                .submit(&mut Eager(&stream))
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let actual: Vec<f32> = y
+                    .to_host_vec()
+                    .sync_on(&stream)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let expected = oracle::dense(&weights, &input, rows, cols);
+                let magnitude = oracle::dense_magnitude(&weights, &input, rows, cols);
+                prop_assert!(expected.iter().all(|value| value.is_finite()));
+                prop_assert!(actual.iter().all(|value| value.is_finite()));
+                prop_assert!(
+                    check::inner_product_excess(&actual, &expected, &magnitude, cols + 1) <= 1.0
+                );
+
+                let dims = MoeDims::new(cols, 128, 128, 2, 1)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let selection = ExpertSelection::parse(&[1], &[1.0], &dims, &stream)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let expert_bits = bits.iter().copied().cycle().take(2 * rows * cols).collect();
+                let expert = HostFp8Matrix::from_parts(
+                    expert_bits,
+                    vec![scale; 4],
+                    2 * rows,
+                    cols,
+                    128,
+                    128,
+                )
+                .map_err(|e| TestCaseError::fail(e.to_string()))?
+                .upload(&stream)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let mut y = api::zeros::<f32>(&[1, rows])
+                    .sync_on(&stream)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                expert_gemv_weight_view(
+                    &Weight::Fp8(expert),
+                    &x.view(&[1, cols / 32, 32])
+                        .map_err(|e| TestCaseError::fail(e.to_string()))?,
+                    &selection,
+                    y.slice_mut(&[0..1, 0..rows])
+                        .map_err(|e| TestCaseError::fail(e.to_string()))?
+                        .partition([1, DEFAULT_GEMV_TILE.rows]),
+                    rows,
+                    0,
+                    DEFAULT_GEMV_TILE,
+                )
+                .submit(&mut Eager(&stream))
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let actual: Vec<f32> = y
+                    .to_host_vec()
+                    .sync_on(&stream)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                prop_assert!(actual.iter().all(|value| value.is_finite()));
+                prop_assert!(
+                    check::inner_product_excess(&actual, &expected, &magnitude, cols + 1) <= 1.0
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
 }

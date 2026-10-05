@@ -12,7 +12,7 @@ use cutile::tensor::{IntoPartition, PartitionMut, Tensor};
 use cutile::tile_kernel::TileKernel;
 #[cfg(feature = "testing")]
 use cutile::tile_kernel::ToHostVecOp;
-use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile, expert_gemv_weight_view, gemv};
+use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile, expert_gemv_weight_view, fp8_tile, gemv};
 use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::{Q8_BLOCK, Weight};
 use firepit_kernels::{attention, elementwise, embedding, gdn, moe, norm, rope, swiglu};
@@ -74,6 +74,18 @@ pub(crate) fn gemv_tile(rows: usize, cols: usize) -> GemvTile {
         tile.blocks /= 2;
     }
     tile
+}
+
+pub(crate) fn weight_gemv_tile(
+    weight: &Weight,
+    rows: usize,
+    cols: usize,
+    groups: usize,
+) -> GemvTile {
+    match weight {
+        Weight::Fp8(w) => fp8_tile(rows, cols, w.block_n, w.block_k, groups),
+        _ => gemv_tile(rows, cols),
+    }
 }
 
 pub(crate) fn weight(model: &Model, layer: usize, name: WeightName) -> &Weight {
@@ -308,14 +320,13 @@ fn run_inner(
                         / batch;
                     let rows = target.shape()[1] as usize;
                     let x = source.view(&[batch, cols / Q8_BLOCK, Q8_BLOCK])?;
-                    let tile = gemv_tile(rows, cols);
-                    gemv(
-                        weight(model, layer, name),
-                        &x,
-                        target.partition([batch, tile.rows]),
-                        tile,
-                    )
-                    .submit(sink)?;
+                    let w = weight(model, layer, name);
+                    let tile = if batch == 1 {
+                        weight_gemv_tile(w, rows, cols, 1)
+                    } else {
+                        gemv_tile(rows, cols)
+                    };
+                    gemv(w, &x, target.partition([batch, tile.rows]), tile).submit(sink)?;
                 }
                 Op::GdnConv { layer } => {
                     let w = match &model.layers[layer].mixer {
@@ -508,9 +519,10 @@ fn run_inner(
                             b * m.top_k()..(b + 1) * m.top_k(),
                             0..2 * m.intermediate(),
                         ])?;
-                        let tile = gemv_tile(2 * m.intermediate(), d.hidden());
+                        let w = &model.layers[layer].moe.gate_up;
+                        let tile = weight_gemv_tile(w, 2 * m.intermediate(), d.hidden(), m.top_k());
                         expert_gemv_weight_view(
-                            &model.layers[layer].moe.gate_up,
+                            w,
                             &x,
                             &plan.selections[layer][b],
                             y.partition([1, tile.rows]),
@@ -549,9 +561,10 @@ fn run_inner(
                             act_rows.view(&[m.top_k(), m.intermediate() / Q8_BLOCK, Q8_BLOCK])?;
                         let y = target
                             .slice_mut(&[b * m.top_k()..(b + 1) * m.top_k(), 0..d.hidden()])?;
-                        let tile = gemv_tile(d.hidden(), m.intermediate());
+                        let w = &model.layers[layer].moe.down;
+                        let tile = weight_gemv_tile(w, d.hidden(), m.intermediate(), m.top_k());
                         expert_gemv_weight_view(
-                            &model.layers[layer].moe.down,
+                            w,
                             &x,
                             &plan.selections[layer][b],
                             y.partition([1, tile.rows]),
