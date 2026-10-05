@@ -242,6 +242,50 @@ mod probes {
         let out: Tile<f32, { [BN] }> = bitcast(acc);
         y.store(out.reshape(shape![1, BN]));
     }
+
+    #[cutile::entry()]
+    pub fn fp8_bits_split<const BN: i32, const KT: i32>(
+        y: &mut Tensor<f32, { [1, BN] }>,
+        w: &Tensor<f8e4m3fn, { [-1, -1] }>,
+        chunks: i32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let wp = w.partition(shape![BN, KT]);
+        let mut acc: Tile<u32, { [BN] }> = constant(0u32, shape![BN]);
+        let first = pid.0 * chunks;
+        for kc in first..(first + chunks) {
+            let weights: Tile<f8e4m3fn, { [BN, KT] }> = wp.load([pid.1, kc]);
+            let bits: Tile<u8, { [BN, KT] }> = bitcast(weights);
+            let wide: Tile<u32, { [BN, KT] }> = exti(bits);
+            let part: Tile<u32, { [BN] }> = reduce_sum(wide, 1i32);
+            let part: Tile<u32, { [BN] }> = part.reshape(shape![BN]);
+            acc = acc + part;
+        }
+        let out: Tile<f32, { [BN] }> = bitcast(acc);
+        y.store(out.reshape(shape![1, BN]));
+    }
+
+    #[cutile::entry()]
+    pub fn bf16_bits_split<const BN: i32, const KT: i32>(
+        y: &mut Tensor<f32, { [1, BN] }>,
+        w: &Tensor<bf16, { [-1, -1] }>,
+        chunks: i32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let wp = w.partition(shape![BN, KT]);
+        let mut acc: Tile<u32, { [BN] }> = constant(0u32, shape![BN]);
+        let first = pid.0 * chunks;
+        for kc in first..(first + chunks) {
+            let weights: Tile<bf16, { [BN, KT] }> = wp.load([pid.1, kc]);
+            let bits: Tile<u16, { [BN, KT] }> = bitcast(weights);
+            let wide: Tile<u32, { [BN, KT] }> = exti(bits);
+            let part: Tile<u32, { [BN] }> = reduce_sum(wide, 1i32);
+            let part: Tile<u32, { [BN] }> = part.reshape(shape![BN]);
+            acc = acc + part;
+        }
+        let out: Tile<f32, { [BN] }> = bitcast(acc);
+        y.store(out.reshape(shape![1, BN]));
+    }
 }
 
 fn parse_args() -> Result<(usize, usize, GemvTile)> {
@@ -430,6 +474,37 @@ fn main() -> Result<()> {
     }
     probe_rows!("R1", fp8_bits_rows, fw_rows, fp8_size);
     probe_rows!("R4", bf16_bits_rows, bw_rows, bf16_size);
+
+    for splits in [2, 4] {
+        let mut partial = api::zeros::<f32>(&[splits, rows]).sync_on(&stream)?;
+        let chunks = (cols / row_tile / splits) as i32;
+        macro_rules! probe_split {
+            ($variant:literal, $kernel:ident, $weights:expr, $size:expr) => {{
+                let ms = do_bench(&stream, &options, |stream| {
+                    probes::$kernel(
+                        (&mut partial).partition([1, tile.rows]),
+                        $weights.clone(),
+                        chunks,
+                    )
+                    .generics(vec![tile.rows.to_string(), row_tile.to_string()])
+                    .sync_on(stream)
+                    .map(|_| ())
+                    .map_err(Into::into)
+                })?
+                .median_ms();
+                print_row(
+                    &format!("{}x{splits}", $variant),
+                    rows,
+                    cols,
+                    tile,
+                    $size,
+                    ms,
+                );
+            }};
+        }
+        probe_split!("S1", fp8_bits_split, fw_rows, fp8_size);
+        probe_split!("S4", bf16_bits_split, bw_rows, bf16_size);
+    }
 
     let wide = GemvTile {
         rows: tile.rows,
