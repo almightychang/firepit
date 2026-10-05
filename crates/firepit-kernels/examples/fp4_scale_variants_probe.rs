@@ -141,6 +141,7 @@ mod kernels {
         let exponent_shift: Tile<u32, { [BN, KT_GROUPS] }> = constant(23u32, shape![BN, KT_GROUPS]);
         let mantissa_shift: Tile<u32, { [BN, KT_GROUPS] }> = constant(20u32, shape![BN, KT_GROUPS]);
         let zero: Tile<u32, { [BN, KT_GROUPS] }> = constant(0u32, shape![BN, KT_GROUPS]);
+        let sign_shift: Tile<u32, { [BN, KT_GROUPS] }> = constant(31u32, shape![BN, KT_GROUPS]);
         let subnormal_step: Tile<f32, { [BN, KT_GROUPS] }> =
             constant(0.001953125f32, shape![BN, KT_GROUPS]);
         let mut acc: Tile<f32, { [BN] }> = constant(0.0f32, shape![BN]);
@@ -159,8 +160,11 @@ mod kernels {
                 bitcast(((exponent + bias) << exponent_shift) | (mantissa << mantissa_shift));
             let mantissa_value: Tile<f32, { [BN, KT_GROUPS] }> = convert_tile(mantissa);
             let subnormal: Tile<f32, { [BN, KT_GROUPS] }> = mantissa_value * subnormal_step;
-            let scale: Tile<f32, { [BN, KT_GROUPS] }> =
+            let magnitude: Tile<f32, { [BN, KT_GROUPS] }> =
                 select(eq_tile(exponent, zero), subnormal, normal);
+            let magnitude: Tile<u32, { [BN, KT_GROUPS] }> = bitcast(magnitude);
+            let scale: Tile<f32, { [BN, KT_GROUPS] }> =
+                bitcast(magnitude | ((bytes >> seven) << sign_shift));
             let part: Tile<f32, { [BN] }> = reduce_sum(groups * scale, 1i32);
             acc = acc + part.reshape(shape![BN]);
         }
