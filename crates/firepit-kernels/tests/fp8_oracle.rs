@@ -11,10 +11,17 @@ use firepit_kernels::gemm::{
 use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, expert_gemv_weight_view, gemv};
 use firepit_kernels::moe::{ExpertSelection, MoeDims, PrefillPlan};
 use firepit_kernels::sink::Eager;
-use firepit_kernels::weights::{HostFp8Matrix, Weight};
+use firepit_kernels::weights::{Fp8Matrix, HostFp8Matrix, Weight};
 use half::bf16;
 use proptest::prelude::*;
 use std::sync::Arc;
+
+const BF16_SPLIT_ERROR: f64 = (1.0 / 256.0) * (1.0 / 256.0);
+
+fn gemm_within_bound(actual: f32, expected: f64, magnitude: f64, cols: usize) -> bool {
+    let bound = (check::gamma_tilde(cols + 1) + BF16_SPLIT_ERROR) * magnitude;
+    (actual as f64 - expected).abs() <= bound.max(f64::MIN_POSITIVE)
+}
 
 fn gpu(
     stream: &Arc<Stream>,
@@ -52,6 +59,41 @@ fn gpu(
     .submit(&mut Eager(stream))?;
     let gemm: Vec<f32> = y.to_host_vec().sync_on(stream)?;
     Ok((gemv, gemm[..rows].to_vec()))
+}
+
+fn grouped_gpu(
+    stream: &Arc<Stream>,
+    matrix: &Fp8Matrix,
+    input: &[f32],
+    dims: &MoeDims,
+    rows_per_expert: usize,
+) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let cols = input.len();
+    let ids: Vec<i32> = (0..64).map(|i| (i % 2) as i32).collect();
+    let plan = PrefillPlan::parse(
+        &ids,
+        &vec![1.0; 64],
+        dims,
+        DEFAULT_GROUPED_GEMM_TILE.m,
+        stream,
+    )?;
+    let padded = plan.layout().padded_rows();
+    let data: Vec<f32> = input.iter().copied().cycle().take(padded * cols).collect();
+    let x = api::copy_host_vec_to_device(&Arc::new(data))
+        .reshape(&[padded, cols])
+        .sync_on(stream)?;
+    let mut y = api::zeros::<f32>(&[padded, rows_per_expert]).sync_on(stream)?;
+    fp8_grouped_gemm_view(
+        matrix,
+        &x.view(&[padded, cols])?,
+        y.slice_mut(&[0..padded, 0..rows_per_expert])?
+            .partition([DEFAULT_GROUPED_GEMM_TILE.m, DEFAULT_GROUPED_GEMM_TILE.n]),
+        &plan,
+        rows_per_expert,
+        DEFAULT_GROUPED_GEMM_TILE,
+    )
+    .submit(&mut Eager(stream))?;
+    Ok(y.to_host_vec().sync_on(stream)?)
 }
 
 #[test]
@@ -99,9 +141,7 @@ fn fp8_gemv_and_gemm_match_dequantized_f64_oracle() {
                     check::inner_product_excess(&gemv, &expected, &magnitude, cols + 1) <= 1.0
                 );
                 for ((&actual, &value), &sum) in gemm.iter().zip(&expected).zip(&magnitude) {
-                    let bound =
-                        (check::gamma_tilde(cols) + 1.0 / 256.0 + (1.0 / 256.0f64).powi(2)) * sum;
-                    prop_assert!((actual as f64 - value).abs() <= bound.max(f64::MIN_POSITIVE));
+                    prop_assert!(gemm_within_bound(actual, value, sum, cols));
                 }
                 Ok(())
             },
@@ -177,52 +217,18 @@ fn fp8_expert_kernels_match_f64_oracle() {
                 ) <= 1.0
             );
 
-            let ids: Vec<i32> = (0..64).map(|i| (i % 2) as i32).collect();
-            let plan = PrefillPlan::parse(
-                &ids,
-                &vec![1.0; 64],
-                &dims,
-                DEFAULT_GROUPED_GEMM_TILE.m,
-                &stream,
-            )
-            .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let padded = plan.layout().padded_rows();
-            let data: Vec<f32> = input.iter().copied().cycle().take(padded * cols).collect();
-            let x = api::copy_host_vec_to_device(&Arc::new(data))
-                .reshape(&[padded, cols])
-                .sync_on(&stream)
-                .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let mut y = api::zeros::<f32>(&[padded, 128])
-                .sync_on(&stream)
-                .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            fp8_grouped_gemm_view(
-                &matrix,
-                &x.view(&[padded, cols])
-                    .map_err(|e| TestCaseError::fail(e.to_string()))?,
-                y.slice_mut(&[0..padded, 0..128])
-                    .map_err(|e| TestCaseError::fail(e.to_string()))?
-                    .partition([DEFAULT_GROUPED_GEMM_TILE.m, DEFAULT_GROUPED_GEMM_TILE.n]),
-                &plan,
-                128,
-                DEFAULT_GROUPED_GEMM_TILE,
-            )
-            .submit(&mut Eager(&stream))
-            .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let actual: Vec<f32> = y
-                .to_host_vec()
-                .sync_on(&stream)
+            let actual = grouped_gpu(&stream, &matrix, &input, &dims, 128)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
             for expert in 0..2 {
                 for row in expert * 32..(expert + 1) * 32 {
                     for output in 0..128 {
                         let index = expert * 128 + output;
-                        let bound =
-                            (check::gamma_tilde(cols) + 1.0 / 256.0 + (1.0 / 256.0f64).powi(2))
-                                * magnitude[index];
-                        prop_assert!(
-                            (actual[row * 128 + output] as f64 - expected[index]).abs()
-                                <= bound.max(f64::MIN_POSITIVE)
-                        );
+                        prop_assert!(gemm_within_bound(
+                            actual[row * 128 + output],
+                            expected[index],
+                            magnitude[index],
+                            cols,
+                        ));
                     }
                 }
             }
@@ -232,7 +238,7 @@ fn fp8_expert_kernels_match_f64_oracle() {
 }
 
 #[test]
-fn fp8_gemv_extreme_finite_values_match_f64_oracle() {
+fn fp8_extreme_finite_values_match_f64_oracle() {
     let stream = common::stream();
     for case in 0..3 {
         common::runner(8, file!())
@@ -276,38 +282,20 @@ fn fp8_gemv_extreme_finite_values_match_f64_oracle() {
                         }
                     })
                     .collect();
-                let matrix =
-                    HostFp8Matrix::from_parts(bits.clone(), vec![scale; 2], rows, cols, 128, 128)
-                        .map_err(|e| TestCaseError::fail(e.to_string()))?
-                        .upload(&stream)
+                let (gemv_output, gemm_output) =
+                    gpu(&stream, bits.clone(), vec![scale; 2], &input, rows, cols)
                         .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                let x = api::copy_host_vec_to_device(&Arc::new(input.clone()))
-                    .reshape(&[1, cols / 32, 32])
-                    .sync_on(&stream)
-                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                let mut y = api::zeros::<f32>(&[1, rows])
-                    .sync_on(&stream)
-                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                gemv(
-                    &Weight::Fp8(matrix),
-                    &x.view(&[1, cols / 32, 32])
-                        .map_err(|e| TestCaseError::fail(e.to_string()))?,
-                    (&mut y).partition([1, DEFAULT_GEMV_TILE.rows]),
-                    DEFAULT_GEMV_TILE,
-                )
-                .submit(&mut Eager(&stream))
-                .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                let actual: Vec<f32> = y
-                    .to_host_vec()
-                    .sync_on(&stream)
-                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 let expected = oracle::dense(&weights, &input, rows, cols);
                 let magnitude = oracle::dense_magnitude(&weights, &input, rows, cols);
                 prop_assert!(expected.iter().all(|value| value.is_finite()));
-                prop_assert!(actual.iter().all(|value| value.is_finite()));
+                prop_assert!(gemv_output.iter().all(|value| value.is_finite()));
                 prop_assert!(
-                    check::inner_product_excess(&actual, &expected, &magnitude, cols + 1) <= 1.0
+                    check::inner_product_excess(&gemv_output, &expected, &magnitude, cols + 1)
+                        <= 1.0
                 );
+                for ((&actual, &value), &sum) in gemm_output.iter().zip(&expected).zip(&magnitude) {
+                    prop_assert!(gemm_within_bound(actual, value, sum, cols));
+                }
 
                 let dims = MoeDims::new(cols, 128, 128, 2, 1)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
@@ -325,11 +313,15 @@ fn fp8_gemv_extreme_finite_values_match_f64_oracle() {
                 .map_err(|e| TestCaseError::fail(e.to_string()))?
                 .upload(&stream)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let x = api::copy_host_vec_to_device(&Arc::new(input.clone()))
+                    .reshape(&[1, cols / 32, 32])
+                    .sync_on(&stream)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 let mut y = api::zeros::<f32>(&[1, rows])
                     .sync_on(&stream)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 expert_gemv_weight_view(
-                    &Weight::Fp8(expert),
+                    &Weight::Fp8(expert.clone()),
                     &x.view(&[1, cols / 32, 32])
                         .map_err(|e| TestCaseError::fail(e.to_string()))?,
                     &selection,
@@ -350,6 +342,14 @@ fn fp8_gemv_extreme_finite_values_match_f64_oracle() {
                 prop_assert!(
                     check::inner_product_excess(&actual, &expected, &magnitude, cols + 1) <= 1.0
                 );
+
+                let grouped = grouped_gpu(&stream, &expert, &input, &dims, rows)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                for row in grouped.chunks(rows) {
+                    for ((&actual, &value), &sum) in row.iter().zip(&expected).zip(&magnitude) {
+                        prop_assert!(gemm_within_bound(actual, value, sum, cols));
+                    }
+                }
                 Ok(())
             })
             .unwrap();
