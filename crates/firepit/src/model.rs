@@ -6,7 +6,8 @@ use cutile::tensor::Tensor;
 use firepit_kernels::weights::{HostFp8Matrix, HostNvfp4Matrix, NVFP4_GROUP, Weight};
 use serde_json::Value;
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Clone, Copy)]
@@ -75,19 +76,19 @@ impl Model {
         options: LoadOptions,
         device: &Arc<Device>,
     ) -> Result<Self> {
+        Self::from_checkpoint_with_overrides(dir, options, &[], device)
+    }
+
+    pub fn from_checkpoint_with_overrides(
+        dir: impl AsRef<Path>,
+        options: LoadOptions,
+        overrides: &[WeightOverride],
+        device: &Arc<Device>,
+    ) -> Result<Self> {
         let stream = device.new_stream()?;
-        let dir = dir.as_ref();
-        let json = |name: &str| -> Result<Value> {
-            Ok(serde_json::from_reader(File::open(dir.join(name))?)?)
-        };
-        let modelopt = dir
-            .join("hf_quant_config.json")
-            .exists()
-            .then(|| json("hf_quant_config.json"))
-            .transpose()?;
-        let config = ModelConfig::new(json("config.json")?, modelopt)?;
-        let dims = config.dims(options.max_seq, options.layers)?;
-        let checkpoint = Checkpoint::open(dir)?;
+        let sources = Sources::open(dir.as_ref(), overrides)?;
+        let dims = sources.base.config.dims(options.max_seq, options.layers)?;
+        let checkpoint = sources.base();
         let h = dims.hidden();
         let embedding = checkpoint.embedding(
             "model.language_model.embed_tokens.weight",
@@ -101,16 +102,10 @@ impl Model {
             let input_norm =
                 checkpoint.vector(&format!("{prefix}.input_layernorm.weight"), h, 1.0, &stream)?;
             let mixer = match kind {
-                LayerKind::Gdn => {
-                    MixerWeights::Gdn(load_gdn(&checkpoint, &prefix, &dims, &config, &stream)?)
+                LayerKind::Gdn => MixerWeights::Gdn(load_gdn(&sources, &prefix, &dims, &stream)?),
+                LayerKind::Attention => {
+                    MixerWeights::Attention(load_attention(&sources, &prefix, &dims, &stream)?)
                 }
-                LayerKind::Attention => MixerWeights::Attention(load_attention(
-                    &checkpoint,
-                    &prefix,
-                    &dims,
-                    &config,
-                    &stream,
-                )?),
             };
             let post_norm = checkpoint.vector(
                 &format!("{prefix}.post_attention_layernorm.weight"),
@@ -118,7 +113,7 @@ impl Model {
                 1.0,
                 &stream,
             )?;
-            let moe = load_moe(&checkpoint, &prefix, &dims, &config, &stream)?;
+            let moe = load_moe(&sources, &prefix, &dims, &stream)?;
             layers.push(LayerWeights {
                 input_norm,
                 mixer,
@@ -127,13 +122,7 @@ impl Model {
             });
         }
         let final_norm = checkpoint.vector("model.language_model.norm.weight", h, 1.0, &stream)?;
-        let lm_head = matrix(
-            &checkpoint,
-            "lm_head.weight",
-            [dims.vocab(), h],
-            &config,
-            &stream,
-        )?;
+        let lm_head = sources.matrix("lm_head.weight", [dims.vocab(), h], &stream)?;
         Ok(Self {
             device_ordinal: stream.device().ordinal(),
             dims,
@@ -142,6 +131,132 @@ impl Model {
             final_norm,
             lm_head,
         })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WeightGroup {
+    LmHead,
+    Projections,
+}
+
+impl WeightGroup {
+    fn of(weight: &str) -> Option<Self> {
+        let projection = [
+            ".linear_attn.in_proj_",
+            ".linear_attn.out_proj.",
+            ".self_attn.q_proj.",
+            ".self_attn.k_proj.",
+            ".self_attn.v_proj.",
+            ".self_attn.o_proj.",
+        ];
+        if weight == "lm_head.weight" {
+            Some(Self::LmHead)
+        } else if projection.iter().any(|part| weight.contains(part)) {
+            Some(Self::Projections)
+        } else {
+            None
+        }
+    }
+}
+
+impl FromStr for WeightGroup {
+    type Err = String;
+
+    fn from_str(name: &str) -> std::result::Result<Self, String> {
+        match name {
+            "lm_head" => Ok(Self::LmHead),
+            "projections" => Ok(Self::Projections),
+            _ => Err(format!(
+                "unknown weight group {name}; expected lm_head or projections"
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WeightOverride {
+    pub group: WeightGroup,
+    pub dir: PathBuf,
+}
+
+impl FromStr for WeightOverride {
+    type Err = String;
+
+    fn from_str(value: &str) -> std::result::Result<Self, String> {
+        let (group, dir) = value
+            .split_once('=')
+            .ok_or_else(|| format!("override {value} must be GROUP=DIR"))?;
+        Ok(Self {
+            group: group.parse()?,
+            dir: PathBuf::from(dir),
+        })
+    }
+}
+
+struct Source {
+    checkpoint: Checkpoint,
+    config: ModelConfig,
+}
+
+impl Source {
+    fn open(dir: &Path) -> Result<Self> {
+        let json = |name: &str| -> Result<Value> {
+            Ok(serde_json::from_reader(File::open(dir.join(name))?)?)
+        };
+        let modelopt = dir
+            .join("hf_quant_config.json")
+            .exists()
+            .then(|| json("hf_quant_config.json"))
+            .transpose()?;
+        Ok(Self {
+            checkpoint: Checkpoint::open(dir)?,
+            config: ModelConfig::new(json("config.json")?, modelopt)?,
+        })
+    }
+}
+
+struct Sources {
+    base: Source,
+    overrides: Vec<(WeightGroup, Source)>,
+}
+
+impl Sources {
+    fn open(dir: &Path, overrides: &[WeightOverride]) -> Result<Self> {
+        let mut sources = Self {
+            base: Source::open(dir)?,
+            overrides: Vec::with_capacity(overrides.len()),
+        };
+        for WeightOverride { group, dir } in overrides {
+            if sources.overrides.iter().any(|(seen, _)| seen == group) {
+                return Err(format!("{group:?} is overridden twice").into());
+            }
+            sources.overrides.push((*group, Source::open(dir)?));
+        }
+        Ok(sources)
+    }
+
+    fn base(&self) -> &Checkpoint {
+        &self.base.checkpoint
+    }
+
+    fn source(&self, weight: &str) -> &Source {
+        WeightGroup::of(weight)
+            .and_then(|group| self.overrides.iter().find(|(g, _)| *g == group))
+            .map_or(&self.base, |(_, source)| source)
+    }
+
+    fn format(&self, weight: &str) -> WeightFormat {
+        self.source(weight).config.format(weight)
+    }
+
+    fn host(&self, name: &str, shape: [usize; 2]) -> Result<HostWeight> {
+        let source = self.source(name);
+        HostWeight::load(&source.checkpoint, name, shape, source.config.format(name))
+    }
+
+    fn matrix(&self, name: &str, shape: [usize; 2], stream: &Stream) -> Result<Weight> {
+        self.host(name, shape)?.upload(stream)
     }
 }
 
@@ -274,40 +389,19 @@ impl HostWeight {
     }
 }
 
-fn host(
-    checkpoint: &Checkpoint,
-    name: &str,
-    shape: [usize; 2],
-    config: &ModelConfig,
-) -> Result<HostWeight> {
-    HostWeight::load(checkpoint, name, shape, config.format(name))
-}
-
-fn matrix(
-    checkpoint: &Checkpoint,
-    name: &str,
-    shape: [usize; 2],
-    config: &ModelConfig,
-    stream: &Stream,
-) -> Result<Weight> {
-    host(checkpoint, name, shape, config)?.upload(stream)
-}
-
 fn load_gdn(
-    checkpoint: &Checkpoint,
+    sources: &Sources,
     prefix: &str,
     dims: &ModelDims,
-    config: &ModelConfig,
     stream: &Stream,
 ) -> Result<GdnWeights> {
+    let checkpoint = sources.base();
     let d = dims.gdn();
     let path = format!("{prefix}.linear_attn");
     let projection = |name: &str, rows: usize| {
-        matrix(
-            checkpoint,
+        sources.matrix(
             &format!("{path}.in_proj_{name}.weight"),
             [rows, dims.hidden()],
-            config,
             &stream,
         )
     };
@@ -333,68 +427,58 @@ fn load_gdn(
             0.0,
             &stream,
         )?,
-        out: matrix(
-            checkpoint,
+        out: sources.matrix(
             &format!("{path}.out_proj.weight"),
             [dims.hidden(), d.value_dim()],
-            config,
             &stream,
         )?,
     })
 }
 
 fn load_attention(
-    checkpoint: &Checkpoint,
+    sources: &Sources,
     prefix: &str,
     dims: &ModelDims,
-    config: &ModelConfig,
     stream: &Stream,
 ) -> Result<AttentionWeights> {
+    let checkpoint = sources.base();
     let d = dims.attention();
     let path = format!("{prefix}.self_attn");
     let q = d.q_heads() * d.head_dim();
     let kv = d.kv_heads() * d.head_dim();
     Ok(AttentionWeights {
-        q_gate: matrix(
-            checkpoint,
+        q_gate: sources.matrix(
             &format!("{path}.q_proj.weight"),
             [2 * q, dims.hidden()],
-            config,
             &stream,
         )?,
-        k: matrix(
-            checkpoint,
+        k: sources.matrix(
             &format!("{path}.k_proj.weight"),
             [kv, dims.hidden()],
-            config,
             &stream,
         )?,
-        v: matrix(
-            checkpoint,
+        v: sources.matrix(
             &format!("{path}.v_proj.weight"),
             [kv, dims.hidden()],
-            config,
             &stream,
         )?,
         q_norm: checkpoint.vector(&format!("{path}.q_norm.weight"), d.head_dim(), 1.0, &stream)?,
         k_norm: checkpoint.vector(&format!("{path}.k_norm.weight"), d.head_dim(), 1.0, &stream)?,
-        out: matrix(
-            checkpoint,
+        out: sources.matrix(
             &format!("{path}.o_proj.weight"),
             [dims.hidden(), q],
-            config,
             &stream,
         )?,
     })
 }
 
 fn load_moe(
-    checkpoint: &Checkpoint,
+    sources: &Sources,
     prefix: &str,
     dims: &ModelDims,
-    config: &ModelConfig,
     stream: &Stream,
 ) -> Result<MoeWeights> {
+    let checkpoint = sources.base();
     let d = dims.moe();
     let h = dims.hidden();
     let path = format!("{prefix}.mlp");
@@ -402,11 +486,9 @@ fn load_moe(
     let shared_gate_up = HostWeight::stack(
         ["gate_proj", "up_proj"]
             .map(|projection| {
-                host(
-                    checkpoint,
+                sources.host(
                     &format!("{shared_path}.{projection}.weight"),
                     [d.shared_intermediate(), h],
-                    config,
                 )
             })
             .into_iter()
@@ -414,15 +496,13 @@ fn load_moe(
     )?
     .upload(stream)?;
     let expert = |expert: usize, projection: &str, shape: [usize; 2]| {
-        host(
-            checkpoint,
+        sources.host(
             &format!("{path}.experts.{expert}.{projection}.weight"),
             shape,
-            config,
         )
     };
     let (gate_up, down) =
-        if config.format(&format!("{path}.experts.0.gate_proj.weight")) == WeightFormat::Bf16 {
+        if sources.format(&format!("{path}.experts.0.gate_proj.weight")) == WeightFormat::Bf16 {
             (
                 Weight::Dense(checkpoint.matrix_bf16(
                     &format!("{path}.experts.gate_up_proj"),
@@ -451,28 +531,18 @@ fn load_moe(
             )
         };
     Ok(MoeWeights {
-        router: matrix(
-            checkpoint,
-            &format!("{path}.gate.weight"),
-            [d.experts(), h],
-            config,
-            stream,
-        )?,
+        router: sources.matrix(&format!("{path}.gate.weight"), [d.experts(), h], stream)?,
         gate_up,
         down,
         shared_gate_up,
-        shared_down: matrix(
-            checkpoint,
+        shared_down: sources.matrix(
             &format!("{shared_path}.down_proj.weight"),
             [h, d.shared_intermediate()],
-            config,
             stream,
         )?,
-        shared_gate: matrix(
-            checkpoint,
+        shared_gate: sources.matrix(
             &format!("{path}.shared_expert_gate.weight"),
             [1, h],
-            config,
             stream,
         )?,
     })
@@ -481,6 +551,131 @@ fn load_moe(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use half::bf16;
+    use safetensors::Dtype;
+    use safetensors::tensor::{TensorView, serialize_to_file};
+
+    const PROJECTION: &str = "model.language_model.layers.0.linear_attn.in_proj_z.weight";
+
+    fn small_config() -> Value {
+        serde_json::from_str(include_str!("../tests/fixtures/small-qwen.json")).unwrap()
+    }
+
+    fn lm_head_shape(config: &Value) -> [usize; 2] {
+        let text = &config["text_config"];
+        let size = |name: &str| text[name].as_u64().unwrap() as usize;
+        [size("vocab_size"), size("hidden_size")]
+    }
+
+    fn write_checkpoint(dir: &Path, fill: f32) -> Result<()> {
+        let config = small_config();
+        let [vocab, hidden] = lm_head_shape(&config);
+        std::fs::create_dir_all(dir)?;
+        std::fs::write(dir.join("config.json"), config.to_string())?;
+        let bytes = |len: usize| -> Vec<u8> {
+            (0..len)
+                .flat_map(|_| bf16::from_f32(fill).to_le_bytes())
+                .collect()
+        };
+        let (lm_head, projection) = (bytes(vocab * hidden), bytes(4 * hidden));
+        let shard = "model.safetensors";
+        serialize_to_file(
+            [
+                (
+                    "lm_head.weight",
+                    TensorView::new(Dtype::BF16, vec![vocab, hidden], &lm_head)?,
+                ),
+                (
+                    PROJECTION,
+                    TensorView::new(Dtype::BF16, vec![4, hidden], &projection)?,
+                ),
+            ],
+            None,
+            &dir.join(shard),
+        )?;
+        let index = serde_json::json!({
+            "weight_map": {"lm_head.weight": shard, PROJECTION: shard},
+        });
+        std::fs::write(dir.join("model.safetensors.index.json"), index.to_string())?;
+        Ok(())
+    }
+
+    fn dense_values(weight: HostWeight) -> Vec<f32> {
+        match weight {
+            HostWeight::Dense(tensor) => tensor.data.iter().map(|x| x.to_f32()).collect(),
+            _ => panic!("expected a dense weight"),
+        }
+    }
+
+    #[test]
+    fn overrides_replace_only_their_weight_group() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("firepit-overrides-{}", std::process::id()));
+        let (base, other) = (root.join("base"), root.join("other"));
+        write_checkpoint(&base, 1.0)?;
+        write_checkpoint(&other, 2.0)?;
+        let shape = lm_head_shape(&small_config());
+        let lm_head_override: WeightOverride = format!("lm_head={}", other.display()).parse()?;
+        let sources = Sources::open(&base, &[lm_head_override.clone()])?;
+        assert!(
+            dense_values(sources.host("lm_head.weight", shape)?)
+                .iter()
+                .all(|&x| x == 2.0)
+        );
+        assert!(
+            dense_values(sources.host(PROJECTION, [4, shape[1]])?)
+                .iter()
+                .all(|&x| x == 1.0)
+        );
+        assert!(Sources::open(&base, &[lm_head_override.clone(), lm_head_override]).is_err());
+        let projections: WeightOverride = format!("projections={}", other.display()).parse()?;
+        let sources = Sources::open(&base, &[projections])?;
+        assert!(
+            dense_values(sources.host("lm_head.weight", shape)?)
+                .iter()
+                .all(|&x| x == 1.0)
+        );
+        assert!(
+            dense_values(sources.host(PROJECTION, [4, shape[1]])?)
+                .iter()
+                .all(|&x| x == 2.0)
+        );
+        assert!(sources.host(PROJECTION, [8, shape[1]]).is_err());
+        std::fs::remove_dir_all(&root)?;
+        Ok(())
+    }
+
+    #[test]
+    fn weight_groups_parse_and_classify_names() {
+        assert_eq!("lm_head".parse(), Ok(WeightGroup::LmHead));
+        assert_eq!("projections".parse(), Ok(WeightGroup::Projections));
+        assert!("experts".parse::<WeightGroup>().is_err());
+        assert!("lm_head".parse::<WeightOverride>().is_err());
+        let layer = "model.language_model.layers.3";
+        for (weight, group) in [
+            ("lm_head.weight".to_owned(), Some(WeightGroup::LmHead)),
+            (
+                format!("{layer}.self_attn.q_proj.weight"),
+                Some(WeightGroup::Projections),
+            ),
+            (
+                format!("{layer}.self_attn.o_proj.weight"),
+                Some(WeightGroup::Projections),
+            ),
+            (
+                format!("{layer}.linear_attn.in_proj_qkv.weight"),
+                Some(WeightGroup::Projections),
+            ),
+            (
+                format!("{layer}.linear_attn.out_proj.weight"),
+                Some(WeightGroup::Projections),
+            ),
+            (format!("{layer}.mlp.experts.0.gate_proj.weight"), None),
+            (format!("{layer}.mlp.shared_expert.up_proj.weight"), None),
+            (format!("{layer}.mlp.gate.weight"), None),
+        ] {
+            assert_eq!(WeightGroup::of(&weight), group, "{weight}");
+        }
+    }
 
     fn gpu_used_mib() -> Result<usize> {
         let output = std::process::Command::new("nvidia-smi")
