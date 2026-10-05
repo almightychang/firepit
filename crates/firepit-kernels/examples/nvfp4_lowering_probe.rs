@@ -3,7 +3,7 @@ use cuda_core::{Device, Stream, f4e2m1fnx2, f8e4m3fn};
 use cutile::api::{self, DeviceOpReshape};
 use cutile::bench::{BenchOptions, do_bench};
 use cutile::tensor::{PartitionMut, Tensor};
-use cutile::tile_kernel::TileKernel;
+use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit_kernels::gemv::{GemvTile, gemv};
 use firepit_kernels::sink::Eager;
 use firepit_kernels::weights::{HostNvfp4Matrix, Weight};
@@ -17,6 +17,19 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 #[cutile::module]
 mod ladder {
     use cutile::core::*;
+
+    #[cutile::entry()]
+    pub fn unpack_store<const BN: i32, const KT: i32, const KT_PACKED: i32>(
+        y: &mut Tensor<f32, { [BN, KT] }>,
+        w: &Tensor<f4e2m1fnx2, { [-1, -1] }>,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let packed: Tile<f4e2m1fnx2, { [BN, KT_PACKED] }> =
+            w.partition(shape![BN, KT_PACKED]).load([pid.0, pid.1]);
+        let weights: Tile<f4e2m1fn, { [BN, KT] }> = packed.unpack(shape![BN, KT]);
+        let weights: Tile<f32, { [BN, KT] }> = convert_tile(weights);
+        y.store(weights);
+    }
 
     #[cutile::entry()]
     pub fn unpack_sum<const BN: i32, const KT: i32, const KT_PACKED: i32>(
@@ -217,6 +230,20 @@ fn main() -> Result<()> {
     let (kt_s, packed_s, groups_s) = (kt.to_string(), (kt / 2).to_string(), (kt / 16).to_string());
     let (bn_s, nb_s) = (tile.rows.to_string(), tile.blocks.to_string());
     println!("variant,N,K,BN,NB,ms,GBps");
+
+    let mut unpacked = api::zeros::<f32>(&[rows, cols]).sync_on(&stream)?;
+    let ms = do_bench(&stream, &options, |stream| {
+        ladder::unpack_store((&mut unpacked).partition([tile.rows, kt]), w.clone())
+            .generics(vec![bn_s.clone(), kt_s.clone(), packed_s.clone()])
+            .sync_on(stream)
+            .map(|_| ())
+            .map_err(Into::into)
+    })?
+    .median_ms();
+    print("unpack_store", ms);
+    if unpacked.dup().to_host_vec().sync_on(&stream)? != vec![1.0f32; rows * cols] {
+        return Err("unpack_store: every weight should unpack to 1.0".into());
+    }
 
     let ms = do_bench(&stream, &options, |stream| {
         ladder::unpack_sum((&mut y).partition([1, tile.rows]), w.clone(), chunks)
