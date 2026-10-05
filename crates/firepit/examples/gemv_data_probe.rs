@@ -538,6 +538,49 @@ fn nvfp4(probe: &mut Probe) -> Result<()> {
     Ok(())
 }
 
+// lm_head launched ten times in a row without the L2 read in between, next to the usual
+// read-then-launch case, to separate the measurement setup from the kernel.
+fn lm_head_back_to_back(probe: &mut Probe) -> Result<()> {
+    let (rows, cols) = (248320, 2048);
+    let stream = probe.stream.clone();
+    let weight = Weight::Dense(DenseMatrix::upload(
+        vec![bf16::from_f32(1.0); rows * cols],
+        rows,
+        cols,
+        &stream,
+    )?);
+    let tile = GemvTile {
+        rows: 16,
+        blocks: KT / 32,
+    };
+    product(
+        probe,
+        &format!("lmhead-scrubbed const N={rows} K={cols} BN=16"),
+        &weight,
+        rows,
+        cols,
+        tile,
+    )?;
+    let x = api::copy_host_vec_to_device(&Arc::new(vec![1.0f32; cols]))
+        .reshape(&[1, cols / 32, 32])
+        .sync_on(&stream)?;
+    let mut y = api::zeros::<f32>(&[1, rows]).sync_on(&stream)?;
+    println!(
+        "CFG lmhead-back-to-back const N={rows} K={cols} BN=16 launches={}",
+        WARMUP + REPS
+    );
+    for _ in 0..WARMUP + REPS {
+        gemv(
+            &weight,
+            &x.view(&[1, cols / 32, 32])?,
+            (&mut y).partition([1, tile.rows]),
+            tile,
+        )
+        .submit(&mut Eager(&stream))?;
+    }
+    Ok(())
+}
+
 fn fp8_tiles(probe: &mut Probe) -> Result<()> {
     let (rows, cols) = (8192, 2048);
     let stream = probe.stream.clone();
@@ -577,7 +620,7 @@ fn main() -> Result<()> {
     }
     let group = std::env::args()
         .nth(1)
-        .ok_or("usage: gemv_data_probe {fp8|bf16|lmhead|nvfp4|fp8tiles}")?;
+        .ok_or("usage: gemv_data_probe {fp8|bf16|lmhead|nvfp4|fp8tiles|lmburst}")?;
     cutile::jit_cache::enable_default()?;
     let stream: Arc<Stream> = Device::new(0)?.new_stream()?;
     let l2 = stream.device().l2_cache_size_bytes().unwrap_or(0);
@@ -617,6 +660,7 @@ fn main() -> Result<()> {
         }
         "nvfp4" => nvfp4(&mut probe),
         "fp8tiles" => fp8_tiles(&mut probe),
+        "lmburst" => lm_head_back_to_back(&mut probe),
         _ => Err(format!("unknown group {group}").into()),
     }
 }
