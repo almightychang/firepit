@@ -39,6 +39,7 @@ mod kernels {
             let products: Tile<f32, { [B, BN, NB, 2, 16] }> =
                 (weights * xb).reshape(shape![B, BN, NB, 2, 16]);
             let groups: Tile<f32, { [B, BN, NB, 2] }> = reduce_sum(products, 4i32);
+            let groups: Tile<f32, { [B, BN, NB, 2] }> = groups.reshape(shape![B, BN, NB, 2]);
             let scale: Tile<f8e4m3fn, { [BN, NB, 2] }> = scale_part.load([pid.1, kc, 0]);
             let scale: Tile<f32, { [BN, NB, 2] }> = convert_tile(scale);
             let scale: Tile<f32, { [B, BN, NB, 2] }> = scale
@@ -83,6 +84,7 @@ mod kernels {
             let products: Tile<f32, { [BN, NB, 2, 16] }> =
                 (weights * xb).reshape(shape![BN, NB, 2, 16]);
             let groups: Tile<f32, { [BN, NB, 2] }> = reduce_sum(products, 3i32);
+            let groups: Tile<f32, { [BN, NB, 2] }> = groups.reshape(shape![BN, NB, 2]);
             let scale: Tile<f8e4m3fn, { [BN, NB, 2] }> = scale_part.load([row_tile, kc, 0]);
             let scale: Tile<f32, { [BN, NB, 2] }> = convert_tile(scale);
             let blocks_sum: Tile<f32, { [BN, NB] }> = reduce_sum(groups * scale, 2i32);
