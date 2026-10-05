@@ -1,10 +1,9 @@
 use cuda_core::Device;
+use firepit::generation::{eos_ids, greedy};
 use firepit::{Engine, LoadOptions, Model, Result, SessionId};
-use serde_json::Value;
 use std::env;
-use std::fs::File;
 use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokenizers::Tokenizer;
@@ -49,43 +48,6 @@ fn parse_args() -> Result<Args> {
         layers,
         eager,
     })
-}
-
-fn eos_ids(model: &Path, tokenizer: &Tokenizer) -> Result<Vec<u32>> {
-    let generation = model.join("generation_config.json");
-    let config = if generation.exists() {
-        serde_json::from_reader::<_, Value>(File::open(generation)?)?
-    } else {
-        serde_json::from_reader::<_, Value>(File::open(model.join("config.json"))?)?
-    };
-    let ids = match &config["eos_token_id"] {
-        Value::Number(id) => vec![id.as_u64().ok_or("invalid eos_token_id")?.try_into()?],
-        Value::Array(ids) => ids
-            .iter()
-            .map(|id| Ok(id.as_u64().ok_or("invalid eos_token_id")?.try_into()?))
-            .collect::<Result<Vec<_>>>()?,
-        Value::Null => {
-            let settings: Value =
-                serde_json::from_reader(File::open(model.join("tokenizer_config.json"))?)?;
-            let token = settings["eos_token"].as_str().ok_or("missing eos token")?;
-            vec![tokenizer.token_to_id(token).ok_or("unknown eos token")?]
-        }
-        _ => return Err("invalid eos_token_id".into()),
-    };
-    if ids.is_empty() {
-        return Err("empty eos_token_id".into());
-    }
-    Ok(ids)
-}
-
-fn greedy(logits: &[f32]) -> Result<u32> {
-    let (id, _) = logits
-        .iter()
-        .enumerate()
-        .filter(|(_, value)| value.is_finite())
-        .max_by(|a, b| a.1.total_cmp(b.1).then_with(|| b.0.cmp(&a.0)))
-        .ok_or("no finite logits")?;
-    Ok(id.try_into()?)
 }
 
 fn main() -> Result<()> {
@@ -157,7 +119,7 @@ mod tests {
     #[test]
     #[ignore = "requires local Qwen3.6 checkpoint"]
     fn reference_prompt_tokens() -> Result<()> {
-        let path = Path::new(env!("HOME")).join("Models/qwen3.6-35b-a3b/tokenizer.json");
+        let path = std::path::Path::new(env!("HOME")).join("Models/qwen3.6-35b-a3b/tokenizer.json");
         let tokenizer = Tokenizer::from_file(path).map_err(|error| error.to_string())?;
         let encoding = tokenizer
             .encode("The capital of France is", false)

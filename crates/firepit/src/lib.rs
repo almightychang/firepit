@@ -2,6 +2,7 @@ mod checkpoint;
 mod config;
 mod engine;
 mod execute;
+pub mod generation;
 mod model;
 mod plan;
 mod prefill;
