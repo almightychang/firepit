@@ -51,3 +51,11 @@ ncu (8192×2048, 16행·K128, 1회 실행):
 - stall 샘플 상위: bf16 sleeping 10269, long_scoreboard 2244, wait 1092. FP8 long_scoreboard 1814, sleeping 1395, wait 1001. 두 커널 모두 메모리 대기가 지배적이다.
 - 해석(추정): SM당 warp가 적어 동시에 날아가는 메모리 요청이 적은 latency 제한 상태다. FP8은 같은 타일에서 단계당 바이트가 bf16의 절반이라 같은 지연에서 대역폭이 더 낮게 나온다. 나눗셈은 부차적 원인이었다.
 - ncu 조건의 Duration(FP8 110 µs, bf16 189 µs)은 do_bench 값과 순서·크기가 달라 직접 비교하지 않는다. GB10에서 ncu의 dram 지표는 n/a다.
+
+## occupancy 힌트 sweep과 decode 분해 (GB10, `aeec9b9`, 2026-10-05)
+
+- 8 형상 × occupancy {기본, 1~4} × worker warp {기본, 4, 8}. 힌트는 실제로 레지스터를 바꾼다(dense FP8 REG 255 → 40/80, bf16 255 → 40/80). 그러나 큰 형상의 최선/기본 시간 비는 0.95~1.00(8192×2048 FP8 0.171 → 0.171, expert gate+up 0.176 → 0.175). 작은 형상(1024×2048, 2048×512)에서만 0.81. **occupancy가 주 제한이라는 가설은 기각**.
+- graph decode batch 1 (`--max-seq 256`): bf16 **27.69 ms (36.1 tok/s)**, FP8 **24.25 ms (41.2 tok/s)**. bf16은 이전 기록 32.7 ms(E4 conv 타일화 직후)보다 빨라졌다(그 사이 변경 중 원인은 확인하지 않음). FP8 이득은 1.14배다.
+- 유효 대역폭(토큰당 가중치 바이트 ÷ step 시간, 계산): bf16 5.89 GB / 27.69 ms ≈ 213 GB/s, FP8 약 3.5 GB / 24.25 ms ≈ 144 GB/s. FP8 경로가 같은 시간에 읽는 바이트가 bf16 경로보다 적다.
+- eager trace(`--profile`, op마다 동기화라 작은 op는 launch 지연이 섞임) GPU ms: gemv 15.1(FP8) vs 16.4(bf16), moe_expert_gemv 8.4 vs 10.1, lm_head 4.4 vs 4.2(둘 다 bf16).
+- 다음 가설(미확인): FP8 GEMV는 타일 한 행이 128 B(K128, 1바이트 원소)로 bf16의 절반이라, 메모리 요청 하나가 나르는 바이트가 작아 요청 수에 묶인다. 판별: 한 타일이 K 방향으로 스케일 블록 2개(256 B/행)를 덮게 해 같은 요청 수로 2배 바이트를 읽는 변형.
