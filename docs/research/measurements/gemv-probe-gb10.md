@@ -61,3 +61,23 @@ split-K로 CTA를 2배·4배 늘려도 바뀌지 않는다. 소비 쪽 병렬도
 | NVFP4 제품 (P0c) | 16 B | 약 90 GB/s | |
 
 decode 분해의 dense_fp8 134 GB/s(nsys, graph 안 커널 시간)는 P1의 정상 상태 대역폭과 가깝다.
+
+## 적용: GEMV를 `[행, K]` view로 (`7abcbd2` → `0a29c40`, GB10 같은 pod)
+
+- 테스트: fp8_oracle, fp8_tile, nvfp4_oracle, moe, gemv_dense, kernels lib, nvfp4_prefix(실제 체크포인트) 모두 통과.
+- decode batch 1: `qwen3.6:nvfp4` 23.11 → **18.34 ms (43.3 → 54.5 tok/s)**, FP8 24.50 → **18.94 ms (40.8 → 52.8 tok/s)**.
+- `bench --profile`(eager, ms/step): gemv 16.16 → 13.56, moe_expert_gemv 6.36 → 4.86, lm_head 4.23 → 4.21.
+- 품질(decode 모드 8묶음, 같은 묶음): NVFP4 ΔNLL 1.1441e-2 → 1.1426e-2(CI ±5.9e-3), FP8 2.2158e-3 → 2.2046e-3(CI ±3.7e-3). 평균 KL 차이 3e-7 이하, top-1 동일. 합 순서 변화 수준이라 통과.
+
+probe 제품 경로(ms, 이전 커밋도 같은 pod에서 다시 잼):
+
+| 형상 (타일 행) | FP8 P0 이전 → 새 | NVFP4 P0c 이전 → 새 |
+|---|---|---|
+| 8192×2048 (128) | 0.186 → 0.141 | 0.133 → 0.103 |
+| 4096×2048 (64) | 0.103 → 0.083 | 0.078 → **0.155** |
+| 2048×4096 (32) | 0.107 → 0.082 | 0.087 → **0.130** |
+| 512×2048 (8) | 0.025 → 0.022 | 0.029 → 0.030 |
+
+- FP8은 모든 형상에서 load만 하는 R1과 같은 시간이다.
+- NVFP4는 타일 행 64·32에서 느려졌다. SASS: spill은 없다(LOCAL 0). 이 두 타일에서만 tileiras가 packed 가중치를 shared memory에서 `LDS.U8`로 1바이트씩 읽어 f32로 풀고 `F2FP.SATFINITE.E2M1.F32`로 다시 묶어 `STS`하는 왕복 경로를 고른다(4096×2048: 명령 4184 → 10176, `BAR.SYNC` 67 → 807). 타일 행 128과 16·8에는 이 경로가 없다. 어떤 reshape나 레이아웃 변환이 이 경로를 유발하는지는 확인하지 않았다.
+- 모델 영향: routed expert는 타일 행 128이라 영향 밖이다(expert 커널 SASS는 직접 보지 않음). shared expert down(2048×512, 타일 행 32)은 0.021 → 0.028 ms, gate_up(1024×2048, 16)은 0.046 → 0.037 ms로 40층 순효과는 약 −0.08 ms(추정).
