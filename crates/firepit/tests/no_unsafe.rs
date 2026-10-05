@@ -13,14 +13,11 @@ fn visit_rs_files(dir: &Path, files: &mut Vec<PathBuf>) {
 }
 
 #[test]
-fn engine_and_kernel_sources_have_no_unsafe() {
+fn crate_sources_have_no_unsafe() {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
     let mut files = Vec::new();
-    for crate_name in ["firepit", "firepit-kernels"] {
-        visit_rs_files(
-            &workspace.join("crates").join(crate_name).join("src"),
-            &mut files,
-        );
+    for entry in fs::read_dir(workspace.join("crates")).unwrap() {
+        visit_rs_files(&entry.unwrap().path().join("src"), &mut files);
     }
     files.sort();
 
