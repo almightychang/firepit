@@ -36,3 +36,17 @@
 - 72묶음 품질은 `--override lm_head=` V2와 **같은 값**: KL 2.534196e-2, top-1 93.33%, ΔNLL +1.076081e-2 ± 2.24e-3. 조립본과 실행 시 조합이 같은 가중치를 쓴다.
 - decode batch 1 (max-seq 256): 23.20 ms (43.1 tok/s), V2 측정 22.90 ms와 같은 수준.
 - `firepit run` 첫 실행은 JIT 포함이라 prefill 5토큰 24.7 s, decode 4.0 tok/s로 보인다(측정값과 다름).
+
+## 기본 구성 decode 분해 (nsys 2025.3.2, `--cuda-graph-trace=node`, `f710059`, 24 step 평균)
+
+`qwen3.6:nvfp4` 조립본, batch 1, max-seq 256. step 합 22.93 ms.
+
+| 커널 | step당 ms | step당 호출 | 읽는 가중치 (계산) | 유효 GB/s |
+|---|---:|---:|---:|---:|
+| dense_fp8 (GDN·attention 투영) | 9.65 | 130 | 1.29 GB | 134 |
+| expert_nvfp4 (routed gate+up, down) | 5.08 | 80 | 0.57 GB | 111 |
+| dense_gemv bf16 (lm_head, router, in_proj_a/b, shared gate) | 4.84 | 141 | 1.07 GB | 221 |
+| dense_nvfp4 (shared expert) | 1.96 | 80 | 0.07 GB | 36 |
+| 나머지 (delta, norm, combine, top-k, conv 등) | 1.40 | | | |
+
+토큰당 가중치 약 3.0 GB, bf16 GEMV가 내는 약 213~221 GB/s 기준 하한은 약 14 ms. 차이 약 8.8 ms 중 FP8 투영 약 3.6 ms, routed NVFP4 약 2.4 ms, shared NVFP4 약 1.6 ms(작은 행렬이라 대역폭이 아니라 지연에 묶인 것으로 추정).
