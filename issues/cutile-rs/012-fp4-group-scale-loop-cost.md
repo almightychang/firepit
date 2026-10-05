@@ -3,7 +3,7 @@
 대상: https://github.com/NVlabs/cutile-rs/issues (주의: lowering은 tileiras에서 일어난다. 008과 같은 FP4 unpack 경로라 008과 묶어 내는 것을 제안. 게시처는 Sam 확인 필요)
 확인 버전: vendor/cutile-rs a620b40 (main 9fe5756 기반), GB10 (sm_121, driver 580.178.04, CUDA 13.3 toolkit, tileiras V13.3.36)
 발견: firepit decode GEMV 잔여분 분석 4~7단계. NVFP4 expert GEMV(BN 128)가 같은 바이트의 load만 대비 K 2048에서 약 +10 µs. 정수 디코드·f16 경유·pipeline hint로 줄지 않음. 7단계에서 unpack·그룹 합·scale 곱으로 나눠 scale 곱 단계로 좁힘
-재현: 012-fp4-group-scale-probe.rs (crates/firepit-kernels/examples/fp4_unpack_cost_probe.rs, 13b9174)
+재현: 012-fp4-group-scale-probe.rs (crates/firepit-kernels/examples/fp4_unpack_cost_probe.rs, 13b9174). scale 적용 형태 변형: 012-fp4-scale-variants-probe.rs (crates/firepit-kernels/examples/fp4_scale_variants_probe.rs, ebbc46d)
 -->
 
 # Multiplying unpacked FP4 group sums by a per-group scale tile triples the loop's conversions and shared-memory reads
@@ -73,6 +73,8 @@ In a full NVFP4 expert GEMV (the above plus the input vector), the same pattern 
 
 Verified: the source difference between `fp4_groups` and `fp4_scaled` is the scale load, its conversion, and one multiply and reduce over `[BN, KT/16]`.
 
+Verified, from the variants below: the extra `F2FP` instructions are not the E4M3 scale conversion. A variant that reads the scales as bytes and decodes them with integer operations (no E4M3 `convert` at all) still has 384 `F2FP` in its loop, against 128 without scales.
+
 Not verified: the tripled `F2FP` count suggests the unpacked values are converted again, or moved through shared memory (`LDS` ×2.8), to match a layout chosen for the `[BN, KT/16]` scale tile. This is related to our other report on `unpack` followed by a row reduction at fewer than 128 rows (008). In both cases the layout picked for the unpacked FP4 tile does not match what the following operations want, and the backend fixes it up every iteration.
 
 As with 008, the Tile IR differs only in what the source asks for. The layout decision is made in `tileiras`, so we would appreciate routing.
@@ -84,4 +86,22 @@ As with 008, the Tile IR differs only in what the source asks for. The layout de
 
 ## Workaround
 
-None found in the kernel source (see above).
+None found. We changed only how the scales are applied, with the same data and tile.
+
+Setup: GB10, N = 9216, BN = 128, KT = 128. The process first allocates 22 GiB, as a loaded model would. Kernel times are nsys medians after an L2 read; the fit is over K = 512 to 4096. Every variant matched an f64 reference of the ModelOpt definition exactly on random E2M1 codes and E4M3 scales (signs, normals, subnormals).
+
+| scale application | per iteration | vs. no scales | loop instructions / `F2FP` / `LDS` | extra bytes per weight |
+|---|---:|---:|---|---:|
+| none (group sums only, floor) | 2.734 µs | — | 634 / 128 / 40 | — |
+| group sums × converted E4M3 tile (current) | 3.159 µs | +15.5% | 1800 / 408 / 112 | 0 |
+| scales broadcast to `[BN, KT]`, multiplied element-wise, one reduction | 3.139 µs | +15% | 2530 / 408 / 112 | 0 |
+| scales read as `u8`, E4M3 decoded with integer operations | 3.121 µs | +14% | 2020 / 384 / 112 | 0 |
+| scales stored pre-converted as `bf16` | 3.687 µs | +35% | 1246 / 256 / 86 | +0.0625 B |
+| scales stored pre-converted as `f32` | 5.078 µs | +86% | 2315 / 384 / 190 (`STS` 50, `BAR` 19) | +0.1875 B |
+
+- Applying the scales outside the K loop is not possible without writing the per-group sums to memory, because every K tile has its own scales. That is a larger version of the pre-converted variants above.
+- Earlier attempts on the full GEMV body also did not help:
+  - decoding E2M1 with integer operations instead of `unpack` (9% slower)
+  - converting through `f16` (identical SASS)
+  - multiplying in `f16` (same time)
+  - `load_pipelined` hints (no consistent change)
