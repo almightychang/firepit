@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/firepit-kernels", "crates/firepit"]
+members = ["crates/firepit-kernels", "crates/firepit", "crates/firepit-cli"]
 resolver = "2"
 exclude = ["vendor/cutile-rs"]
 
