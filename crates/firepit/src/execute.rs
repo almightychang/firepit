@@ -12,7 +12,9 @@ use cutile::tensor::{IntoPartition, PartitionMut, Tensor};
 use cutile::tile_kernel::TileKernel;
 #[cfg(feature = "testing")]
 use cutile::tile_kernel::ToHostVecOp;
-use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile, expert_gemv_weight_view, fp8_tile, gemv};
+use firepit_kernels::gemv::{
+    DEFAULT_GEMV_TILE, GemvTile, expert_gemv_weight_view, fp8_tile, gemv, nvfp4_tile,
+};
 use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::{Q8_BLOCK, Weight};
 use firepit_kernels::{attention, elementwise, embedding, gdn, moe, norm, rope, swiglu};
@@ -84,6 +86,7 @@ pub(crate) fn weight_gemv_tile(
 ) -> GemvTile {
     match weight {
         Weight::Fp8(w) => fp8_tile(rows, cols, w.block_n, w.block_k, groups),
+        Weight::Nvfp4(_) => nvfp4_tile(rows, cols, groups),
         _ => gemv_tile(rows, cols),
     }
 }

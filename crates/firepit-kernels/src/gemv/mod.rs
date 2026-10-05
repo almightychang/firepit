@@ -1,6 +1,7 @@
 mod dense;
 mod expert;
 mod fp8;
+mod nvfp4;
 mod q8;
 
 pub use expert::{expert_gemv, expert_gemv_view};
@@ -50,6 +51,10 @@ pub fn fp8_tile(
         tile.blocks /= 2;
     }
     tile
+}
+
+pub fn nvfp4_tile(rows: usize, cols: usize, groups: usize) -> GemvTile {
+    fp8_tile(rows, cols, rows, cols, groups)
 }
 
 impl GemvTile {
@@ -116,6 +121,15 @@ impl Gemv<'_> {
                     self.compile_options,
                 ))?;
             }
+            Weight::Nvfp4(w) => {
+                sink.run(nvfp4::dense_gemv(
+                    w,
+                    self.x,
+                    self.y,
+                    self.tile,
+                    self.compile_options,
+                ))?;
+            }
         }
         Ok(())
     }
@@ -172,6 +186,16 @@ impl ExpertGemvView<'_> {
                 self.compile_options,
             ))?,
             Weight::Fp8(w) => sink.run(fp8::expert_gemv_view(
+                w,
+                self.x,
+                self.selection,
+                self.y,
+                self.rows_per_expert,
+                self.input_stride,
+                self.tile,
+                self.compile_options,
+            ))?,
+            Weight::Nvfp4(w) => sink.run(nvfp4::expert_gemv_view(
                 w,
                 self.x,
                 self.selection,

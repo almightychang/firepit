@@ -4,6 +4,9 @@ use crate::weights::{DenseMatrix, Fp8Matrix};
 use cutile::tensor::{Partition, Tensor, TensorView, TensorViewMut};
 use half::bf16;
 
+mod nvfp4;
+pub use nvfp4::{Nvfp4Gemm, Nvfp4GroupedGemmView, nvfp4_gemm, nvfp4_grouped_gemm_view};
+
 #[cutile::module]
 mod kernels {
     use cutile::core::*;

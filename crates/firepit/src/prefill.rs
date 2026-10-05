@@ -15,7 +15,7 @@ use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit_kernels::attention::DEFAULT_PREFILL_TILE;
 use firepit_kernels::gemm::{
     DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, fp8_gemm, fp8_grouped_gemm_view, gemm,
-    grouped_gemm_view,
+    grouped_gemm_view, nvfp4_gemm, nvfp4_grouped_gemm_view,
 };
 use firepit_kernels::gemv::gemv;
 use firepit_kernels::moe::{PrefillLayout as MoePrefillLayout, PrefillPlan as MoePrefillPlan};
@@ -780,6 +780,13 @@ fn run_inner(
                                     tile,
                                 )
                                 .submit(sink)?,
+                                Weight::Nvfp4(nvfp4) => nvfp4_gemm(
+                                    nvfp4,
+                                    &selected,
+                                    target.partition([tile.m, tile.n]),
+                                    tile,
+                                )
+                                .submit(sink)?,
                                 Weight::Q8(_) => return Err("Q8 prefill is unsupported".into()),
                             }
                         }
@@ -793,6 +800,10 @@ fn run_inner(
                             }
                             Weight::Fp8(fp8) => {
                                 fp8_gemm(fp8, &x, target.partition([tile.m, tile.n]), tile)
+                                    .submit(sink)?
+                            }
+                            Weight::Nvfp4(nvfp4) => {
+                                nvfp4_gemm(nvfp4, &x, target.partition([tile.m, tile.n]), tile)
                                     .submit(sink)?
                             }
                             Weight::Q8(_) => return Err("Q8 prefill is unsupported".into()),
@@ -1225,6 +1236,15 @@ fn run_special(
                     tile,
                 )
                 .submit(sink)?,
+                Weight::Nvfp4(w) => nvfp4_grouped_gemm_view(
+                    w,
+                    &x,
+                    y.partition([tile.m, tile.n]),
+                    layout,
+                    2 * m.intermediate(),
+                    tile,
+                )
+                .submit(sink)?,
                 Weight::Q8(_) => return Err("Q8 expert prefill is unsupported".into()),
             }
         }
@@ -1247,6 +1267,15 @@ fn run_special(
                 )
                 .submit(sink)?,
                 Weight::Fp8(w) => fp8_grouped_gemm_view(
+                    w,
+                    &x,
+                    y.partition([tile.m, tile.n]),
+                    layout,
+                    d.hidden(),
+                    tile,
+                )
+                .submit(sink)?,
+                Weight::Nvfp4(w) => nvfp4_grouped_gemm_view(
                     w,
                     &x,
                     y.partition([tile.m, tile.n]),
