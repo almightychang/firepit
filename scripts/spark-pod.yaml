@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: @POD@
+spec:
+  nodeName: @NODE@
+  hostNetwork: true
+  restartPolicy: Never
+  runtimeClassName: nvidia
+  containers:
+  - name: build
+    image: @IMAGE@
+    command: ["sleep", "infinity"]
+    env:
+    - {name: CARGO_HOME, value: /work/cargo}
+    - {name: RUSTUP_HOME, value: /work/rustup}
+    - {name: LIBCLANG_PATH, value: /usr/lib/llvm-18/lib}
+    - {name: CUDA_HOME, value: /usr/local/cuda}
+    - {name: CUDA_TOOLKIT_PATH, value: /usr/local/cuda}
+    resources:
+      requests: {cpu: "4", memory: 8Gi, nvidia.com/gpu: "1"}
+      limits: {memory: 120Gi, nvidia.com/gpu: "1"}
+    volumeMounts:
+    - {name: work, mountPath: /work}
+  volumes:
+  - name: work
+    hostPath: {path: @HOSTPATH@, type: DirectoryOrCreate}

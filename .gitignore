@@ -29,3 +29,7 @@ __pycache__/
 # 비밀값
 .env
 .env.*
+
+# GB10 실행 설정과 결과 (scripts/spark-bench.sh)
+/scripts/spark.env
+/runs/
