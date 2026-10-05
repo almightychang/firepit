@@ -24,6 +24,7 @@ const SCRUB_TILE: usize = 4096;
 const KT: usize = 128;
 const SCALE_BLOCK: usize = 128;
 const NVFP4_GROUP: usize = 16;
+const SUSTAINED: usize = 240;
 
 #[cutile::module]
 mod probes {
@@ -560,7 +561,13 @@ fn lm_head(probe: &mut Probe) -> Result<()> {
     probe.repeat(&format!("lmhead-graph N={rows} K={cols} BN=16"), |s| {
         graph.launch().sync_on(s)?;
         Ok(())
-    })
+    })?;
+    // About a second of uninterrupted replays, to see whether sustained load changes the time.
+    println!("CFG lmhead-sustained N={rows} K={cols} BN=16 launches={SUSTAINED}");
+    for _ in 0..SUSTAINED {
+        graph.launch().sync_on(&stream)?;
+    }
+    Ok(())
 }
 
 fn main() -> Result<()> {
