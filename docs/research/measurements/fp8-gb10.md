@@ -34,3 +34,20 @@
 bf16 8192×2048은 약 155 GB/s. 바이트가 절반인데 시간은 0.72~0.83배라, spill을 줄인 뒤에도 FP8 경로가 대역폭을 다 쓰지 못한다. 남은 원인은 확인하지 않았다(가설: 원소별 FP8→f32 변환 처리량).
 - 품질(prefill 72묶음)은 이전과 같은 값이다. quality prefill 모드는 GEMM 경로를 쓰므로 이번 GEMV 변경은 반영되지 않는다.
 - GB10 pod의 `cargo test --workspace`에서 trybuild `public_invariants_cannot_be_bypassed`가 실패했다. 같은 커밋이 로컬 컨테이너에서는 통과(컴파일 전용 테스트)하므로 pod 툴체인의 진단 문구 차이로 보인다(추정). FP8 테스트·비트 비교는 GB10에서 통과.
+
+## FP8 GEMV 병목 분석 (GB10, 2026-10-05)
+
+SASS(8192×2048, 16행, K128, 정적): 변경 전(`0ef4f48`) FP8 커널은 I2F.RP 48·MUFU.RCP 48·IMAD.HI 108·IABS 75 등 런타임 정수 나눗셈 패턴이 있었다(스케일 인덱스 `pid·BN/block_n`, `kc·NB·32/block_k`). 스케일 블록 2중 루프와 const generic 블록 크기(`587b5ac`)로 나눗셈 패턴은 12개로 줄었다. 그러나 stack이 dense 128 → 480 B, expert 224 → 928 B로 다시 늘었고, 총 명령 수는 bf16 1392 대비 FP8 3512다.
+
+| 지표 | 이전 FP8 | `587b5ac` FP8 | bf16 |
+|---|---:|---:|---:|
+| 8192×2048 GEMV (do_bench) | 0.174 ms | 0.171 ms | 0.218 ms |
+| expert gate+up | 0.179 | 0.174 | 0.218 |
+| expert down | 0.098 | 0.092 | 0.133 |
+| decode batch 1 | 24.80 ms | **24.26 ms (41.2 tok/s)** | 32.7 ms |
+
+ncu (8192×2048, 16행·K128, 1회 실행):
+- 두 커널 모두 255 registers/thread, block 256 threads → **SM당 block 1개(레지스터 제한), 이론 occupancy 16.7%(8 warps/SM)**. 달성 occupancy FP8 10.2%, bf16 16.0%.
+- stall 샘플 상위: bf16 sleeping 10269, long_scoreboard 2244, wait 1092. FP8 long_scoreboard 1814, sleeping 1395, wait 1001. 두 커널 모두 메모리 대기가 지배적이다.
+- 해석(추정): SM당 warp가 적어 동시에 날아가는 메모리 요청이 적은 latency 제한 상태다. FP8은 같은 타일에서 단계당 바이트가 bf16의 절반이라 같은 지연에서 대역폭이 더 낮게 나온다. 나눗셈은 부차적 원인이었다.
+- ncu 조건의 Duration(FP8 110 µs, bf16 189 µs)은 do_bench 값과 순서·크기가 달라 직접 비교하지 않는다. GB10에서 ncu의 dram 지표는 n/a다.
