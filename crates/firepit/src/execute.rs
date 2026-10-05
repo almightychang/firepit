@@ -349,7 +349,6 @@ fn run_inner(
                                 &x,
                                 conv.partition([tile, kernel_tile]),
                                 &w.conv,
-                                g.conv_kernel() as i32,
                             )
                             .generics(g.conv_generics(tile)),
                         )?;

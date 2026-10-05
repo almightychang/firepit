@@ -3,12 +3,11 @@ mod kernels {
     use cutile::core::*;
 
     #[cutile::entry()]
-    pub fn conv1d_silu<const CHANNEL_TILE: i32, const KERNEL_TILE: i32>(
+    pub fn conv1d_silu<const CHANNEL_TILE: i32, const KERNEL_TILE: i32, const KERNEL: i32>(
         out: &mut Tensor<f32, { [CHANNEL_TILE] }>,
         input: &Tensor<f32, { [-1] }>,
         state: &mut Tensor<f32, { [CHANNEL_TILE, KERNEL_TILE] }>,
         weight: &Tensor<f32, { [-1, -1] }>,
-        kernel_size: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
         let previous: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> = state.load();
@@ -21,7 +20,7 @@ mod kernels {
         let columns: Tile<i32, { [1, KERNEL_TILE] }> = positions.reshape(shape![1, KERNEL_TILE]);
         let current_column: Tile<bool, { [CHANNEL_TILE, KERNEL_TILE] }> = eq_tile(
             columns.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
-            (kernel_size - 1i32).broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+            (KERNEL - 1i32).broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
         );
         let window = select(
             current_column,
@@ -32,7 +31,7 @@ mod kernels {
         );
         let valid_columns: Tile<bool, { [CHANNEL_TILE, KERNEL_TILE] }> = lt_tile(
             columns.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
-            kernel_size.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+            KERNEL.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
         );
         let zero: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> =
             constant(0.0f32, shape![CHANNEL_TILE, KERNEL_TILE]);
@@ -48,7 +47,7 @@ mod kernels {
         let mut shifted: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> = current
             .reshape(shape![CHANNEL_TILE, 1])
             .broadcast(shape![CHANNEL_TILE, KERNEL_TILE]);
-        for slot in 0i32..(kernel_size - 2i32) {
+        for slot in 0i32..(KERNEL - 2i32) {
             let next: Tile<f32, { [CHANNEL_TILE, 1] }> = extract(
                 previous,
                 [scalar_to_tile(0i32), scalar_to_tile(slot + 1i32)],
@@ -69,12 +68,12 @@ mod kernels {
         const SEQUENCE_TILE: i32,
         const CHANNEL_TILE: i32,
         const KERNEL_TILE: i32,
+        const KERNEL: i32,
     >(
         out: &mut Tensor<f32, { [SEQUENCE_TILE, CHANNEL_TILE] }>,
         input: &Tensor<f32, { [-1, -1] }>,
         state: &mut Tensor<f32, { [1, CHANNEL_TILE, KERNEL_TILE] }>,
         weight: &Tensor<f32, { [-1, -1] }>,
-        kernel_size: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
         let coefficients: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> = weight
@@ -86,12 +85,9 @@ mod kernels {
             .broadcast(shape![CHANNEL_TILE, KERNEL_TILE]);
         let current_column = eq_tile(
             slots,
-            (kernel_size - 1i32).broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
+            (KERNEL - 1i32).broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
         );
-        let valid_columns = lt_tile(
-            slots,
-            kernel_size.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]),
-        );
+        let valid_columns = lt_tile(slots, KERNEL.broadcast(shape![CHANNEL_TILE, KERNEL_TILE]));
         let zero: Tile<f32, { [CHANNEL_TILE, KERNEL_TILE] }> =
             constant(0.0f32, shape![CHANNEL_TILE, KERNEL_TILE]);
         let one: Tile<f32, { [CHANNEL_TILE] }> = constant(1.0f32, shape![CHANNEL_TILE]);
@@ -118,7 +114,7 @@ mod kernels {
                 .store(activated.reshape(shape![1, CHANNEL_TILE]), [time, 0]);
 
             let mut shifted = current;
-            for slot in 0i32..(kernel_size - 2i32) {
+            for slot in 0i32..(KERNEL - 2i32) {
                 let next: Tile<f32, { [CHANNEL_TILE, 1] }> = extract(
                     previous,
                     [scalar_to_tile(0i32), scalar_to_tile(slot + 1i32)],
@@ -404,6 +400,7 @@ impl GdnDims {
         vec![
             channel_tile.to_string(),
             self.conv_kernel.next_power_of_two().to_string(),
+            self.conv_kernel.to_string(),
         ]
     }
     pub fn delta_generics(self, value_tile: usize) -> Vec<String> {

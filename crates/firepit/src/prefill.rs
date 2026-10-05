@@ -926,13 +926,12 @@ fn run_special(
                     &x,
                     (&mut state).partition(layout.conv_prefill_grid(plan.conv_tile)),
                     &w.conv,
-                    g.conv_kernel() as i32,
                 )
-                .generics(vec![
-                    len.next_power_of_two().to_string(),
-                    plan.conv_tile.to_string(),
-                    g.conv_kernel().next_power_of_two().to_string(),
-                ]),
+                .generics({
+                    let mut generics = vec![len.next_power_of_two().to_string()];
+                    generics.extend(g.conv_generics(plan.conv_tile));
+                    generics
+                }),
             );
             let spare = std::mem::replace(conv, state.reshape(&layout.conv_storage())?);
             plan.conv_spare = Some(spare);

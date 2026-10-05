@@ -35,6 +35,7 @@ fn measure(
         sequence_tile.to_string(),
         tile.to_string(),
         kernel_tile.to_string(),
+        kernel.to_string(),
     ];
     let launch = |state: &mut cutile::tensor::Tensor<f32>,
                   output: &mut cutile::tensor::Tensor<f32>,
@@ -44,7 +45,6 @@ fn measure(
             &input,
             state.partition([1, tile, kernel_tile]),
             &weight,
-            kernel as i32,
         )
         .generics(generics.clone())
         .sync_on(stream)

@@ -155,7 +155,6 @@ fn gdn_conv_prefill_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
             &x,
             state.partition([1, tile, kernel.next_power_of_two()]),
             &w,
-            kernel as i32,
         )
         .generics({
             let mut generics = vec![t.next_power_of_two().to_string()];
@@ -266,7 +265,6 @@ fn gdn_prefill_layer_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
             &qkv,
             conv_state.partition([1, channel_tile, dims.conv_kernel().next_power_of_two()]),
             &conv_weight,
-            dims.conv_kernel() as i32,
         )
         .generics({
             let mut g = vec![t.next_power_of_two().to_string()];
@@ -550,7 +548,6 @@ fn gdn_projection_and_conv_match_hf() -> Result<(), Box<dyn std::error::Error>> 
                 &qkv_gpu,
                 state.partition([1, dims.conv_kernel().next_power_of_two()]),
                 &conv_w,
-                dims.conv_kernel() as i32,
             )
             .generics(dims.conv_generics(1))
             .sync_on(&stream)?;

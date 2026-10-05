@@ -72,11 +72,11 @@ fn gpu_step(
         &x,
         s.partition([tile, kernel.next_power_of_two()]),
         &w,
-        kernel as i32,
     )
     .generics(vec![
         tile.to_string(),
         kernel.next_power_of_two().to_string(),
+        kernel.to_string(),
     ])
     .sync_on(stream)?;
     Ok((
@@ -110,12 +110,12 @@ fn gpu_prefill(
         &x,
         s.partition([1, tile, kernel.next_power_of_two()]),
         &w,
-        kernel as i32,
     )
     .generics(vec![
         steps.next_power_of_two().to_string(),
         tile.to_string(),
         kernel.next_power_of_two().to_string(),
+        kernel.to_string(),
     ])
     .sync_on(stream)?;
     Ok((
