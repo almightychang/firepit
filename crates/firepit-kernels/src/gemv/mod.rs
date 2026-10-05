@@ -113,22 +113,10 @@ impl Gemv<'_> {
                 ))?;
             }
             Weight::Fp8(w) => {
-                sink.run(fp8::dense_gemv(
-                    w,
-                    self.x,
-                    self.y,
-                    self.tile,
-                    self.compile_options,
-                ))?;
+                fp8::dense_gemv(w, self.x, self.y, self.tile, self.compile_options, sink)?;
             }
             Weight::Nvfp4(w) => {
-                sink.run(nvfp4::dense_gemv(
-                    w,
-                    self.x,
-                    self.y,
-                    self.tile,
-                    self.compile_options,
-                ))?;
+                nvfp4::dense_gemv(w, self.x, self.y, self.tile, self.compile_options, sink)?;
             }
         }
         Ok(())
@@ -185,7 +173,7 @@ impl ExpertGemvView<'_> {
                 self.tile,
                 self.compile_options,
             ))?,
-            Weight::Fp8(w) => sink.run(fp8::expert_gemv_view(
+            Weight::Fp8(w) => fp8::expert_gemv_view(
                 w,
                 self.x,
                 self.selection,
@@ -194,8 +182,9 @@ impl ExpertGemvView<'_> {
                 self.input_stride,
                 self.tile,
                 self.compile_options,
-            ))?,
-            Weight::Nvfp4(w) => sink.run(nvfp4::expert_gemv_view(
+                sink,
+            )?,
+            Weight::Nvfp4(w) => nvfp4::expert_gemv_view(
                 w,
                 self.x,
                 self.selection,
@@ -204,7 +193,8 @@ impl ExpertGemvView<'_> {
                 self.input_stride,
                 self.tile,
                 self.compile_options,
-            ))?,
+                sink,
+            )?,
             Weight::Q8(_) => {
                 return Err(cuda_async::error::DeviceError::Internal(
                     "Q8 expert GEMV is unsupported".into(),
