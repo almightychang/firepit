@@ -51,14 +51,13 @@ impl Model {
             };
             let post_norm = random.norm(h, stream)?;
             let m = dims.moe();
-            let gate_up = random.dense(m.experts() * 2 * m.intermediate(), h, stream)?;
-            let down = random.dense(m.experts() * h, m.intermediate(), stream)?;
+            let stacked = m.with_shared_expert().experts();
+            let gate_up = random.dense(stacked * 2 * m.intermediate(), h, stream)?;
+            let down = random.dense(stacked * h, m.intermediate(), stream)?;
             let moe = MoeWeights {
                 router: random.matrix(m.experts(), h, stream)?,
                 gate_up: Weight::Dense(gate_up),
                 down: Weight::Dense(down),
-                shared_gate_up: random.matrix(2 * m.shared_intermediate(), h, stream)?,
-                shared_down: random.matrix(h, m.shared_intermediate(), stream)?,
                 shared_gate: random.matrix(1, h, stream)?,
             };
             layers.push(LayerWeights {

@@ -9,8 +9,7 @@ use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit_kernels::gemm::{GemmTile, gemm, grouped_gemm};
 use firepit_kernels::gemv::{GemvTile, expert_gemv, gemv};
 use firepit_kernels::moe::{
-    ExpertSelection, MoeDims, PrefillLayout, PrefillPlan, combine, combine_prefill,
-    combine_prefill_view, gather_prefill,
+    ExpertSelection, MoeDims, PrefillLayout, PrefillPlan, combine, combine_prefill, gather_prefill,
 };
 use firepit_kernels::sink::Eager;
 use firepit_kernels::weights::{DenseMatrix, Weight};
@@ -72,10 +71,8 @@ fn padded_expert_gemm_smoke() -> Result<(), Box<dyn std::error::Error>> {
         tile,
     )
     .submit(&mut Eager(&stream))?;
-    let shared = api::zeros::<f32>(&[2, 32]).sync_on(&stream)?;
-    let gate = api::zeros::<f32>(&[2, 1]).sync_on(&stream)?;
     let mut output = api::zeros::<f32>(&[2, 32]).sync_on(&stream)?;
-    combine_prefill(output.partition([1, 32]), &routed, &plan, &shared, &gate).sync_on(&stream)?;
+    combine_prefill(output.partition([1, 32]), &routed, &plan).sync_on(&stream)?;
     let actual: Vec<f32> = output.to_host_vec().sync_on(&stream)?;
     assert!(actual.iter().all(|&value| (value - 32768.0).abs() < 1e-3));
     Ok(())
@@ -124,23 +121,18 @@ fn prefill_matches_tokenwise_decode() -> Result<(), Box<dyn std::error::Error>> 
         .map(|i| bf16::from_f32((i / (hidden * intermediate) + 1) as f32 / 2048.0))
         .collect();
     let router = DenseMatrix::upload(router_data, experts, hidden, &stream)?;
+    let stacked = dims.with_shared_expert();
+    let shared_gate_up = vec![bf16::from_f32(0.01); 2 * intermediate * hidden];
+    let shared_down = vec![bf16::from_f32(0.01); hidden * intermediate];
     let expert_gate = DenseMatrix::upload(
-        expert_gate_data,
-        experts * 2 * intermediate,
+        [expert_gate_data, shared_gate_up].concat(),
+        stacked.experts() * 2 * intermediate,
         hidden,
         &stream,
     )?;
-    let expert_down =
-        DenseMatrix::upload(expert_down_data, experts * hidden, intermediate, &stream)?;
-    let shared_gate_up = DenseMatrix::upload(
-        vec![bf16::from_f32(0.01); 2 * intermediate * hidden],
-        2 * intermediate,
-        hidden,
-        &stream,
-    )?;
-    let shared_down = DenseMatrix::upload(
-        vec![bf16::from_f32(0.01); hidden * intermediate],
-        hidden,
+    let expert_down = DenseMatrix::upload(
+        [expert_down_data, shared_down].concat(),
+        stacked.experts() * hidden,
         intermediate,
         &stream,
     )?;
@@ -158,8 +150,17 @@ fn prefill_matches_tokenwise_decode() -> Result<(), Box<dyn std::error::Error>> 
         tile,
     )
     .submit(&mut Eager(&stream))?;
+    let mut gate = api::zeros::<f32>(&[tile.m, 1]).sync_on(&stream)?;
+    gemm(
+        &shared_gate,
+        &x.view(&[tile.m, hidden])?,
+        gate.partition([tile.m, 1]),
+        GemmTile { n: 1, ..tile },
+    )
+    .submit(&mut Eager(&stream))?;
     let plan = PrefillPlan::top_k(
         &logits.slice(&[0..tokens, 0..experts])?,
+        &gate.slice(&[0..tokens, 0..1])?,
         &dims,
         tile.m,
         &stream,
@@ -200,46 +201,8 @@ fn prefill_matches_tokenwise_decode() -> Result<(), Box<dyn std::error::Error>> 
         tile,
     )
     .submit(&mut Eager(&stream))?;
-    let mut shared_projected = api::zeros::<f32>(&[tile.m, 2 * intermediate]).sync_on(&stream)?;
-    gemm(
-        &shared_gate_up,
-        &x.view(&[tile.m, hidden])?,
-        shared_projected.partition([tile.m, tile.n]),
-        tile,
-    )
-    .submit(&mut Eager(&stream))?;
-    let mut shared_activated = api::zeros::<f32>(&[tile.m, intermediate]).sync_on(&stream)?;
-    firepit_kernels::swiglu::swiglu(
-        shared_activated.partition([1, intermediate]),
-        &shared_projected,
-    )
-    .generics(vec![intermediate.to_string()])
-    .sync_on(&stream)?;
-    let mut shared = api::zeros::<f32>(&[tile.m, hidden]).sync_on(&stream)?;
-    gemm(
-        &shared_down,
-        &shared_activated.view(&[tile.m, intermediate])?,
-        shared.partition([tile.m, tile.n]),
-        tile,
-    )
-    .submit(&mut Eager(&stream))?;
-    let mut gate = api::zeros::<f32>(&[tile.m, 1]).sync_on(&stream)?;
-    gemm(
-        &shared_gate,
-        &x.view(&[tile.m, hidden])?,
-        gate.partition([tile.m, 1]),
-        GemmTile { n: 1, ..tile },
-    )
-    .submit(&mut Eager(&stream))?;
     let mut prefill = api::zeros::<f32>(&[tokens, hidden]).sync_on(&stream)?;
-    combine_prefill_view(
-        prefill.partition([1, hidden]),
-        &routed,
-        &plan,
-        &shared.slice(&[0..tokens, 0..hidden])?,
-        &gate.slice(&[0..tokens, 0..1])?,
-    )
-    .sync_on(&stream)?;
+    combine_prefill(prefill.partition([1, hidden]), &routed, &plan).sync_on(&stream)?;
     let prefill: Vec<f32> = prefill.to_host_vec().sync_on(&stream)?;
 
     let mut decode = Vec::new();
@@ -247,6 +210,7 @@ fn prefill_matches_tokenwise_decode() -> Result<(), Box<dyn std::error::Error>> 
         rows: 16,
         blocks: 1,
     };
+    let slots = stacked.top_k();
     for token in 0..tokens {
         let row = api::copy_host_vec_to_device(&Arc::new(
             x_host[token * hidden..(token + 1) * hidden].to_vec(),
@@ -262,8 +226,21 @@ fn prefill_matches_tokenwise_decode() -> Result<(), Box<dyn std::error::Error>> 
             gemv_tile,
         )
         .submit(&mut Eager(&stream))?;
-        let selection = ExpertSelection::top_k(&router_logits.view(&[experts])?, &dims, &stream)?;
-        let mut projected = api::zeros::<f32>(&[k, 2 * intermediate]).sync_on(&stream)?;
+        let mut gate_output = api::zeros::<f32>(&[1, 1]).sync_on(&stream)?;
+        gemv(
+            &Weight::Dense(shared_gate.clone()),
+            &view,
+            gate_output.partition([1, 1]),
+            GemvTile { rows: 1, blocks: 1 },
+        )
+        .submit(&mut Eager(&stream))?;
+        let selection = ExpertSelection::top_k(
+            &router_logits.view(&[experts])?,
+            &gate_output.view(&[1, 1])?,
+            &dims,
+            &stream,
+        )?;
+        let mut projected = api::zeros::<f32>(&[slots, 2 * intermediate]).sync_on(&stream)?;
         expert_gemv(
             &expert_gate,
             &view,
@@ -274,14 +251,14 @@ fn prefill_matches_tokenwise_decode() -> Result<(), Box<dyn std::error::Error>> 
             gemv_tile,
         )
         .sync_on(&stream)?;
-        let mut activated = api::zeros::<f32>(&[k, intermediate]).sync_on(&stream)?;
+        let mut activated = api::zeros::<f32>(&[slots, intermediate]).sync_on(&stream)?;
         firepit_kernels::swiglu::swiglu(activated.partition([1, intermediate]), &projected)
             .generics(vec![intermediate.to_string()])
             .sync_on(&stream)?;
-        let mut routed = api::zeros::<f32>(&[k, hidden]).sync_on(&stream)?;
+        let mut routed = api::zeros::<f32>(&[slots, hidden]).sync_on(&stream)?;
         expert_gemv(
             &expert_down,
-            &activated.view(&[k, 1, 32])?,
+            &activated.view(&[slots, 1, 32])?,
             &selection,
             routed.partition([1, gemv_tile.rows]),
             hidden,
@@ -289,46 +266,8 @@ fn prefill_matches_tokenwise_decode() -> Result<(), Box<dyn std::error::Error>> 
             gemv_tile,
         )
         .sync_on(&stream)?;
-        let mut shared_projected = api::zeros::<f32>(&[1, 2 * intermediate]).sync_on(&stream)?;
-        gemv(
-            &Weight::Dense(shared_gate_up.clone()),
-            &view,
-            shared_projected.partition([1, gemv_tile.rows]),
-            gemv_tile,
-        )
-        .submit(&mut Eager(&stream))?;
-        let mut shared_activated = api::zeros::<f32>(&[1, intermediate]).sync_on(&stream)?;
-        firepit_kernels::swiglu::swiglu(
-            shared_activated.partition([1, intermediate]),
-            &shared_projected,
-        )
-        .generics(vec![intermediate.to_string()])
-        .sync_on(&stream)?;
-        let mut shared_output = api::zeros::<f32>(&[1, hidden]).sync_on(&stream)?;
-        gemv(
-            &Weight::Dense(shared_down.clone()),
-            &shared_activated.view(&[1, 1, 32])?,
-            shared_output.partition([1, gemv_tile.rows]),
-            gemv_tile,
-        )
-        .submit(&mut Eager(&stream))?;
-        let mut gate_output = api::zeros::<f32>(&[1, 1]).sync_on(&stream)?;
-        gemv(
-            &Weight::Dense(shared_gate.clone()),
-            &view,
-            gate_output.partition([1, 1]),
-            GemvTile { rows: 1, blocks: 1 },
-        )
-        .submit(&mut Eager(&stream))?;
         let mut output = api::zeros::<f32>(&[1, hidden]).sync_on(&stream)?;
-        combine(
-            output.partition([1, hidden]),
-            &routed,
-            &selection,
-            &shared_output,
-            &gate_output,
-        )
-        .sync_on(&stream)?;
+        combine(output.partition([1, hidden]), &routed, &selection).sync_on(&stream)?;
         decode.extend(output.to_host_vec().sync_on(&stream)?);
     }
     let bound =
@@ -530,14 +469,28 @@ fn top_k_prefill_matches_decode() -> Result<(), Box<dyn std::error::Error>> {
     let logits = api::copy_host_vec_to_device(&Arc::new(scores.clone()))
         .reshape(&[7, 5])
         .sync_on(&stream)?;
-    let plan = PrefillPlan::top_k(&logits.view(&[7, 5])?, &dims, 16, &stream)?;
+    let gate_values: Vec<f32> = (0..7).map(|token| token as f32 / 3.0 - 1.0).collect();
+    let gates = api::copy_host_vec_to_device(&Arc::new(gate_values.clone()))
+        .reshape(&[7, 1])
+        .sync_on(&stream)?;
+    let plan = PrefillPlan::top_k(
+        &logits.view(&[7, 5])?,
+        &gates.view(&[7, 1])?,
+        &dims,
+        16,
+        &stream,
+    )?;
     let ids: Vec<i32> = plan.indices().dup().to_host_vec().sync_on(&stream)?;
     let weights: Vec<f32> = plan.weights().dup().to_host_vec().sync_on(&stream)?;
     for token in 0..7 {
         let row =
             api::copy_host_vec_to_device(&Arc::new(scores[token * 5..(token + 1) * 5].to_vec()))
                 .sync_on(&stream)?;
-        let decode = ExpertSelection::top_k(&row.view(&[5])?, &dims, &stream)?;
+        let gate = api::copy_host_vec_to_device(&Arc::new(vec![gate_values[token]]))
+            .reshape(&[1, 1])
+            .sync_on(&stream)?;
+        let decode =
+            ExpertSelection::top_k(&row.view(&[5])?, &gate.view(&[1, 1])?, &dims, &stream)?;
         let expected_ids: Vec<i32> = decode.indices().dup().to_host_vec().sync_on(&stream)?;
         let expected_weights: Vec<f32> = decode.weights().dup().to_host_vec().sync_on(&stream)?;
         assert_eq!(&ids[token * 4..token * 4 + 3], &expected_ids[..3]);
@@ -716,25 +669,43 @@ fn grouped_gemm_and_combine_oracle_pbt() {
                         );
                     }
                 }
-                let shared_gpu = api::copy_host_vec_to_device(&Arc::new(shared.clone()))
-                    .reshape(&[tokens, 32])
-                    .sync_on(&stream)
-                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                let gate = api::zeros::<f32>(&[tokens, 1])
+                let with_shared = dims.with_shared_expert();
+                let shared_expert = dims.experts() as i32;
+                let slot_ids: Vec<i32> = ids
+                    .chunks_exact(k)
+                    .flat_map(|row| row.iter().copied().chain([shared_expert]))
+                    .collect();
+                let slot_scores: Vec<f32> = scores
+                    .chunks_exact(k)
+                    .flat_map(|row| row.iter().copied().chain([0.5]))
+                    .collect();
+                let combined_plan =
+                    PrefillPlan::parse(&slot_ids, &slot_scores, &with_shared, 16, &stream)
+                        .map_err(fail)?;
+                let combined_rows = combined_plan.layout().padded_rows();
+                let mut combined_host = vec![0.0f32; combined_rows * 32];
+                for token in 0..tokens {
+                    for slot in 0..=k {
+                        let row = combined_plan.layout().inverse()[token * (k + 1) + slot] as usize;
+                        let source = if slot < k {
+                            let routed_row = plan.layout().inverse()[token * k + slot] as usize;
+                            &routed_host[routed_row * 32..(routed_row + 1) * 32]
+                        } else {
+                            &shared[token * 32..(token + 1) * 32]
+                        };
+                        combined_host[row * 32..(row + 1) * 32].copy_from_slice(source);
+                    }
+                }
+                let combined = api::copy_host_vec_to_device(&Arc::new(combined_host))
+                    .reshape(&[combined_rows, 32])
                     .sync_on(&stream)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 let mut output = api::zeros::<f32>(&[tokens, 32])
                     .sync_on(&stream)
                     .map_err(|e| TestCaseError::fail(e.to_string()))?;
-                combine_prefill(
-                    output.partition([1, 32]),
-                    &routed,
-                    &plan,
-                    &shared_gpu,
-                    &gate,
-                )
-                .sync_on(&stream)
-                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+                combine_prefill(output.partition([1, 32]), &combined, &combined_plan)
+                    .sync_on(&stream)
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
                 let actual: Vec<f32> = output
                     .to_host_vec()
                     .sync_on(&stream)

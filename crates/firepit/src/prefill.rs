@@ -2,9 +2,7 @@ use crate::Result;
 use crate::checkpoint::Stream;
 #[cfg(feature = "testing")]
 use crate::engine::RoutingLayerTrace;
-use crate::execute::{
-    input_output, three_inputs_output, two_inputs_output, weight, weight_gemv_tile,
-};
+use crate::execute::{input_output, two_inputs_output, weight, weight_gemv_tile};
 use crate::model::{MixerWeights, Model};
 use crate::plan::{NormName, Op, Slot, StepPlan, WeightName};
 use crate::session::{GdnStateLayout, LayerState, Session};
@@ -245,7 +243,11 @@ impl PrefillPlan {
             return Err("scored rows exceed padded sequence".into());
         }
         let m = model.dims.moe();
-        let max_moe_rows = MoePrefillLayout::max_padded_rows(len, &m, DEFAULT_GROUPED_GEMM_TILE.m)?;
+        let max_moe_rows = MoePrefillLayout::max_padded_rows(
+            len,
+            &m.with_shared_expert(),
+            DEFAULT_GROUPED_GEMM_TILE.m,
+        )?;
         let mut ops = Vec::new();
         for op in StepPlan::ops(model) {
             match op {
@@ -318,7 +320,7 @@ impl PrefillPlan {
         } else {
             (None, None)
         };
-        let top_width = model.dims.moe().top_k().next_power_of_two();
+        let top_width = m.with_shared_expert().width();
         let top_ids = api::zeros::<i32>(&[len, top_width]).sync_on(stream)?;
         let top_weights = api::zeros::<f32>(&[len, top_width]).sync_on(stream)?;
         Ok(Self {
@@ -474,7 +476,7 @@ pub(crate) fn run_routing_observed(
                         .to_host_vec()
                         .sync_on(stream)?;
                     let ids: Vec<i32> = plan.top_ids.dup().to_host_vec().sync_on(stream)?;
-                    let width = top_k.next_power_of_two();
+                    let width = model.dims.moe().with_shared_expert().width();
                     let mut trace = RoutingLayerTrace::default();
                     trace.router_logits = logits
                         .chunks_exact(experts)
@@ -591,7 +593,7 @@ pub(crate) fn run_isolated_layer(
         |op, plan| {
             match op {
                 PrefillOp::TopK => {
-                    let width = model.dims.moe().top_k().next_power_of_two();
+                    let width = model.dims.moe().with_shared_expert().width();
                     let ids: Vec<i32> = plan.top_ids.dup().to_host_vec().sync_on(stream)?;
                     trace.selected =
                         ids[last * width..last * width + model.dims.moe().top_k()].to_vec();
@@ -869,14 +871,6 @@ fn run_inner(
                     sink.run(
                         swiglu::swiglu(y.partition([1, m.intermediate()]), &x)
                             .generics(vec![m.intermediate().to_string()]),
-                    )?;
-                }
-                PrefillOp::Kernel(Op::SharedSwiglu) => {
-                    let (source, target) =
-                        input_output(&mut plan.buffers, Slot::SharedUp, Slot::SharedAct);
-                    sink.run(
-                        swiglu::swiglu(target.partition([1, m.shared_intermediate()]), source)
-                            .generics(vec![m.shared_intermediate().to_string()]),
                     )?;
                 }
                 PrefillOp::Kernel(Op::Add { input, delta, out }) => {
@@ -1167,11 +1161,14 @@ fn run_special(
         }
         PrefillOp::TopK => {
             let logits = plan.buffers[Slot::Router.index()].slice(&[0..len, 0..m.experts()])?;
+            let gate = plan.buffers[Slot::SharedGate.index()].slice(&[0..len, 0..1])?;
+            let width = m.with_shared_expert().width();
             sink.run(
                 moe::top_k_prefill(
                     &logits,
-                    (&mut plan.top_ids).partition([1, m.top_k().next_power_of_two()]),
-                    (&mut plan.top_weights).partition([1, m.top_k().next_power_of_two()]),
+                    &gate,
+                    (&mut plan.top_ids).partition([1, width]),
+                    (&mut plan.top_weights).partition([1, width]),
                     m.experts() as i32,
                     m.top_k() as i32,
                 )
@@ -1179,19 +1176,24 @@ fn run_special(
             )?;
         }
         PrefillOp::HostSort => {
+            let selected = m.with_shared_expert();
             let ids = plan.top_ids.dup().to_host_vec().sync_on(stream)?;
             let weights = plan.top_weights.dup().to_host_vec().sync_on(stream)?;
-            let top_width = m.top_k().next_power_of_two();
             let ids: Vec<i32> = ids
-                .chunks_exact(top_width)
-                .flat_map(|row| row[..m.top_k()].iter().copied())
+                .chunks_exact(selected.width())
+                .flat_map(|row| row[..selected.top_k()].iter().copied())
                 .collect();
             let weights: Vec<f32> = weights
-                .chunks_exact(top_width)
-                .flat_map(|row| row[..m.top_k()].iter().copied())
+                .chunks_exact(selected.width())
+                .flat_map(|row| row[..selected.top_k()].iter().copied())
                 .collect();
-            let layout =
-                MoePrefillPlan::parse(&ids, &weights, &m, DEFAULT_GROUPED_GEMM_TILE.m, stream)?;
+            let layout = MoePrefillPlan::parse(
+                &ids,
+                &weights,
+                &selected,
+                DEFAULT_GROUPED_GEMM_TILE.m,
+                stream,
+            )?;
             let count = layout.layout().padded_rows();
             if count > plan.moe_sorted.shape()[0] as usize {
                 return Err("MoE padded rows exceed prefill buffer capacity".into());
@@ -1289,22 +1291,12 @@ fn run_special(
         }
         PrefillOp::Combine => {
             let layout = plan.moe.as_ref().ok_or("missing MoE layout")?;
-            let (routed, shared, gate, target) = three_inputs_output(
-                &mut plan.buffers,
-                Slot::ExpertOut,
-                Slot::Shared,
-                Slot::SharedGate,
-                Slot::MoeDelta,
-            );
-            let shared = shared.slice(&[0..len, 0..d.hidden()])?;
-            let gate = gate.slice(&[0..len, 0..1])?;
+            let (routed, target) = input_output(&mut plan.buffers, Slot::ExpertOut, Slot::MoeDelta);
             let routed = routed.slice(&[0..layout.layout().padded_rows(), 0..d.hidden()])?;
             sink.run(moe::combine_prefill_sliced(
                 target.partition([1, d.hidden()]),
                 &routed,
                 layout,
-                &shared,
-                &gate,
             ))?;
         }
         PrefillOp::Kernel(_) => unreachable!(),

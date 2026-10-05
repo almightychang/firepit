@@ -16,11 +16,50 @@ fn top_k_gpu_smoke() -> Result<(), Box<dyn std::error::Error>> {
     let stream = device.new_stream()?;
     let logits = api::copy_host_vec_to_device(&Arc::new(vec![0.2f32, 2.0, -1.0, 1.0, 3.0]))
         .sync_on(&stream)?;
-    let selection = ExpertSelection::top_k(&logits.view(&[dims.experts()])?, &dims, &stream)?;
+    let gate = shared_gate(&stream, 0.0)?;
+    let selection = ExpertSelection::top_k(
+        &logits.view(&[dims.experts()])?,
+        &gate.view(&[1, 1])?,
+        &dims,
+        &stream,
+    )?;
     let ids: Vec<i32> = selection.indices().dup().to_host_vec().sync_on(&stream)?;
     let weights: Vec<f32> = selection.weights().dup().to_host_vec().sync_on(&stream)?;
     assert_eq!(&ids[..dims.top_k()], &[4, 1, 3]);
-    assert!((weights.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    assert!((weights[..dims.top_k()].iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    Ok(())
+}
+
+fn shared_gate(
+    stream: &Arc<cuda_core::Stream>,
+    value: f32,
+) -> Result<cutile::tensor::Tensor<f32>, Box<dyn std::error::Error>> {
+    Ok(api::copy_host_vec_to_device(&Arc::new(vec![value]))
+        .reshape(&[1, 1])
+        .sync_on(stream)?)
+}
+
+#[test]
+fn top_k_appends_the_shared_expert_as_the_last_slot() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let dims = MoeDims::new(32, 32, 32, 5, 3)?;
+    let logits = api::copy_host_vec_to_device(&Arc::new(vec![0.2f32, 2.0, -1.0, 1.0, 3.0]))
+        .sync_on(&stream)?;
+    for value in [-6.0f32, -0.5, 0.0, 1.25, 9.0] {
+        let gate = shared_gate(&stream, value)?;
+        let selection = ExpertSelection::top_k(
+            &logits.view(&[dims.experts()])?,
+            &gate.view(&[1, 1])?,
+            &dims,
+            &stream,
+        )?;
+        let ids: Vec<i32> = selection.indices().dup().to_host_vec().sync_on(&stream)?;
+        let weights: Vec<f32> = selection.weights().dup().to_host_vec().sync_on(&stream)?;
+        let sigmoid = 1.0 / (1.0 + (-(value as f64)).exp());
+        assert_eq!(&ids[..=dims.top_k()], &[4, 1, 3, dims.experts() as i32]);
+        assert!(((weights[dims.top_k()] as f64 - sigmoid) / sigmoid).abs() < 1e-6);
+        assert!((weights[..dims.top_k()].iter().sum::<f32>() - 1.0).abs() < 1e-6);
+    }
     Ok(())
 }
 
@@ -94,20 +133,14 @@ fn combine_gpu_smoke() -> Result<(), Box<dyn std::error::Error>> {
     let device = Device::new(0)?;
     let stream = device.new_stream()?;
     let routed = api::copy_host_vec_to_device(&Arc::new(
-        vec![1.0f32; 32].into_iter().chain(vec![3.0; 32]).collect(),
+        [vec![1.0f32; 32], vec![3.0; 32], vec![2.0; 32]].concat(),
     ))
-    .reshape(&[2, 32])
+    .reshape(&[3, 32])
     .sync_on(&stream)?;
-    let dims = MoeDims::new(32, 32, 32, 2, 2)?;
-    let selection = ExpertSelection::parse(&[0, 1], &[0.25, 0.75], &dims, &stream)?;
-    let shared = api::copy_host_vec_to_device(&Arc::new(vec![2.0f32; 32]))
-        .reshape(&[1, 32])
-        .sync_on(&stream)?;
-    let gate = api::copy_host_vec_to_device(&Arc::new(vec![0.0f32]))
-        .reshape(&[1, 1])
-        .sync_on(&stream)?;
+    let dims = MoeDims::new(32, 32, 32, 2, 2)?.with_shared_expert();
+    let selection = ExpertSelection::parse(&[0, 1, 2], &[0.25, 0.75, 0.5], &dims, &stream)?;
     let mut out = api::zeros::<f32>(&[1, 32]).sync_on(&stream)?;
-    combine(out.partition([1, 32]), &routed, &selection, &shared, &gate).sync_on(&stream)?;
+    combine(out.partition([1, 32]), &routed, &selection).sync_on(&stream)?;
     let actual: Vec<f32> = out.to_host_vec().sync_on(&stream)?;
     assert!(actual.iter().all(|v| (v - 3.5).abs() < 1e-6));
     Ok(())
@@ -131,7 +164,13 @@ fn select_gpu(
 ) -> Result<(Vec<i32>, Vec<f32>), Box<dyn std::error::Error>> {
     let dims = MoeDims::new(32, 32, 32, logits.len(), k)?;
     let x = api::copy_host_vec_to_device(&Arc::new(logits.to_vec())).sync_on(stream)?;
-    let selection = ExpertSelection::top_k(&x.view(&[logits.len()])?, &dims, stream)?;
+    let gate = shared_gate(stream, 0.0)?;
+    let selection = ExpertSelection::top_k(
+        &x.view(&[logits.len()])?,
+        &gate.view(&[1, 1])?,
+        &dims,
+        stream,
+    )?;
     let mut ids: Vec<i32> = selection.indices().dup().to_host_vec().sync_on(stream)?;
     let mut weights: Vec<f32> = selection.weights().dup().to_host_vec().sync_on(stream)?;
     ids.truncate(k);
@@ -314,36 +353,26 @@ fn combine_matches_f64_oracle() {
     });
     common::runner(64, file!())
         .run(&cases, |((h, k), routed, weights, shared, gate)| {
-            let routed_gpu = api::copy_host_vec_to_device(&Arc::new(routed.clone()))
-                .reshape(&[k, h])
+            let rows: Vec<f32> = [routed.as_slice(), shared.as_slice()].concat();
+            let routed_gpu = api::copy_host_vec_to_device(&Arc::new(rows))
+                .reshape(&[k + 1, h])
                 .sync_on(&stream)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
             let scores: Vec<f32> = weights.iter().map(|&weight| weight.abs() + 1.0).collect();
-            let dims =
-                MoeDims::new(h, 32, 32, k, k).map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let ids: Vec<i32> = (0..k as i32).collect();
-            let selection = ExpertSelection::parse(&ids, &scores, &dims, &stream)
-                .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let shared_gpu = api::copy_host_vec_to_device(&Arc::new(shared.clone()))
-                .reshape(&[1, h])
-                .sync_on(&stream)
-                .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            let gate_gpu = api::copy_host_vec_to_device(&Arc::new(gate.clone()))
-                .reshape(&[1, 1])
-                .sync_on(&stream)
+            let dims = MoeDims::new(h, 32, 32, k, k)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?
+                .with_shared_expert();
+            let ids: Vec<i32> = (0..=k as i32).collect();
+            let shared_weight = 1.0 / (1.0 + (-gate[0]).exp());
+            let slot_weights = [scores.as_slice(), &[shared_weight]].concat();
+            let selection = ExpertSelection::parse(&ids, &slot_weights, &dims, &stream)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
             let mut out = api::zeros::<f32>(&[1, h])
                 .sync_on(&stream)
                 .map_err(|e| TestCaseError::fail(e.to_string()))?;
-            combine(
-                out.partition([1, h]),
-                &routed_gpu,
-                &selection,
-                &shared_gpu,
-                &gate_gpu,
-            )
-            .sync_on(&stream)
-            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            combine(out.partition([1, h]), &routed_gpu, &selection)
+                .sync_on(&stream)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
             let got: Vec<f32> = out
                 .to_host_vec()
                 .sync_on(&stream)

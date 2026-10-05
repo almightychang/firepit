@@ -39,6 +39,8 @@ fn measure(stream: &Arc<Stream>, dims: MoeDims, tokens: usize) -> Result<(), Box
         dims.experts(),
         dims.top_k(),
     );
+    let selected = dims.with_shared_expert();
+    let (stacked, slots) = (selected.experts(), selected.top_k());
     let router_tile = DEFAULT_GEMM_TILE;
     let tile = DEFAULT_GROUPED_GEMM_TILE;
     let padded_tokens = tokens.div_ceil(router_tile.m) * router_tile.m;
@@ -53,12 +55,17 @@ fn measure(stream: &Arc<Stream>, dims: MoeDims, tokens: usize) -> Result<(), Box
         .collect();
     let router = DenseMatrix::upload(router_data, e, h, stream)?;
     let gate_up = DenseMatrix::upload(
-        vec![bf16::from_f32(0.01); e * 2 * i * h],
-        e * 2 * i,
+        vec![bf16::from_f32(0.01); stacked * 2 * i * h],
+        stacked * 2 * i,
         h,
         stream,
     )?;
-    let down = DenseMatrix::upload(vec![bf16::from_f32(0.01); e * h * i], e * h, i, stream)?;
+    let down = DenseMatrix::upload(
+        vec![bf16::from_f32(0.01); stacked * h * i],
+        stacked * h,
+        i,
+        stream,
+    )?;
     let mut logits = api::zeros::<f32>(&[padded_tokens, e]).sync_on(stream)?;
     let router_ms = do_bench(stream, &BenchOptions::default(), |stream| {
         gemm(
@@ -72,12 +79,14 @@ fn measure(stream: &Arc<Stream>, dims: MoeDims, tokens: usize) -> Result<(), Box
     })?
     .median_ms();
     let logits_view = logits.slice(&[0..tokens, 0..e])?;
-    let top_width = k.next_power_of_two();
+    let gate = api::zeros::<f32>(&[tokens, 1]).sync_on(stream)?;
+    let top_width = selected.width();
     let mut ids = api::zeros::<i32>(&[tokens, top_width]).sync_on(stream)?;
     let mut scores = api::zeros::<f32>(&[tokens, top_width]).sync_on(stream)?;
     let top_ms = do_bench(stream, &BenchOptions::default(), |stream| {
         top_k_prefill(
             &logits_view,
+            &gate,
             ids.partition([1, top_width]),
             scores.partition([1, top_width]),
             e as i32,
@@ -93,22 +102,22 @@ fn measure(stream: &Arc<Stream>, dims: MoeDims, tokens: usize) -> Result<(), Box
     let host_scores: Vec<f32> = scores.dup().to_host_vec().sync_on(stream)?;
     let flat_ids: Vec<i32> = host_ids
         .chunks_exact(top_width)
-        .flat_map(|row| row[..k].iter().copied())
+        .flat_map(|row| row[..slots].iter().copied())
         .collect();
     let flat_scores: Vec<f32> = host_scores
         .chunks_exact(top_width)
-        .flat_map(|row| row[..k].iter().copied())
+        .flat_map(|row| row[..slots].iter().copied())
         .collect();
     let mut sort_times = Vec::new();
     for _ in 0..9 {
         let start = Instant::now();
-        let layout = PrefillLayout::parse(&flat_ids, &flat_scores, &dims, tile.m)?;
+        let layout = PrefillLayout::parse(&flat_ids, &flat_scores, &selected, tile.m)?;
         std::hint::black_box(layout);
         sort_times.push(start.elapsed().as_secs_f64() * 1e3);
     }
     sort_times.sort_by(f64::total_cmp);
     let sort_ms = sort_times[sort_times.len() / 2];
-    let plan = PrefillPlan::parse(&flat_ids, &flat_scores, &dims, tile.m, stream)?;
+    let plan = PrefillPlan::parse(&flat_ids, &flat_scores, &selected, tile.m, stream)?;
     let rows = plan.layout().padded_rows();
     let mut sorted = api::zeros::<f32>(&[rows, h]).sync_on(stream)?;
     let gather_ms = do_bench(stream, &BenchOptions::default(), |stream| {
@@ -160,11 +169,9 @@ fn measure(stream: &Arc<Stream>, dims: MoeDims, tokens: usize) -> Result<(), Box
         .map_err(Into::into)
     })?
     .median_ms();
-    let shared = api::zeros::<f32>(&[tokens, h]).sync_on(stream)?;
-    let gate = api::zeros::<f32>(&[tokens, 1]).sync_on(stream)?;
     let mut output = api::zeros::<f32>(&[tokens, h]).sync_on(stream)?;
     let combine_ms = do_bench(stream, &BenchOptions::default(), |stream| {
-        combine_prefill(output.partition([1, h]), &routed, &plan, &shared, &gate)
+        combine_prefill(output.partition([1, h]), &routed, &plan)
             .sync_on(stream)
             .map(|_| ())
             .map_err(Into::into)

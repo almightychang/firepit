@@ -15,6 +15,7 @@ mod kernels {
     #[cutile::entry()]
     pub fn top_k_prefill<const SIZE: i32, const TOP: i32>(
         logits: &Tensor<f32, { [-1, -1] }>,
+        shared_gate: &Tensor<f32, { [-1, 1] }>,
         indices: &mut Tensor<i32, { [1, TOP] }>,
         weights: &mut Tensor<f32, { [1, TOP] }>,
         experts: i32,
@@ -54,8 +55,16 @@ mod kernels {
             let chosen: Tile<bool, { [SIZE] }> = eq_tile(positions, winner.broadcast(shape![SIZE]));
             remaining = select(chosen, negative, remaining);
         }
-        indices.store(selected_ids.reshape(shape![1, TOP]));
-        weights.store((selected_scores / total.broadcast(shape![TOP])).reshape(shape![1, TOP]));
+        let gate: Tile<f32, { [1, 1] }> = shared_gate.partition(shape![1, 1]).load([pid.0, 0]);
+        let one: Tile<f32, { [1] }> = constant(1.0f32, shape![1]);
+        let gate: Tile<f32, { [1] }> = gate.reshape(shape![1]);
+        let sigmoid: Tile<f32, { [1] }> = one / (one + exp(gate * constant(-1.0f32, shape![1])));
+        let shared: Tile<bool, { [TOP] }> = eq_tile(ranks, k.broadcast(shape![TOP]));
+        let ids = select(shared, experts.broadcast(shape![TOP]), selected_ids);
+        let routed = selected_scores / total.broadcast(shape![TOP]);
+        let scores = select(shared, sigmoid.broadcast(shape![TOP]), routed);
+        indices.store(ids.reshape(shape![1, TOP]));
+        weights.store(scores.reshape(shape![1, TOP]));
     }
 
     #[cutile::entry()]
@@ -85,13 +94,11 @@ mod kernels {
         routed: &Tensor<f32, { [-1, H] }>,
         inverse: &Tensor<i32, { [-1, -1] }>,
         weights: &Tensor<f32, { [-1, -1] }>,
-        shared: &Tensor<f32, { [-1, H] }>,
-        gate: &Tensor<f32, { [-1, 1] }>,
-        k: i32,
+        slots: i32,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
         let mut sum: Tile<f32, { [1, H] }> = constant(0.0f32, shape![1, H]);
-        for rank in 0i32..k {
+        for rank in 0i32..slots {
             let location: Tile<i32, { [1, 1] }> =
                 inverse.partition(shape![1, 1]).load([pid.0, rank]);
             let row: i32 = tile_to_scalar(location.reshape(shape![]));
@@ -99,11 +106,7 @@ mod kernels {
             let weight: Tile<f32, { [1, 1] }> = weights.partition(shape![1, 1]).load([pid.0, rank]);
             sum = sum + value * weight.broadcast(shape![1, H]);
         }
-        let shared: Tile<f32, { [1, H] }> = shared.partition(shape![1, H]).load([pid.0, 0]);
-        let gate: Tile<f32, { [1, 1] }> = gate.partition(shape![1, 1]).load([pid.0, 0]);
-        let one: Tile<f32, { [1, 1] }> = constant(1.0f32, shape![1, 1]);
-        let sigmoid = one / (one + exp(gate * constant(-1.0f32, shape![1, 1])));
-        out.store(sum + shared * sigmoid.broadcast(shape![1, H]));
+        out.store(sum);
     }
 }
 
@@ -120,7 +123,7 @@ impl std::fmt::Display for MoeDimensionError {
 
 impl std::error::Error for MoeDimensionError {}
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MoeDims {
     hidden: usize,
     intermediate: usize,
@@ -139,7 +142,7 @@ impl MoeDims {
     ) -> Result<Self, MoeDimensionError> {
         if hidden == 0
             || intermediate == 0
-            || shared_intermediate == 0
+            || shared_intermediate != intermediate
             || experts == 0
             || top_k == 0
             || top_k > experts
@@ -153,17 +156,19 @@ impl MoeDims {
                 .checked_mul(2)
                 .is_none_or(|n| n > i32::MAX as usize)
             || experts
-                .checked_next_power_of_two()
+                .checked_add(1)
+                .and_then(usize::checked_next_power_of_two)
                 .is_none_or(|n| n > i32::MAX as usize)
             || top_k
-                .checked_next_power_of_two()
+                .checked_add(1)
+                .and_then(usize::checked_next_power_of_two)
                 .is_none_or(|n| n > i32::MAX as usize)
             || hidden
-                .checked_mul(experts)
+                .checked_mul(experts + 1)
                 .is_none_or(|n| n > i32::MAX as usize)
             || intermediate
                 .checked_mul(2)
-                .and_then(|n| n.checked_mul(experts))
+                .and_then(|n| n.checked_mul(experts + 1))
                 .is_none_or(|n| n > i32::MAX as usize)
         {
             return Err(MoeDimensionError);
@@ -177,11 +182,23 @@ impl MoeDims {
         })
     }
 
+    pub fn with_shared_expert(self) -> Self {
+        Self {
+            experts: self.experts + 1,
+            top_k: self.top_k + 1,
+            ..self
+        }
+    }
+
     pub fn top_k_generics(self) -> Vec<String> {
         vec![
             self.experts.next_power_of_two().to_string(),
-            self.top_k.next_power_of_two().to_string(),
+            self.with_shared_expert().width().to_string(),
         ]
+    }
+
+    pub fn width(self) -> usize {
+        self.top_k.next_power_of_two()
     }
     pub fn combine_generics(self) -> Vec<String> {
         vec![self.hidden.to_string()]
@@ -233,7 +250,7 @@ impl ExpertSelection {
         dims: &MoeDims,
         stream: &Arc<cuda_core::Stream>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let padded = dims.top_k.next_power_of_two();
+        let padded = dims.width();
         Ok(Self {
             indices: api::zeros::<i32>(&[1, padded]).sync_on(stream)?,
             weights: api::zeros::<f32>(&[1, padded]).sync_on(stream)?,
@@ -246,33 +263,38 @@ impl ExpertSelection {
 
     pub fn select(
         &mut self,
+        router: &MoeDims,
         logits: &TensorView<'_, f32>,
+        shared_gate: &TensorView<'_, f32>,
         sink: &mut impl Sink,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        assert_eq!(logits.shape(), &[self.dims.experts as i32]);
-        let padded = self.dims.top_k.next_power_of_two();
-        let rows = logits.view(&[1, self.dims.experts])?;
+        assert_eq!(self.dims, router.with_shared_expert());
+        assert_eq!(logits.shape(), &[router.experts as i32]);
+        assert_eq!(shared_gate.shape(), &[1, 1]);
+        let width = self.dims.width();
+        let rows = logits.view(&[1, router.experts])?;
         sink.run(
             kernels::top_k_prefill(
                 &rows,
-                self.indices.partition([1, padded]),
-                self.weights.partition([1, padded]),
-                self.dims.experts as i32,
-                self.dims.top_k as i32,
+                shared_gate,
+                self.indices.partition([1, width]),
+                self.weights.partition([1, width]),
+                router.experts as i32,
+                router.top_k as i32,
             )
-            .generics(self.dims.top_k_generics()),
+            .generics(router.top_k_generics()),
         )?;
         Ok(())
     }
 
     pub fn top_k(
         logits: &TensorView<'_, f32>,
-        dims: &MoeDims,
+        shared_gate: &TensorView<'_, f32>,
+        router: &MoeDims,
         stream: &Arc<cuda_core::Stream>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        assert_eq!(logits.shape(), &[dims.experts as i32]);
-        let mut selection = Self::empty(dims, stream)?;
-        selection.select(logits, &mut crate::sink::Eager(stream))?;
+        let mut selection = Self::empty(&router.with_shared_expert(), stream)?;
+        selection.select(router, logits, shared_gate, &mut crate::sink::Eager(stream))?;
         Ok(selection)
     }
 
@@ -303,7 +325,7 @@ impl ExpertSelection {
         {
             return Err(ExpertSelectionError::Weight.into());
         }
-        let padded = dims.top_k.next_power_of_two();
+        let padded = dims.width();
         let mut padded_indices = indices.to_vec();
         padded_indices.resize(padded, 0);
         let mut padded_weights = weights.to_vec();
@@ -417,7 +439,7 @@ impl PrefillLayout {
         }
         let tokens = indices.len() / dims.top_k;
         if tokens
-            .checked_mul(dims.top_k.next_power_of_two())
+            .checked_mul(dims.width())
             .is_none_or(|len| len > i32::MAX as usize)
         {
             return Err(ExpertSelectionError::Count);
@@ -517,16 +539,22 @@ pub struct PrefillPlan {
 impl PrefillPlan {
     pub fn top_k(
         logits: &TensorView<'_, f32>,
-        dims: &MoeDims,
+        shared_gate: &TensorView<'_, f32>,
+        router: &MoeDims,
         tile_rows: usize,
         stream: &Arc<cuda_core::Stream>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let shape = logits.shape();
-        if shape.len() != 2 || shape[0] <= 0 || shape[1] != dims.experts as i32 {
+        if shape.len() != 2
+            || shape[0] <= 0
+            || shape[1] != router.experts as i32
+            || shared_gate.shape() != [shape[0], 1]
+        {
             return Err(ExpertSelectionError::Count.into());
         }
+        let dims = &router.with_shared_expert();
         let tokens = shape[0] as usize;
-        let padded = dims.top_k.next_power_of_two();
+        let padded = dims.width();
         if tokens
             .checked_mul(padded)
             .is_none_or(|len| len > i32::MAX as usize)
@@ -537,13 +565,14 @@ impl PrefillPlan {
         let mut weights = api::zeros::<f32>(&[tokens, padded]).sync_on(stream)?;
         let host: Vec<i32> = kernels::top_k_prefill(
             logits,
+            shared_gate,
             indices.partition([1, padded]),
             weights.partition([1, padded]),
-            dims.experts as i32,
-            dims.top_k as i32,
+            router.experts as i32,
+            router.top_k as i32,
         )
-        .generics(dims.top_k_generics())
-        .then(|(_, ids, _, _, _)| ids.unpartition().dup().to_host_vec())
+        .generics(router.top_k_generics())
+        .then(|(_, _, ids, _, _, _)| ids.unpartition().dup().to_host_vec())
         .sync_on(stream)?;
         let ids: Vec<i32> = host
             .chunks_exact(padded)
@@ -561,7 +590,7 @@ impl PrefillPlan {
         stream: &Arc<cuda_core::Stream>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         let layout = PrefillLayout::parse(indices, weights, dims, tile_rows)?;
-        let padded = dims.top_k.next_power_of_two();
+        let padded = dims.width();
         let mut ids = vec![0; layout.tokens * padded];
         let mut scores = vec![0.0; layout.tokens * padded];
         for token in 0..layout.tokens {
@@ -591,10 +620,9 @@ impl PrefillPlan {
             .inverse
             .chunks_exact(dims.top_k)
             .flat_map(|row| {
-                row.iter().copied().chain(std::iter::repeat_n(
-                    0,
-                    dims.top_k.next_power_of_two() - dims.top_k,
-                ))
+                row.iter()
+                    .copied()
+                    .chain(std::iter::repeat_n(0, dims.width() - dims.top_k))
             })
             .collect();
         Ok(Self {
@@ -602,7 +630,7 @@ impl PrefillPlan {
             token_rows: upload(layout.token_rows.clone())?,
             tile_experts: upload(layout.tile_experts.clone())?,
             inverse: api::copy_host_vec_to_device(&Arc::new(inverse))
-                .reshape(&[layout.tokens, dims.top_k.next_power_of_two()])
+                .reshape(&[layout.tokens, dims.width()])
                 .sync_on(stream)?,
             layout,
             indices,
@@ -693,15 +721,11 @@ pub fn combine_prefill<'a>(
     out: Partition<&'a mut Tensor<f32>>,
     routed: &'a Tensor<f32>,
     plan: &'a PrefillPlan,
-    shared: &'a Tensor<f32>,
-    gate: &'a Tensor<f32>,
 ) -> impl DeviceOp<
     Output = (
         Partition<&'a mut Tensor<f32>>,
         &'a Tensor<f32>,
         &'a Tensor<i32>,
-        &'a Tensor<f32>,
-        &'a Tensor<f32>,
         &'a Tensor<f32>,
         i32,
     ),
@@ -713,78 +737,20 @@ pub fn combine_prefill<'a>(
         routed.shape(),
         &[plan.layout.padded_rows() as i32, dims.hidden as i32]
     );
-    assert_eq!(
-        shared.shape(),
-        &[plan.layout.tokens as i32, dims.hidden as i32]
-    );
-    assert_eq!(gate.shape(), &[plan.layout.tokens as i32, 1]);
-    kernels::combine_prefill_kernel(
-        out,
-        routed,
-        &plan.inverse,
-        &plan.weights,
-        shared,
-        gate,
-        dims.top_k as i32,
-    )
-    .generics(dims.combine_generics())
-}
-
-pub fn combine_prefill_view<'a>(
-    out: Partition<&'a mut Tensor<f32>>,
-    routed: &'a Tensor<f32>,
-    plan: &'a PrefillPlan,
-    shared: &'a TensorView<'a, f32>,
-    gate: &'a TensorView<'a, f32>,
-) -> impl DeviceOp<
-    Output = (
-        Partition<&'a mut Tensor<f32>>,
-        &'a Tensor<f32>,
-        &'a Tensor<i32>,
-        &'a Tensor<f32>,
-        &'a TensorView<'a, f32>,
-        &'a TensorView<'a, f32>,
-        i32,
-    ),
-> + GraphNode
-+ 'a {
-    let dims = plan.dims;
-    assert_eq!(out.partition_shape, vec![1, dims.hidden]);
-    assert_eq!(
-        routed.shape(),
-        &[plan.layout.padded_rows() as i32, dims.hidden as i32]
-    );
-    assert_eq!(
-        shared.shape(),
-        &[plan.layout.tokens as i32, dims.hidden as i32]
-    );
-    assert_eq!(gate.shape(), &[plan.layout.tokens as i32, 1]);
-    kernels::combine_prefill_kernel(
-        out,
-        routed,
-        &plan.inverse,
-        &plan.weights,
-        shared,
-        gate,
-        dims.top_k as i32,
-    )
-    .generics(dims.combine_generics())
+    kernels::combine_prefill_kernel(out, routed, &plan.inverse, &plan.weights, dims.top_k as i32)
+        .generics(dims.combine_generics())
 }
 
 pub fn combine_prefill_sliced<'a>(
     out: Partition<&'a mut Tensor<f32>>,
     routed: &'a TensorView<'a, f32>,
     plan: &'a PrefillPlan,
-    shared: &'a TensorView<'a, f32>,
-    gate: &'a TensorView<'a, f32>,
 ) -> impl DeviceOp<
     Output = (
         Partition<&'a mut Tensor<f32>>,
         &'a TensorView<'a, f32>,
         &'a Tensor<i32>,
         &'a Tensor<f32>,
-        &'a TensorView<'a, f32>,
-        &'a TensorView<'a, f32>,
         i32,
     ),
 > + GraphNode
@@ -795,52 +761,32 @@ pub fn combine_prefill_sliced<'a>(
         routed.shape(),
         &[plan.layout.padded_rows() as i32, dims.hidden as i32]
     );
-    assert_eq!(
-        shared.shape(),
-        &[plan.layout.tokens as i32, dims.hidden as i32]
-    );
-    assert_eq!(gate.shape(), &[plan.layout.tokens as i32, 1]);
-    kernels::combine_prefill_kernel(
-        out,
-        routed,
-        &plan.inverse,
-        &plan.weights,
-        shared,
-        gate,
-        dims.top_k as i32,
-    )
-    .generics(dims.combine_generics())
+    kernels::combine_prefill_kernel(out, routed, &plan.inverse, &plan.weights, dims.top_k as i32)
+        .generics(dims.combine_generics())
 }
 
 pub fn combine<'a>(
     out: Partition<&'a mut Tensor<f32>>,
     routed: &'a Tensor<f32>,
     selection: &'a ExpertSelection,
-    shared: &'a Tensor<f32>,
-    gate: &'a Tensor<f32>,
 ) -> impl DeviceOp<
     Output = (
         Partition<&'a mut Tensor<f32>>,
         &'a Tensor<f32>,
         &'a Tensor<i32>,
         &'a Tensor<f32>,
-        &'a Tensor<f32>,
-        &'a Tensor<f32>,
         i32,
     ),
 > + GraphNode
 + 'a {
     let dims = selection.dims;
+    assert_eq!(out.partition_shape, vec![1, dims.hidden]);
     assert_eq!(routed.shape(), &[dims.top_k as i32, dims.hidden as i32]);
-    assert_eq!(shared.shape(), &[1, dims.hidden as i32]);
-    assert_eq!(gate.shape(), &[1, 1]);
     kernels::combine_prefill_kernel(
         out,
         routed,
         &selection.inverse,
         &selection.weights,
-        shared,
-        gate,
         dims.top_k as i32,
     )
     .generics(dims.combine_generics())
@@ -850,31 +796,24 @@ pub fn combine_view<'a>(
     out: Partition<TensorViewMut<'a, f32>>,
     routed: &'a TensorView<'a, f32>,
     selection: &'a ExpertSelection,
-    shared: &'a TensorView<'a, f32>,
-    gate: &'a TensorView<'a, f32>,
 ) -> impl DeviceOp<
     Output = (
         Partition<TensorViewMut<'a, f32>>,
         &'a TensorView<'a, f32>,
         &'a Tensor<i32>,
         &'a Tensor<f32>,
-        &'a TensorView<'a, f32>,
-        &'a TensorView<'a, f32>,
         i32,
     ),
 > + GraphNode
 + 'a {
     let dims = selection.dims;
+    assert_eq!(out.partition_shape, vec![1, dims.hidden]);
     assert_eq!(routed.shape(), &[dims.top_k as i32, dims.hidden as i32]);
-    assert_eq!(shared.shape(), &[1, dims.hidden as i32]);
-    assert_eq!(gate.shape(), &[1, 1]);
     kernels::combine_prefill_kernel(
         out,
         routed,
         &selection.inverse,
         &selection.weights,
-        shared,
-        gate,
         dims.top_k as i32,
     )
     .generics(dims.combine_generics())
@@ -893,6 +832,7 @@ mod tests {
             (2048, 512, 0, 256, 8),
             (2048, 512, 512, 0, 8),
             (2048, 512, 512, 256, 0),
+            (2048, 512, 256, 256, 8),
             (2048, 512, 512, 4, 8),
             (48, 512, 512, 256, 8),
             (2048, 96, 512, 256, 8),

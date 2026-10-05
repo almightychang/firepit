@@ -277,10 +277,18 @@ impl ModelDims {
             .ok_or("missing rope_theta")? as f32;
         let q_rope = RopeDims::new(q_heads, head_dim, rotary_dim as usize, theta)?;
         let k_rope = RopeDims::new(kv_heads, head_dim, rotary_dim as usize, theta)?;
+        let shared_intermediate = integer("shared_expert_intermediate_size")?;
+        if shared_intermediate != integer("moe_intermediate_size")? {
+            return Err(
+                "shared_expert_intermediate_size must equal moe_intermediate_size: the shared \
+                 expert runs as an always-selected routed expert"
+                    .into(),
+            );
+        }
         let moe = MoeDims::new(
             hidden,
             integer("moe_intermediate_size")?,
-            integer("shared_expert_intermediate_size")?,
+            shared_intermediate,
             integer("num_experts")?,
             integer("num_experts_per_tok")?,
         )?;

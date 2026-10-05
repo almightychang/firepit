@@ -60,16 +60,15 @@ Attention layer
   gemv o_proj                          Gated → Delta
   add
 
-MoE (모든 layer)
+MoE (모든 layer, shared expert는 항상 선택되는 마지막 expert: design-e4 4.3)
   rms_norm(post_attention_layernorm)   Residual → Normed
   gemv router                          Normed → Router              [B, 256]
-  top_k                                Router → ExpertSelection     토큰별
-  ◆ expert_gemv gate_up                Normed 행 b → ExpertUp       [8, 1024]   ◆ = 토큰마다
-  ◆ swiglu                             ExpertUp → ExpertAct         [8, 512]
-  ◆ expert_gemv down                   ExpertAct → ExpertOut        [8, H]
-  gemv shared gate_up → swiglu → gemv shared down     Normed → Shared  [B, H]
   gemv shared_expert_gate (rows 1)     Normed → SharedGate          [B, 1]
-  ◆ combine                            ExpertOut, Shared, SharedGate → Delta 행 b
+  top_k                                Router, SharedGate → ExpertSelection   토큰별 8 + shared 1칸
+  ◆ expert_gemv gate_up                Normed 행 b → ExpertUp       [9, 1024]   ◆ = 토큰마다
+  ◆ swiglu                             ExpertUp → ExpertAct         [9, 512]
+  ◆ expert_gemv down                   ExpertAct → ExpertOut        [9, H]
+  ◆ combine                            ExpertOut → Delta 행 b
   add
 
 Final

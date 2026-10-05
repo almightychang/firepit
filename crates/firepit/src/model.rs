@@ -42,8 +42,6 @@ pub struct MoeWeights {
     pub router: Weight,
     pub gate_up: Weight,
     pub down: Weight,
-    pub shared_gate_up: Weight,
-    pub shared_down: Weight,
     pub shared_gate: Weight,
 }
 
@@ -538,66 +536,59 @@ fn load_moe(
 ) -> Result<MoeWeights> {
     let checkpoint = sources.base();
     let d = dims.moe();
-    let h = dims.hidden();
+    let (h, i) = (dims.hidden(), d.intermediate());
     let path = format!("{prefix}.mlp");
-    let shared_path = format!("{path}.shared_expert");
-    let shared_gate_up = HostWeight::stack(
-        ["gate_proj", "up_proj"]
-            .map(|projection| {
-                sources.host(
-                    &format!("{shared_path}.{projection}.weight"),
-                    [d.shared_intermediate(), h],
-                )
-            })
-            .into_iter()
-            .collect::<Result<_>>()?,
-    )?
-    .upload(stream)?;
+    let routed_format = sources.format(&format!("{path}.experts.0.gate_proj.weight"));
+    let shared_format = sources.format(&format!("{path}.shared_expert.gate_proj.weight"));
+    if routed_format != shared_format {
+        return Err(format!(
+            "{path}: shared expert is {shared_format:?} but routed experts are {routed_format:?}"
+        )
+        .into());
+    }
+    let shared = |projection: &str, shape: [usize; 2]| {
+        sources.host(&format!("{path}.shared_expert.{projection}.weight"), shape)
+    };
     let expert = |expert: usize, projection: &str, shape: [usize; 2]| {
         sources.host(
             &format!("{path}.experts.{expert}.{projection}.weight"),
             shape,
         )
     };
-    let (gate_up, down) =
-        if sources.format(&format!("{path}.experts.0.gate_proj.weight")) == WeightFormat::Bf16 {
-            (
-                Weight::Dense(checkpoint.matrix_bf16(
-                    &format!("{path}.experts.gate_up_proj"),
-                    &[d.experts(), 2 * d.intermediate(), h],
-                    stream,
-                )?),
-                Weight::Dense(checkpoint.matrix_bf16(
-                    &format!("{path}.experts.down_proj"),
-                    &[d.experts(), h, d.intermediate()],
-                    stream,
-                )?),
-            )
-        } else {
-            let gate_up = (0..d.experts())
+    let fused = |name: &str, [experts, rows, cols]: [usize; 3]| -> Result<HostWeight> {
+        let name = format!("{path}.experts.{name}");
+        let tensor = checkpoint.tensor_bf16(&name)?;
+        if tensor.shape != [experts, rows, cols] {
+            return Err(format!("{name}: expected [{experts}, {rows}, {cols}]").into());
+        }
+        Ok(HostWeight::Dense(HostBf16Tensor {
+            shape: vec![experts * rows, cols],
+            data: tensor.data,
+        }))
+    };
+    let (mut gate_up, mut down) = if routed_format == WeightFormat::Bf16 {
+        (
+            vec![fused("gate_up_proj", [d.experts(), 2 * i, h])?],
+            vec![fused("down_proj", [d.experts(), h, i])?],
+        )
+    } else {
+        (
+            (0..d.experts())
                 .flat_map(|e| {
-                    ["gate_proj", "up_proj"]
-                        .map(|projection| expert(e, projection, [d.intermediate(), h]))
+                    ["gate_proj", "up_proj"].map(|projection| expert(e, projection, [i, h]))
                 })
-                .collect::<Result<_>>()?;
-            let down = (0..d.experts())
-                .map(|e| expert(e, "down_proj", [h, d.intermediate()]))
-                .collect::<Result<_>>()?;
-            (
-                HostWeight::stack(gate_up)?.upload(stream)?,
-                HostWeight::stack(down)?.upload(stream)?,
-            )
-        };
+                .collect::<Result<Vec<_>>>()?,
+            (0..d.experts())
+                .map(|e| expert(e, "down_proj", [h, i]))
+                .collect::<Result<Vec<_>>>()?,
+        )
+    };
+    gate_up.extend([shared("gate_proj", [i, h])?, shared("up_proj", [i, h])?]);
+    down.push(shared("down_proj", [h, i])?);
     Ok(MoeWeights {
         router: sources.matrix(&format!("{path}.gate.weight"), [d.experts(), h], stream)?,
-        gate_up,
-        down,
-        shared_gate_up,
-        shared_down: sources.matrix(
-            &format!("{shared_path}.down_proj.weight"),
-            [h, d.shared_intermediate()],
-            stream,
-        )?,
+        gate_up: HostWeight::stack(gate_up)?.upload(stream)?,
+        down: HostWeight::stack(down)?.upload(stream)?,
         shared_gate: sources.matrix(
             &format!("{path}.shared_expert_gate.weight"),
             [1, h],

@@ -35,16 +35,13 @@ pub enum Slot {
     ExpertUp,
     ExpertAct,
     ExpertOut,
-    SharedUp,
-    SharedAct,
-    Shared,
     SharedGate,
     MoeDelta,
     Logits,
 }
 
 impl Slot {
-    pub const ALL: [Self; 31] = [
+    pub const ALL: [Self; 28] = [
         Self::Residual0,
         Self::Residual1,
         Self::Normed,
@@ -70,9 +67,6 @@ impl Slot {
         Self::ExpertUp,
         Self::ExpertAct,
         Self::ExpertOut,
-        Self::SharedUp,
-        Self::SharedAct,
-        Self::Shared,
         Self::SharedGate,
         Self::MoeDelta,
         Self::Logits,
@@ -112,12 +106,9 @@ impl Slot {
             return vec![batch * a.kv_heads(), a.head_dim()];
         }
         let width = match self {
-            Self::Residual0
-            | Self::Residual1
-            | Self::Normed
-            | Self::Delta
-            | Self::Shared
-            | Self::MoeDelta => d.hidden(),
+            Self::Residual0 | Self::Residual1 | Self::Normed | Self::Delta | Self::MoeDelta => {
+                d.hidden()
+            }
             Self::Qkv | Self::Conv => g.conv_dim(),
             Self::Z | Self::Mixer | Self::MixerNorm | Self::Gated => g.value_dim(),
             Self::B | Self::A => g.value_heads(),
@@ -130,13 +121,11 @@ impl Slot {
             Self::ExpertUp => 2 * m.intermediate(),
             Self::ExpertAct => m.intermediate(),
             Self::ExpertOut => d.hidden(),
-            Self::SharedUp => 2 * m.shared_intermediate(),
-            Self::SharedAct => m.shared_intermediate(),
             Self::SharedGate => 1,
             Self::Logits => d.vocab(),
         };
         let rows = if matches!(self, Self::ExpertUp | Self::ExpertAct | Self::ExpertOut) {
-            batch * m.top_k()
+            batch * m.with_shared_expert().top_k()
         } else {
             batch
         };
@@ -166,8 +155,6 @@ pub enum WeightName {
     AttnV,
     AttnOut,
     Router,
-    SharedGateUp,
-    SharedDown,
     SharedGate,
     LmHead,
 }
@@ -216,7 +203,6 @@ pub enum Op {
     ExpertDown {
         layer: usize,
     },
-    SharedSwiglu,
     Combine {
         layer: usize,
     },
@@ -246,7 +232,7 @@ impl Op {
             Self::OutputGate => "output_gate",
             Self::TopK { .. } => "moe_top_k",
             Self::ExpertGateUp { .. } | Self::ExpertDown { .. } => "moe_expert_gemv",
-            Self::ExpertSwiglu | Self::SharedSwiglu => "swiglu",
+            Self::ExpertSwiglu => "swiglu",
             Self::Combine { .. } => "moe_combine",
             Self::Add { .. } => "add",
         }
@@ -371,29 +357,16 @@ impl StepPlan {
                 input: Slot::Normed,
                 out: Slot::Router,
             });
-            ops.push(Op::TopK { layer });
-            ops.push(Op::ExpertGateUp { layer });
-            ops.push(Op::ExpertSwiglu);
-            ops.push(Op::ExpertDown { layer });
-            ops.push(Op::Gemv {
-                layer,
-                name: WeightName::SharedGateUp,
-                input: Slot::Normed,
-                out: Slot::SharedUp,
-            });
-            ops.push(Op::SharedSwiglu);
-            ops.push(Op::Gemv {
-                layer,
-                name: WeightName::SharedDown,
-                input: Slot::SharedAct,
-                out: Slot::Shared,
-            });
             ops.push(Op::Gemv {
                 layer,
                 name: WeightName::SharedGate,
                 input: Slot::Normed,
                 out: Slot::SharedGate,
             });
+            ops.push(Op::TopK { layer });
+            ops.push(Op::ExpertGateUp { layer });
+            ops.push(Op::ExpertSwiglu);
+            ops.push(Op::ExpertDown { layer });
             ops.push(Op::Combine { layer });
             let after_moe = if next == Slot::Residual0 {
                 Slot::Residual1
@@ -444,7 +417,7 @@ impl StepPlan {
         let selections = (0..model.layers.len())
             .map(|_| {
                 (0..batch)
-                    .map(|_| ExpertSelection::empty(&model.dims.moe(), stream))
+                    .map(|_| ExpertSelection::empty(&model.dims.moe().with_shared_expert(), stream))
                     .collect::<Result<Vec<_>>>()
             })
             .collect::<Result<Vec<_>>>()?;

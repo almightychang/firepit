@@ -135,8 +135,6 @@ pub(crate) fn weight(model: &Model, layer: usize, name: WeightName) -> &Weight {
             _ => unreachable!(),
         },
         Router => &layer.moe.router,
-        SharedGateUp => &layer.moe.shared_gate_up,
-        SharedDown => &layer.moe.shared_down,
         SharedGate => &layer.moe.shared_gate,
         LmHead => unreachable!(),
     }
@@ -221,6 +219,7 @@ fn run_inner(
     let g = d.gdn();
     let a = d.attention();
     let m = d.moe();
+    let slots = m.with_shared_expert().top_k();
     let batch = plan.batch;
     for (op_index, &op) in plan.ops.iter().enumerate() {
         let result = sink.span(op.kind(), |sink| -> Result<()> {
@@ -505,10 +504,12 @@ fn run_inner(
                 }
                 Op::TopK { layer } => {
                     let logits = &plan.buffers[Slot::Router.index()];
+                    let gates = &plan.buffers[Slot::SharedGate.index()];
                     for b in 0..sessions.len() {
                         let router_row = logits.slice(&[b..b + 1, 0..m.experts()])?;
                         let row = router_row.view(&[m.experts()])?;
-                        plan.selections[layer][b].select(&row, sink)?;
+                        let gate = gates.slice(&[b..b + 1, 0..1])?;
+                        plan.selections[layer][b].select(&m, &row, &gate, sink)?;
                     }
                 }
                 Op::ExpertGateUp { layer } => {
@@ -517,12 +518,10 @@ fn run_inner(
                     for b in 0..sessions.len() {
                         let input_row = input.slice(&[b..b + 1, 0..d.hidden()])?;
                         let x = input_row.view(&[1, d.hidden() / Q8_BLOCK, Q8_BLOCK])?;
-                        let y = output.slice_mut(&[
-                            b * m.top_k()..(b + 1) * m.top_k(),
-                            0..2 * m.intermediate(),
-                        ])?;
+                        let y = output
+                            .slice_mut(&[b * slots..(b + 1) * slots, 0..2 * m.intermediate()])?;
                         let w = &model.layers[layer].moe.gate_up;
-                        let tile = weight_gemv_tile(w, 2 * m.intermediate(), d.hidden(), m.top_k());
+                        let tile = weight_gemv_tile(w, 2 * m.intermediate(), d.hidden(), slots);
                         expert_gemv_weight_view(
                             w,
                             &x,
@@ -539,14 +538,10 @@ fn run_inner(
                     let (source, target) =
                         input_output(&mut plan.buffers, Slot::ExpertUp, Slot::ExpertAct);
                     for b in 0..sessions.len() {
-                        let x = source.slice(&[
-                            b * m.top_k()..(b + 1) * m.top_k(),
-                            0..2 * m.intermediate(),
-                        ])?;
-                        let y = target.slice_mut(&[
-                            b * m.top_k()..(b + 1) * m.top_k(),
-                            0..m.intermediate(),
-                        ])?;
+                        let x =
+                            source.slice(&[b * slots..(b + 1) * slots, 0..2 * m.intermediate()])?;
+                        let y =
+                            target.slice_mut(&[b * slots..(b + 1) * slots, 0..m.intermediate()])?;
                         sink.run(
                             swiglu::swiglu(y.partition([1, m.intermediate()]), &x)
                                 .generics(vec![m.intermediate().to_string()]),
@@ -557,14 +552,12 @@ fn run_inner(
                     let (source, target) =
                         input_output(&mut plan.buffers, Slot::ExpertAct, Slot::ExpertOut);
                     for b in 0..sessions.len() {
-                        let act_rows = source
-                            .slice(&[b * m.top_k()..(b + 1) * m.top_k(), 0..m.intermediate()])?;
-                        let x =
-                            act_rows.view(&[m.top_k(), m.intermediate() / Q8_BLOCK, Q8_BLOCK])?;
-                        let y = target
-                            .slice_mut(&[b * m.top_k()..(b + 1) * m.top_k(), 0..d.hidden()])?;
+                        let act_rows =
+                            source.slice(&[b * slots..(b + 1) * slots, 0..m.intermediate()])?;
+                        let x = act_rows.view(&[slots, m.intermediate() / Q8_BLOCK, Q8_BLOCK])?;
+                        let y = target.slice_mut(&[b * slots..(b + 1) * slots, 0..d.hidden()])?;
                         let w = &model.layers[layer].moe.down;
-                        let tile = weight_gemv_tile(w, d.hidden(), m.intermediate(), m.top_k());
+                        let tile = weight_gemv_tile(w, d.hidden(), m.intermediate(), slots);
                         expert_gemv_weight_view(
                             w,
                             &x,
@@ -577,34 +570,16 @@ fn run_inner(
                         .submit(sink)?;
                     }
                 }
-                Op::SharedSwiglu => {
-                    let (source, target) =
-                        input_output(&mut plan.buffers, Slot::SharedUp, Slot::SharedAct);
-                    sink.run(
-                        swiglu::swiglu(target.partition([1, m.shared_intermediate()]), source)
-                            .generics(vec![m.shared_intermediate().to_string()]),
-                    )?;
-                }
                 Op::Combine { layer } => {
-                    let (routed, shared, gate, out) = three_inputs_output(
-                        &mut plan.buffers,
-                        Slot::ExpertOut,
-                        Slot::Shared,
-                        Slot::SharedGate,
-                        Slot::MoeDelta,
-                    );
+                    let (routed, out) =
+                        input_output(&mut plan.buffers, Slot::ExpertOut, Slot::MoeDelta);
                     for b in 0..sessions.len() {
-                        let r =
-                            routed.slice(&[b * m.top_k()..(b + 1) * m.top_k(), 0..d.hidden()])?;
-                        let s = shared.slice(&[b..b + 1, 0..d.hidden()])?;
-                        let g = gate.slice(&[b..b + 1, 0..1])?;
+                        let r = routed.slice(&[b * slots..(b + 1) * slots, 0..d.hidden()])?;
                         let y = out.slice_mut(&[b..b + 1, 0..d.hidden()])?;
                         sink.run(moe::combine_view(
                             y.partition([1, d.hidden()]),
                             &r,
                             &plan.selections[layer][b],
-                            &s,
-                            &g,
                         ))?;
                     }
                 }
