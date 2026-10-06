@@ -436,25 +436,13 @@ impl PrefillLayout {
         if indices.is_empty() || indices.len() % dims.top_k != 0 || weights.len() != indices.len() {
             return Err(ExpertSelectionError::Count);
         }
-        for (ids, scores) in indices
-            .chunks_exact(dims.top_k)
-            .zip(weights.chunks_exact(dims.top_k))
-        {
+        for scores in weights.chunks_exact(dims.top_k) {
             let total: f32 = scores.iter().sum();
             if scores.iter().any(|&x| !x.is_finite() || x < 0.0)
                 || !total.is_finite()
                 || total <= 0.0
             {
                 return Err(ExpertSelectionError::Weight);
-            }
-            let mut seen = vec![false; dims.experts];
-            for &id in ids {
-                if id < 0 || id as usize >= dims.experts {
-                    return Err(ExpertSelectionError::Index);
-                }
-                if std::mem::replace(&mut seen[id as usize], true) {
-                    return Err(ExpertSelectionError::Duplicate);
-                }
             }
         }
         Self::from_indices(indices, dims, tile_rows)
@@ -481,51 +469,41 @@ impl PrefillLayout {
         {
             return Err(ExpertSelectionError::Count);
         }
-        let mut entries = Vec::with_capacity(indices.len());
+        let mut last_token = vec![usize::MAX; dims.experts];
+        let mut counts = vec![0usize; dims.experts];
         for (token, ids) in indices.chunks_exact(dims.top_k).enumerate() {
-            let mut seen = vec![false; dims.experts];
-            for (slot, &id) in ids.iter().enumerate() {
+            for &id in ids {
                 if id < 0 || id as usize >= dims.experts {
                     return Err(ExpertSelectionError::Index);
                 }
-                if std::mem::replace(&mut seen[id as usize], true) {
+                if std::mem::replace(&mut last_token[id as usize], token) == token {
                     return Err(ExpertSelectionError::Duplicate);
                 }
-                entries.push((id as usize, token, slot));
+                counts[id as usize] += 1;
             }
         }
-        entries.sort_by_key(|entry| entry.0);
-        let mut token_rows = Vec::new();
+        let mut ranges = Vec::with_capacity(dims.experts);
         let mut tile_experts = Vec::new();
-        let mut inverse = vec![0i32; indices.len()];
-        let mut ranges = vec![(0usize, 0usize); dims.experts];
-        let mut cursor = 0;
-        for (expert, range) in ranges.iter_mut().enumerate() {
-            range.0 = token_rows.len();
-            while cursor < entries.len() && entries[cursor].0 == expert {
-                let (_, token, slot) = entries[cursor];
-                if token_rows.len() > i32::MAX as usize {
-                    return Err(ExpertSelectionError::Count);
-                }
-                inverse[token * dims.top_k + slot] = token_rows.len() as i32;
-                token_rows.push(token as i32);
-                cursor += 1;
-                range.1 += 1;
-            }
-            let padded = range
-                .1
+        let mut start = 0usize;
+        for (expert, &count) in counts.iter().enumerate() {
+            ranges.push((start, count));
+            let padded = count
                 .checked_next_multiple_of(tile_rows)
                 .ok_or(ExpertSelectionError::Count)?;
-            let end = range
-                .0
+            tile_experts.extend(std::iter::repeat_n(expert as i32, padded / tile_rows));
+            start = start
                 .checked_add(padded)
                 .filter(|&end| end <= i32::MAX as usize)
                 .ok_or(ExpertSelectionError::Count)?;
-            token_rows.resize(end, -1);
-            tile_experts.extend(std::iter::repeat_n(expert as i32, padded / tile_rows));
         }
-        if token_rows.len() > i32::MAX as usize {
-            return Err(ExpertSelectionError::Count);
+        let mut token_rows = vec![-1i32; start];
+        let mut inverse = vec![0i32; indices.len()];
+        let mut cursors: Vec<usize> = ranges.iter().map(|&(start, _)| start).collect();
+        for (entry, &id) in indices.iter().enumerate() {
+            let row = cursors[id as usize];
+            cursors[id as usize] += 1;
+            token_rows[row] = (entry / dims.top_k) as i32;
+            inverse[entry] = row as i32;
         }
         Ok(Self {
             tokens,
@@ -882,7 +860,85 @@ pub fn combine_add_norm_prefill<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::MoeDims;
+    use super::{MoeDims, PrefillLayout};
+
+    fn sorted_layout(indices: &[i32], dims: &MoeDims, tile_rows: usize) -> PrefillLayout {
+        let mut entries: Vec<(usize, usize, usize)> = indices
+            .chunks_exact(dims.top_k)
+            .enumerate()
+            .flat_map(|(token, ids)| {
+                ids.iter()
+                    .enumerate()
+                    .map(move |(slot, &id)| (id as usize, token, slot))
+            })
+            .collect();
+        entries.sort_by_key(|entry| entry.0);
+        let (mut token_rows, mut tile_experts) = (Vec::new(), Vec::new());
+        let mut inverse = vec![0i32; indices.len()];
+        let mut ranges = vec![(0usize, 0usize); dims.experts];
+        let mut cursor = 0;
+        for (expert, range) in ranges.iter_mut().enumerate() {
+            range.0 = token_rows.len();
+            while cursor < entries.len() && entries[cursor].0 == expert {
+                let (_, token, slot) = entries[cursor];
+                inverse[token * dims.top_k + slot] = token_rows.len() as i32;
+                token_rows.push(token as i32);
+                cursor += 1;
+                range.1 += 1;
+            }
+            let padded = range.1.next_multiple_of(tile_rows);
+            token_rows.resize(range.0 + padded, -1);
+            tile_experts.extend(std::iter::repeat_n(expert as i32, padded / tile_rows));
+        }
+        PrefillLayout {
+            tokens: indices.len() / dims.top_k,
+            tile_rows,
+            token_rows,
+            tile_experts,
+            inverse,
+            ranges,
+        }
+    }
+
+    #[test]
+    fn counting_layout_matches_a_stable_sort_by_expert() {
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |bound: usize| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as usize % bound
+        };
+        for (experts, top_k, tokens, tile_rows) in [
+            (4, 1, 1, 1),
+            (8, 3, 17, 4),
+            (64, 8, 300, 32),
+            (257, 9, 1000, 32),
+            (5, 5, 40, 64),
+        ] {
+            let dims = MoeDims::new(32, 32, 32, experts, top_k).unwrap();
+            let indices: Vec<i32> = (0..tokens)
+                .flat_map(|_| {
+                    let mut ids: Vec<i32> = Vec::with_capacity(top_k);
+                    while ids.len() < top_k {
+                        let id = next(experts) as i32;
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
+                    ids
+                })
+                .collect();
+            let weights = vec![0.5f32; indices.len()];
+            let layout = PrefillLayout::parse(&indices, &weights, &dims, tile_rows).unwrap();
+            let expected = sorted_layout(&indices, &dims, tile_rows);
+            assert_eq!(layout.token_rows, expected.token_rows);
+            assert_eq!(layout.tile_experts, expected.tile_experts);
+            assert_eq!(layout.inverse, expected.inverse);
+            assert_eq!(layout.ranges, expected.ranges);
+            assert_eq!(layout.tokens, expected.tokens);
+        }
+    }
 
     #[test]
     fn dimension_validation() {
