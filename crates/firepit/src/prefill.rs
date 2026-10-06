@@ -2,11 +2,13 @@ use crate::Result;
 use crate::checkpoint::Stream;
 #[cfg(feature = "testing")]
 use crate::engine::RoutingLayerTrace;
-use crate::execute::{gdn_gate, output_gate, rms_norm, row_width, weight_gemv_tile};
+use crate::execute::{
+    gdn_gate, heads, norm_read, output_gate, rms_norm, row_width, weight_gemv_tile,
+};
 use crate::model::{MixerWeights, Model, Projection};
 use crate::plan::{NormName, Op, Slot, StepPlan, WeightName};
 use crate::session::{GdnStateLayout, LayerState, Session};
-use crate::store::weight;
+use crate::store::{View, resolve, weight};
 use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{IntoPartition, PartitionMut, Reshape, Tensor, TensorView};
@@ -702,8 +704,11 @@ fn run_inner(
                         NormName::Final => plan.scored.outer(),
                         _ => 0..rows,
                     };
-                    let (source, target) = input_output(&mut plan.buffers, input, out);
-                    rms_norm(model, layer, name, source, target, rows, selected, sink)?;
+                    let read = norm_read(layer, name, input);
+                    let columns = resolve(model, &plan.buffers, rows, read)?.columns;
+                    let (tensor, target) = input_output(&mut plan.buffers, input, out);
+                    let source = View { tensor, columns };
+                    rms_norm(model, layer, name, &source, target, rows, selected, sink)?;
                 }
                 PrefillOp::Kernel(Op::Gemv {
                     layer,
@@ -1033,11 +1038,12 @@ fn run_special(
         PrefillOp::CacheAppend { layer } => {
             let k_shaped =
                 plan.buffers[Slot::KRot.index()].view(&[rows, a.kv_heads(), a.head_dim()])?;
-            let (v, heads) = Slot::projection_heads(model, layer, Projection::AttnV)?;
+            let (v, columns) = Slot::projection(model, layer, Projection::AttnV)?;
             let v = &plan.buffers[v.index()];
             let v_shaped = v.view(&[rows, row_width(v, rows) / a.head_dim(), a.head_dim()])?;
             let keys = k_shaped.slice(&[0..len, 0..a.kv_heads(), 0..a.head_dim()])?;
-            let values = v_shaped.slice(&[0..len, heads, 0..a.head_dim()])?;
+            let values =
+                v_shaped.slice(&[0..len, heads(&columns, a.head_dim()), 0..a.head_dim()])?;
             let LayerState::Attention { k, v } = &mut session.state[layer] else {
                 unreachable!()
             };

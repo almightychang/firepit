@@ -1,5 +1,6 @@
 use crate::Result;
 use crate::checkpoint::Stream;
+use crate::execute::row_width;
 use crate::model::{MixerWeights, Model, Projection};
 use crate::plan::{Slot, WeightName};
 use crate::session::{LayerState, Session};
@@ -227,6 +228,7 @@ impl<'a, 's, 'm> Ctx<'a, 's, 'm> {
         Parts {
             buffers: Buffers {
                 model: self.model,
+                rows: store.positions.len(),
                 buffers: &mut store.buffers,
                 recorder,
             },
@@ -254,11 +256,7 @@ impl<'a, 's, 'm> Ctx<'a, 's, 'm> {
 
     #[cfg(feature = "testing")]
     pub(crate) fn peek(&self, read: Read) -> Result<View<'_>> {
-        let (slot, columns) = resolve(self.model, &self.store.buffers, read)?;
-        Ok(View {
-            tensor: &self.store.buffers[slot.index()],
-            columns,
-        })
+        resolve(self.model, &self.store.buffers, self.store.batch(), read)
     }
 
     #[cfg(feature = "testing")]
@@ -275,46 +273,62 @@ pub(crate) struct Parts<'c, 's, 'm> {
     pub weights: Weights<'c, 'm>,
 }
 
-fn resolve(model: &Model, buffers: &[Tensor<f32>], read: Read) -> Result<(Slot, Range<usize>)> {
+fn locate(
+    model: &Model,
+    buffers: &[Tensor<f32>],
+    rows: usize,
+    read: Read,
+) -> Result<(Slot, Range<usize>)> {
     match read {
-        Read::Whole(slot) => {
-            let tensor = &buffers[slot.index()];
-            let elements: usize = tensor.shape().iter().map(|&x| x as usize).product();
-            Ok((slot, 0..elements / tensor.shape()[0] as usize))
-        }
+        Read::Whole(slot) => Ok((slot, 0..row_width(&buffers[slot.index()], rows))),
         Read::Member { layer, member } => Slot::projection(model, layer, member),
     }
+}
+
+pub(crate) fn resolve<'b>(
+    model: &Model,
+    buffers: &'b [Tensor<f32>],
+    rows: usize,
+    read: Read,
+) -> Result<View<'b>> {
+    let (slot, columns) = locate(model, buffers, rows, read)?;
+    Ok(View {
+        tensor: &buffers[slot.index()],
+        columns,
+    })
 }
 
 pub(crate) struct Buffers<'c, 'm> {
     model: &'m Model,
     buffers: &'c mut Vec<Tensor<f32>>,
+    rows: usize,
     recorder: Recorder<'c>,
 }
 
 impl Buffers<'_, '_> {
+    fn locate<const N: usize>(&self, reads: [Read; N]) -> Result<[(Slot, Range<usize>); N]> {
+        let mut located = Vec::with_capacity(N);
+        for read in reads {
+            self.recorder.read(read.into());
+            located.push(locate(self.model, self.buffers, self.rows, read)?);
+        }
+        Ok(located.try_into().expect("one location per read"))
+    }
+
     pub(crate) fn io<const N: usize>(
         &mut self,
         reads: [Read; N],
         write: Slot,
     ) -> Result<([View<'_>; N], &mut Tensor<f32>)> {
-        for read in reads {
-            self.recorder.read(read.into());
-        }
+        let located = self.locate(reads)?;
         self.recorder.write(Buffer::Slot(write));
-        let resolved = reads
-            .into_iter()
-            .map(|read| resolve(self.model, self.buffers, read))
-            .collect::<Result<Vec<_>>>()?;
         let output = write.index();
-        if let Some((slot, _)) = resolved.iter().find(|(slot, _)| slot.index() == output) {
+        if let Some((slot, _)) = located.iter().find(|(slot, _)| slot.index() == output) {
             return Err(format!("{slot:?} is both read and written").into());
         }
         let (before, at) = self.buffers.split_at_mut(output);
         let (target, after) = at.split_first_mut().expect("written slot exists");
-        let mut resolved = resolved.into_iter();
-        let views = std::array::from_fn(|_| {
-            let (slot, columns) = resolved.next().expect("one resolved read per read");
+        let views = located.map(|(slot, columns)| {
             let index = slot.index();
             let tensor = if index < output {
                 &before[index]
@@ -327,20 +341,9 @@ impl Buffers<'_, '_> {
     }
 
     pub(crate) fn read<const N: usize>(&self, reads: [Read; N]) -> Result<[View<'_>; N]> {
-        for read in reads {
-            self.recorder.read(read.into());
-        }
-        let resolved = reads
-            .into_iter()
-            .map(|read| resolve(self.model, self.buffers, read))
-            .collect::<Result<Vec<_>>>()?;
-        let mut resolved = resolved.into_iter();
-        Ok(std::array::from_fn(|_| {
-            let (slot, columns) = resolved.next().expect("one resolved read per read");
-            View {
-                tensor: &self.buffers[slot.index()],
-                columns,
-            }
+        Ok(self.locate(reads)?.map(|(slot, columns)| View {
+            tensor: &self.buffers[slot.index()],
+            columns,
         }))
     }
 }

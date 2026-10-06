@@ -67,15 +67,6 @@ impl Slot {
         Ok((Self::Projection(layout), columns))
     }
 
-    pub(crate) fn projection_heads(
-        model: &Model,
-        layer: usize,
-        member: Projection,
-    ) -> Result<(Self, Range<usize>)> {
-        let (layout, heads) = model.projection_heads(layer, member)?;
-        Ok((Self::Projection(layout), heads))
-    }
-
     pub fn index(self) -> usize {
         match self {
             Self::Projection(layout) => Self::ALL.len() + layout,

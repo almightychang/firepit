@@ -174,18 +174,6 @@ impl Model {
             .ok_or_else(|| format!("layer has no {member:?} projection").into())
     }
 
-    pub(crate) fn projection_heads(
-        &self,
-        layer: usize,
-        member: Projection,
-    ) -> Result<(usize, Range<usize>)> {
-        let (layout, _) = self.projection(layer, member)?;
-        let pitch = member.head_pitch(self.dims.attention().head_dim());
-        Ok((
-            layout,
-            self.projection_layouts[layout].heads(member, pitch)?,
-        ))
-    }
     pub fn from_checkpoint(
         dir: impl AsRef<Path>,
         options: LoadOptions,

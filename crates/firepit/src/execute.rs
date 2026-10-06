@@ -91,12 +91,29 @@ impl<'a> ProjectionRows<'a> {
     }
 }
 
+pub(crate) fn heads(columns: &Range<usize>, pitch: usize) -> Range<usize> {
+    columns.start / pitch..columns.end / pitch
+}
+
+pub(crate) fn norm_read(layer: usize, name: NormName, input: Slot) -> Read {
+    match name {
+        NormName::Q => Read::Member {
+            layer,
+            member: Projection::AttnQGate,
+        },
+        NormName::K => Read::Member {
+            layer,
+            member: Projection::AttnK,
+        },
+        _ => Read::Whole(input),
+    }
+}
+
 struct NormInput<'a> {
     gamma: &'a Tensor<f32>,
     eps: f32,
     width: usize,
     pitch: usize,
-    heads: Range<usize>,
 }
 
 impl<'a> NormInput<'a> {
@@ -106,14 +123,13 @@ impl<'a> NormInput<'a> {
             eps,
             width,
             pitch: width,
-            heads: 0..1,
         }
     }
 
-    fn new(model: &'a Model, layer: usize, name: NormName) -> Result<Self> {
+    fn new(model: &'a Model, layer: usize, name: NormName) -> Self {
         let d = &model.dims;
         let head_dim = d.attention().head_dim();
-        Ok(match (name, &model.layers[layer].mixer) {
+        match (name, &model.layers[layer].mixer) {
             (NormName::Input, _) => {
                 Self::rows(&model.layers[layer].input_norm, d.norm_eps(), d.hidden())
             }
@@ -126,14 +142,12 @@ impl<'a> NormInput<'a> {
                 eps: d.norm_eps(),
                 width: head_dim,
                 pitch: Projection::AttnQGate.head_pitch(head_dim),
-                heads: model.projection_heads(layer, Projection::AttnQGate)?.1,
             },
             (NormName::K, MixerWeights::Attention(w)) => Self {
                 gamma: &w.k_norm,
                 eps: d.norm_eps(),
                 width: head_dim,
                 pitch: Projection::AttnK.head_pitch(head_dim),
-                heads: model.projection_heads(layer, Projection::AttnK)?.1,
             },
             (NormName::GdnGated, MixerWeights::Gdn(w)) => {
                 let g = d.gdn();
@@ -142,11 +156,10 @@ impl<'a> NormInput<'a> {
                     eps: g.eps(),
                     width: g.value_head_dim(),
                     pitch: g.value_head_dim(),
-                    heads: 0..g.value_heads(),
                 }
             }
             _ => unreachable!(),
-        })
+        }
     }
 }
 
@@ -155,16 +168,18 @@ pub(crate) fn rms_norm(
     model: &Model,
     layer: usize,
     name: NormName,
-    source: &Tensor<f32>,
+    source: &View<'_>,
     target: &mut Tensor<f32>,
     rows: usize,
     selected: Range<usize>,
     sink: &mut impl Sink,
 ) -> Result<()> {
-    let norm = NormInput::new(model, layer, name)?;
-    let shaped = source.view(&[rows, row_width(source, rows) / norm.pitch, norm.pitch])?;
-    let y = target.slice_mut(&[selected.clone(), 0..norm.heads.len() * norm.width])?;
-    let x = shaped.slice(&[selected, norm.heads, 0..norm.width])?;
+    let norm = NormInput::new(model, layer, name);
+    let heads = heads(&source.columns, norm.pitch);
+    let tensor = source.tensor;
+    let shaped = tensor.view(&[rows, row_width(tensor, rows) / norm.pitch, norm.pitch])?;
+    let y = target.slice_mut(&[selected.clone(), 0..heads.len() * norm.width])?;
+    let x = shaped.slice(&[selected, heads, 0..norm.width])?;
     sink.run(
         norm::rms_norm(
             y.partition([1, norm.width]),
@@ -211,8 +226,7 @@ pub(crate) fn output_gate(
     let pitch = Projection::AttnQGate.head_pitch(width);
     let x = source.view(&[rows, a.q_heads(), width])?;
     let shaped = q_gate.view(&[rows, row_width(q_gate, rows) / pitch, pitch])?;
-    let heads = columns.start / pitch..columns.end / pitch;
-    let gate = shaped.slice(&[0..rows, heads, width..pitch])?;
+    let gate = shaped.slice(&[0..rows, heads(&columns, pitch), width..pitch])?;
     sink.run(
         attention::output_gate(target.partition([1, width]), &x, &gate).generics(a.gate_generics()),
     )?;
@@ -333,28 +347,8 @@ fn run_inner(
                     input,
                     out,
                 } => {
-                    let read = match name {
-                        NormName::Q => Read::Member {
-                            layer,
-                            member: Projection::AttnQGate,
-                        },
-                        NormName::K => Read::Member {
-                            layer,
-                            member: Projection::AttnK,
-                        },
-                        _ => Read::Whole(input),
-                    };
-                    let ([source], target) = buffers.io([read], out)?;
-                    rms_norm(
-                        model,
-                        layer,
-                        name,
-                        source.tensor,
-                        target,
-                        batch,
-                        0..batch,
-                        sink,
-                    )?;
+                    let ([source], target) = buffers.io([norm_read(layer, name, input)], out)?;
+                    rms_norm(model, layer, name, &source, target, batch, 0..batch, sink)?;
                 }
                 Op::Gemv {
                     layer,

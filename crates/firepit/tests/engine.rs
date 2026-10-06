@@ -263,7 +263,7 @@ fn bf16_flow_reads_nothing_unwritten_and_fuses_each_input() -> TestResult {
     assert!(analysis.unproduced.is_empty(), "{:?}", analysis.unproduced);
     assert!(analysis.candidates().is_empty());
     let mut fused: Vec<Vec<firepit::Projection>> =
-        analysis.fused(&model).map(|group| group.members).collect();
+        analysis.fused().map(|gemv| gemv.members.clone()).collect();
     fused.dedup();
     assert_eq!(
         fused,

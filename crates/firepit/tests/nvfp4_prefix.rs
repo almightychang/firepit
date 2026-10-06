@@ -65,8 +65,8 @@ fn nvfp4_flow_shows_the_four_projection_groups() -> Result<()> {
     let nodes = engine.step_flow(engine.batch([(&mut session, 0)])?, true)?;
     let analysis = firepit::flow::analyze(&model, &nodes);
     let mut groups: Vec<_> = analysis
-        .fused(&model)
-        .map(|group| (group.members, group.format, group.padding))
+        .fused()
+        .map(|gemv| (gemv.members.clone(), gemv.format, gemv.padding))
         .collect();
     groups.sort_by_key(|(members, ..)| format!("{members:?}"));
     groups.dedup();

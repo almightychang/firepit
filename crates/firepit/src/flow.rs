@@ -21,11 +21,46 @@ pub struct Value {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Gemv {
     pub op: usize,
-    pub layer: u16,
     pub name: WeightName,
-    pub out: Slot,
+    pub members: Vec<Projection>,
     pub format: MatrixFormat,
     pub cols: usize,
+    pub padding: usize,
+    pub gemms: usize,
+}
+
+impl Gemv {
+    fn new(model: &Model, op: usize, layer: u16, name: WeightName, out: Slot) -> Self {
+        let matrix = weight(model, layer as usize, name);
+        let (members, padding, gemms) = match out {
+            Slot::Projection(layout) => {
+                let layout = &model.projection_layouts[layout];
+                (
+                    layout.members().collect(),
+                    layout.padding(),
+                    layout.gemm_rows().len(),
+                )
+            }
+            _ => (Vec::new(), 0, 1),
+        };
+        Self {
+            op,
+            name,
+            members,
+            format: matrix.format(),
+            cols: matrix.cols(),
+            padding,
+            gemms,
+        }
+    }
+
+    fn label(&self) -> String {
+        if self.members.is_empty() {
+            return format!("{:?}", self.name);
+        }
+        let names: Vec<_> = self.members.iter().map(|m| format!("{m:?}")).collect();
+        format!("[{}]", names.join("|"))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -35,18 +70,25 @@ pub struct GemvInput {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Fused {
-    pub members: Vec<Projection>,
-    pub format: MatrixFormat,
-    pub padding: usize,
-    pub gemms: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Analysis {
     pub values: Vec<Value>,
     pub unproduced: Vec<(usize, Buffer)>,
     pub gemv_inputs: Vec<GemvInput>,
+}
+
+fn group_by<K: PartialEq, T>(
+    items: impl IntoIterator<Item = T>,
+    key: impl Fn(&T) -> K,
+) -> Vec<(K, Vec<T>)> {
+    let mut groups: Vec<(K, Vec<T>)> = Vec::new();
+    for item in items {
+        let found = key(&item);
+        match groups.iter_mut().find(|(seen, _)| *seen == found) {
+            Some((_, group)) => group.push(item),
+            None => groups.push((found, vec![item])),
+        }
+    }
+    groups
 }
 
 fn location(model: &Model, buffer: Buffer) -> Location {
@@ -77,10 +119,13 @@ pub fn analyze(model: &Model, nodes: &[OpNode]) -> Analysis {
     let mut values: Vec<Value> = Vec::new();
     let mut latest = HashMap::<Location, usize>::new();
     let mut unproduced = Vec::new();
-    let mut gemv_inputs: Vec<GemvInput> = Vec::new();
+    let mut gemvs = Vec::new();
     for (op, node) in nodes.iter().enumerate() {
-        let mut input = None;
+        let (mut input, mut matrix, mut out) = (None, None, None);
         for usage in node.uses.iter().filter(|usage| !usage.write) {
+            if let Buffer::Matrix { layer, name } = usage.buffer {
+                matrix = Some((layer, name));
+            }
             match latest.get(&location(model, usage.buffer)) {
                 Some(&value) => {
                     values[value].consumers.push((op, usage.buffer));
@@ -93,6 +138,9 @@ pub fn analyze(model: &Model, nodes: &[OpNode]) -> Analysis {
             }
         }
         for usage in node.uses.iter().filter(|usage| usage.write) {
+            if let Buffer::Slot(slot) = usage.buffer {
+                out = Some(slot);
+            }
             let location = location(model, usage.buffer);
             values.push(Value {
                 location,
@@ -101,37 +149,19 @@ pub fn analyze(model: &Model, nodes: &[OpNode]) -> Analysis {
             });
             latest.insert(location, values.len() - 1);
         }
-        if node.kind != "gemv" {
-            continue;
-        }
-        let matrix = node.uses.iter().find_map(|usage| match usage.buffer {
-            Buffer::Matrix { layer, name } => Some((layer, name)),
-            _ => None,
-        });
-        let out = node.uses.iter().find_map(|usage| match usage.buffer {
-            Buffer::Slot(slot) if usage.write => Some(slot),
-            _ => None,
-        });
-        let (Some(value), Some((layer, name)), Some(out)) = (input, matrix, out) else {
-            continue;
-        };
-        let matrix = weight(model, layer as usize, name);
-        let gemv = Gemv {
-            op,
-            layer,
-            name,
-            out,
-            format: matrix.format(),
-            cols: matrix.cols(),
-        };
-        match gemv_inputs.iter_mut().find(|group| group.value == value) {
-            Some(group) => group.gemvs.push(gemv),
-            None => gemv_inputs.push(GemvInput {
-                value,
-                gemvs: vec![gemv],
-            }),
+        if let ("gemv", Some(value), Some((layer, name)), Some(out)) =
+            (node.kind, input, matrix, out)
+        {
+            gemvs.push((value, Gemv::new(model, op, layer, name, out)));
         }
     }
+    let gemv_inputs = group_by(gemvs, |(value, _)| *value)
+        .into_iter()
+        .map(|(value, gemvs)| GemvInput {
+            value,
+            gemvs: gemvs.into_iter().map(|(_, gemv)| gemv).collect(),
+        })
+        .collect();
     Analysis {
         values,
         unproduced,
@@ -140,59 +170,20 @@ pub fn analyze(model: &Model, nodes: &[OpNode]) -> Analysis {
 }
 
 impl Analysis {
-    pub fn fused<'a>(&'a self, model: &'a Model) -> impl Iterator<Item = Fused> + 'a {
+    pub fn fused(&self) -> impl Iterator<Item = &Gemv> {
         self.gemv_inputs
             .iter()
             .flat_map(|group| &group.gemvs)
-            .filter_map(move |gemv| {
-                let Slot::Projection(layout) = gemv.out else {
-                    return None;
-                };
-                let layout = &model.projection_layouts[layout];
-                let members: Vec<_> = layout.members().collect();
-                (members.len() > 1).then(|| Fused {
-                    members,
-                    format: gemv.format,
-                    padding: layout.padding(),
-                    gemms: layout.gemm_rows().len(),
-                })
-            })
+            .filter(|gemv| gemv.members.len() > 1)
     }
 
     pub fn candidates(&self) -> Vec<Vec<&Gemv>> {
         self.gemv_inputs
             .iter()
-            .flat_map(|group| {
-                let mut same: Vec<Vec<&Gemv>> = Vec::new();
-                for gemv in &group.gemvs {
-                    match same.iter_mut().find(|bucket| {
-                        (bucket[0].format, bucket[0].cols) == (gemv.format, gemv.cols)
-                    }) {
-                        Some(bucket) => bucket.push(gemv),
-                        None => same.push(vec![gemv]),
-                    }
-                }
-                same.into_iter().filter(|bucket| bucket.len() > 1)
-            })
+            .flat_map(|group| group_by(&group.gemvs, |gemv| (gemv.format, gemv.cols)))
+            .map(|(_, same)| same)
+            .filter(|same| same.len() > 1)
             .collect()
-    }
-}
-
-fn describe(model: &Model, buffer: Buffer) -> String {
-    match buffer {
-        Buffer::Slot(slot) => format!("{slot:?}"),
-        Buffer::Member { layer, member } => {
-            let (slot, _) = Slot::projection(model, layer as usize, member)
-                .expect("members in the flow belong to the model");
-            format!("{slot:?}.{member:?}")
-        }
-        Buffer::Token => "Token".into(),
-        Buffer::Position(_) => "Position".into(),
-        Buffer::Cos => "Cos".into(),
-        Buffer::Sin => "Sin".into(),
-        Buffer::Selection { .. } => "Selection".into(),
-        Buffer::State { .. } => "State".into(),
-        Buffer::Matrix { name, .. } => format!("Matrix {name:?}"),
     }
 }
 
@@ -203,128 +194,116 @@ fn describe_location(model: &Model, location: Location) -> String {
     }
 }
 
-fn fold(lines: impl IntoIterator<Item = String>) -> Vec<(String, usize)> {
-    let mut folded: Vec<(String, usize)> = Vec::new();
-    for line in lines {
-        match folded.iter_mut().find(|(seen, _)| *seen == line) {
-            Some((_, count)) => *count += 1,
-            None => folded.push((line, 1)),
-        }
+fn describe(model: &Model, buffer: Buffer) -> String {
+    match buffer {
+        Buffer::Slot(slot) => format!("{slot:?}"),
+        Buffer::Member { member, .. } => format!(
+            "{}.{member:?}",
+            describe_location(model, location(model, buffer))
+        ),
+        Buffer::Token => "Token".into(),
+        Buffer::Position(_) => "Position".into(),
+        Buffer::Cos => "Cos".into(),
+        Buffer::Sin => "Sin".into(),
+        Buffer::Selection { .. } => "Selection".into(),
+        Buffer::State { .. } => "State".into(),
+        Buffer::Matrix { name, .. } => format!("Matrix {name:?}"),
     }
-    folded
 }
 
-fn members(model: &Model, gemv: &Gemv) -> String {
-    match gemv.out {
-        Slot::Projection(layout) => {
-            let names: Vec<_> = model.projection_layouts[layout]
-                .members()
-                .map(|member| format!("{member:?}"))
-                .collect();
-            format!("[{}]", names.join("|"))
-        }
-        _ => format!("{:?}", gemv.name),
+fn section(out: &mut String, title: &str, lines: impl IntoIterator<Item = String>) {
+    let _ = writeln!(out, "== {title}");
+    let folded = group_by(lines, String::clone);
+    if folded.is_empty() {
+        out.push_str("none\n");
+    }
+    for (line, same) in folded {
+        let _ = writeln!(out, "{line} x{}", same.len());
     }
 }
 
 pub fn report(model: &Model, nodes: &[OpNode]) -> String {
     let analysis = analyze(model, nodes);
-    let mut out = String::new();
     let kind = |op: usize| nodes[op].kind;
+    let mut out = String::new();
     out.push_str(
         "# Norm Q and OutputGate both read AttnQGate whole: each uses half, so it counts twice.\n",
     );
     out.push_str("# Slots reused across layers keep the previous layer's value: a misordered layer k >= 1 shows as an edge to the old value, not as a read before any write.\n");
-
-    out.push_str("== horizontal concatenation\n");
-    let lines = analysis.gemv_inputs.iter().map(|group| {
-        let input = &analysis.values[group.value];
-        let mut line = format!(
-            "input {} <- {}:",
-            describe_location(model, input.location),
-            kind(input.producer)
-        );
-        for gemv in &group.gemvs {
-            let _ = write!(
-                line,
-                " {} {:?} cols {}",
-                members(model, gemv),
-                gemv.format,
-                gemv.cols
+    section(
+        &mut out,
+        "same-input GEMVs",
+        analysis.gemv_inputs.iter().map(|group| {
+            let input = &analysis.values[group.value];
+            let mut line = format!(
+                "input {} <- {}:",
+                describe_location(model, input.location),
+                kind(input.producer)
             );
-            if let Slot::Projection(layout) = gemv.out {
-                let layout = &model.projection_layouts[layout];
-                if layout.padding() > 0 {
+            for gemv in &group.gemvs {
+                let _ = write!(
+                    line,
+                    " {} {:?} cols {}",
+                    gemv.label(),
+                    gemv.format,
+                    gemv.cols
+                );
+                if gemv.padding > 0 {
                     let _ = write!(
                         line,
                         " (padding {} rows, {} prefill GEMMs)",
-                        layout.padding(),
-                        layout.gemm_rows().len()
+                        gemv.padding, gemv.gemms
                     );
                 }
+                line.push(';');
             }
-            line.push(';');
-        }
-        let mut formats: Vec<MatrixFormat> = Vec::new();
-        for gemv in &group.gemvs {
-            if !formats.contains(&gemv.format) {
-                formats.push(gemv.format);
+            let formats = group_by(&group.gemvs, |gemv| gemv.format);
+            if formats.len() > 1 {
+                let formats: Vec<_> = formats.iter().map(|(format, _)| format).collect();
+                let _ = write!(line, " formats differ: {formats:?};");
             }
-        }
-        if formats.len() > 1 {
-            let _ = write!(line, " formats differ: {formats:?};");
-        }
-        line
-    });
-    for (line, count) in fold(lines) {
-        let _ = writeln!(out, "{line} x{count}");
-    }
-    let candidates = analysis.candidates();
-    if candidates.is_empty() {
-        out.push_str("candidates: none\n");
-    }
-    for bucket in fold(candidates.iter().map(|bucket| {
-        let names: Vec<_> = bucket.iter().map(|gemv| members(model, gemv)).collect();
-        format!(
-            "candidate {} {:?} cols {}",
-            names.join(" + "),
-            bucket[0].format,
-            bucket[0].cols
-        )
-    })) {
-        let _ = writeln!(out, "{} x{}", bucket.0, bucket.1);
-    }
-
-    out.push_str("== production -> consumption\n");
-    let lines = analysis.values.iter().map(|value| {
-        let consumers: Vec<_> = value
-            .consumers
+            line
+        }),
+    );
+    section(
+        &mut out,
+        "same-input, same-format GEMVs left apart",
+        analysis.candidates().into_iter().map(|same| {
+            let labels: Vec<_> = same.iter().map(|gemv| gemv.label()).collect();
+            format!(
+                "{} {:?} cols {}",
+                labels.join(" + "),
+                same[0].format,
+                same[0].cols
+            )
+        }),
+    );
+    section(
+        &mut out,
+        "producer -> consumers",
+        analysis.values.iter().map(|value| {
+            let consumers: Vec<_> = value
+                .consumers
+                .iter()
+                .map(|&(op, buffer)| format!("{}({})", kind(op), describe(model, buffer)))
+                .collect();
+            format!(
+                "{} -> {} -> [{}] ({})",
+                kind(value.producer),
+                describe_location(model, value.location),
+                consumers.join(", "),
+                consumers.len()
+            )
+        }),
+    );
+    section(
+        &mut out,
+        "reads before any write",
+        analysis
+            .unproduced
             .iter()
-            .map(|&(op, buffer)| format!("{}({})", kind(op), describe(model, buffer)))
-            .collect();
-        format!(
-            "{} -> {} -> [{}] ({})",
-            kind(value.producer),
-            describe_location(model, value.location),
-            consumers.join(", "),
-            consumers.len()
-        )
-    });
-    for (line, count) in fold(lines) {
-        let _ = writeln!(out, "{line} x{count}");
-    }
-
-    out.push_str("== reads before any write\n");
-    if analysis.unproduced.is_empty() {
-        out.push_str("none\n");
-    }
-    let lines = analysis
-        .unproduced
-        .iter()
-        .map(|&(op, buffer)| format!("{} reads {}", kind(op), describe(model, buffer)));
-    for (line, count) in fold(lines) {
-        let _ = writeln!(out, "{line} x{count}");
-    }
+            .map(|&(op, buffer)| format!("{} reads {}", kind(op), describe(model, buffer))),
+    );
     out
 }
 
