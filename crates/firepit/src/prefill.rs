@@ -3,7 +3,7 @@ use crate::checkpoint::Stream;
 #[cfg(feature = "testing")]
 use crate::engine::RoutingLayerTrace;
 use crate::execute::{
-    gdn_gate, heads, input_output, output_gate, rms_norm, row_width, two_inputs_output, weight,
+    gdn_gate, input_output, output_gate, rms_norm, row_width, two_inputs_output, weight,
     weight_gemv_tile,
 };
 use crate::model::{MixerWeights, Model, Projection};
@@ -1002,12 +1002,11 @@ fn run_special(
         PrefillOp::CacheAppend { layer } => {
             let k_shaped =
                 plan.buffers[Slot::KRot.index()].view(&[rows, a.kv_heads(), a.head_dim()])?;
-            let (v, columns) = Slot::projection(model, layer, Projection::AttnV)?;
+            let (v, heads) = Slot::projection_heads(model, layer, Projection::AttnV)?;
             let v = &plan.buffers[v.index()];
             let v_shaped = v.view(&[rows, row_width(v, rows) / a.head_dim(), a.head_dim()])?;
             let keys = k_shaped.slice(&[0..len, 0..a.kv_heads(), 0..a.head_dim()])?;
-            let values =
-                v_shaped.slice(&[0..len, heads(&columns, a.head_dim())?, 0..a.head_dim()])?;
+            let values = v_shaped.slice(&[0..len, heads, 0..a.head_dim()])?;
             let LayerState::Attention { k, v } = &mut session.state[layer] else {
                 unreachable!()
             };

@@ -34,6 +34,15 @@ pub enum Projection {
     SharedGate,
 }
 
+impl Projection {
+    pub(crate) fn head_pitch(self, head_dim: usize) -> usize {
+        match self {
+            Self::AttnQGate => 2 * head_dim,
+            _ => head_dim,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectionLayout {
     members: Vec<(Projection, Range<usize>)>,
@@ -50,6 +59,20 @@ impl ProjectionLayout {
             .iter()
             .find(|(projection, _)| *projection == member)
             .map(|(_, columns)| columns.clone())
+    }
+
+    pub fn heads(&self, member: Projection, pitch: usize) -> Result<Range<usize>> {
+        let columns = self
+            .columns(member)
+            .ok_or_else(|| format!("projection group has no {member:?}"))?;
+        if self.rows % pitch != 0 || columns.start % pitch != 0 || columns.end % pitch != 0 {
+            return Err(format!(
+                "{member:?} columns {columns:?} of a {}-row projection group do not split into heads of {pitch}",
+                self.rows
+            )
+            .into());
+        }
+        Ok(columns.start / pitch..columns.end / pitch)
     }
 }
 
@@ -133,6 +156,19 @@ impl Model {
                 Some((group.layout, columns))
             })
             .ok_or_else(|| format!("layer has no {member:?} projection").into())
+    }
+
+    pub(crate) fn projection_heads(
+        &self,
+        layer: usize,
+        member: Projection,
+    ) -> Result<(usize, Range<usize>)> {
+        let (layout, _) = self.projection(layer, member)?;
+        let pitch = member.head_pitch(self.dims.attention().head_dim());
+        Ok((
+            layout,
+            self.projection_layouts[layout].heads(member, pitch)?,
+        ))
     }
     pub fn from_checkpoint(
         dir: impl AsRef<Path>,
@@ -693,17 +729,26 @@ fn load_attention(
     let q = d.q_heads() * d.head_dim();
     let kv = d.kv_heads() * d.head_dim();
     let projection = |name: &str| format!("{path}.{name}_proj.weight");
+    let projections = sources.projections(
+        &[
+            (Projection::AttnQGate, projection("q"), 2 * q),
+            (Projection::AttnK, projection("k"), kv),
+            (Projection::AttnV, projection("v"), kv),
+        ],
+        dims.hidden(),
+        layouts,
+        stream,
+    )?;
+    for group in &projections {
+        let layout = &layouts[group.layout];
+        for member in [Projection::AttnQGate, Projection::AttnK, Projection::AttnV] {
+            if layout.columns(member).is_some() {
+                layout.heads(member, member.head_pitch(d.head_dim()))?;
+            }
+        }
+    }
     Ok(AttentionWeights {
-        projections: sources.projections(
-            &[
-                (Projection::AttnQGate, projection("q"), 2 * q),
-                (Projection::AttnK, projection("k"), kv),
-                (Projection::AttnV, projection("v"), kv),
-            ],
-            dims.hidden(),
-            layouts,
-            stream,
-        )?,
+        projections,
         q_norm: checkpoint.vector(&format!("{path}.q_norm.weight"), d.head_dim(), 1.0, &stream)?,
         k_norm: checkpoint.vector(&format!("{path}.k_norm.weight"), d.head_dim(), 1.0, &stream)?,
         out: sources.matrix(
@@ -971,6 +1016,32 @@ mod tests {
                 .all(|&x| x == bf16::from_f32(2.0))
         );
         assert!(tensor.data[257 * cols..].iter().all(|&x| x == bf16::ZERO));
+        Ok(())
+    }
+
+    #[test]
+    fn projection_heads_require_head_aligned_columns_and_width() -> Result<()> {
+        let layout = ProjectionLayout {
+            members: vec![
+                (Projection::AttnQGate, 0..16),
+                (Projection::AttnK, 16..24),
+                (Projection::AttnV, 24..32),
+            ],
+            rows: 32,
+        };
+        assert_eq!(layout.heads(Projection::AttnQGate, 8)?, 0..2);
+        assert_eq!(layout.heads(Projection::AttnV, 4)?, 6..8);
+        assert!(layout.heads(Projection::GdnZ, 4).is_err());
+        let padded = ProjectionLayout {
+            rows: 36,
+            ..layout.clone()
+        };
+        assert!(padded.heads(Projection::AttnQGate, 8).is_err());
+        let shifted = ProjectionLayout {
+            members: vec![(Projection::AttnK, 2..10)],
+            rows: 12,
+        };
+        assert!(shifted.heads(Projection::AttnK, 4).is_err());
         Ok(())
     }
 

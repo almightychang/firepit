@@ -127,13 +127,6 @@ pub(crate) fn row_width(tensor: &Tensor<f32>, rows: usize) -> usize {
         / rows
 }
 
-pub(crate) fn heads(columns: &Range<usize>, pitch: usize) -> Result<Range<usize>> {
-    if columns.start % pitch != 0 || columns.end % pitch != 0 {
-        return Err(format!("columns {columns:?} do not split into heads of {pitch}").into());
-    }
-    Ok(columns.start / pitch..columns.end / pitch)
-}
-
 struct ProjectionRows<'a> {
     flat: TensorView<'a, f32>,
     width: usize,
@@ -188,26 +181,20 @@ impl<'a> NormInput<'a> {
                 Self::rows(&model.layers[layer].post_norm, d.norm_eps(), d.hidden())
             }
             (NormName::Final, _) => Self::rows(&model.final_norm, d.norm_eps(), d.hidden()),
-            (NormName::Q, MixerWeights::Attention(w)) => {
-                let (_, columns) = model.projection(layer, Projection::AttnQGate)?;
-                Self {
-                    gamma: &w.q_norm,
-                    eps: d.norm_eps(),
-                    width: head_dim,
-                    pitch: 2 * head_dim,
-                    heads: heads(&columns, 2 * head_dim)?,
-                }
-            }
-            (NormName::K, MixerWeights::Attention(w)) => {
-                let (_, columns) = model.projection(layer, Projection::AttnK)?;
-                Self {
-                    gamma: &w.k_norm,
-                    eps: d.norm_eps(),
-                    width: head_dim,
-                    pitch: head_dim,
-                    heads: heads(&columns, head_dim)?,
-                }
-            }
+            (NormName::Q, MixerWeights::Attention(w)) => Self {
+                gamma: &w.q_norm,
+                eps: d.norm_eps(),
+                width: head_dim,
+                pitch: Projection::AttnQGate.head_pitch(head_dim),
+                heads: model.projection_heads(layer, Projection::AttnQGate)?.1,
+            },
+            (NormName::K, MixerWeights::Attention(w)) => Self {
+                gamma: &w.k_norm,
+                eps: d.norm_eps(),
+                width: head_dim,
+                pitch: Projection::AttnK.head_pitch(head_dim),
+                heads: model.projection_heads(layer, Projection::AttnK)?.1,
+            },
             (NormName::GdnGated, MixerWeights::Gdn(w)) => {
                 let g = d.gdn();
                 Self {
@@ -278,13 +265,14 @@ pub(crate) fn output_gate(
     sink: &mut impl Sink,
 ) -> Result<()> {
     let a = model.dims.attention();
-    let (q_gate, columns) = Slot::projection(model, layer, Projection::AttnQGate)?;
+    let (q_gate, heads) = Slot::projection_heads(model, layer, Projection::AttnQGate)?;
     let (source, q_gate, target) =
         two_inputs_output(buffers, Slot::AttnOut, q_gate, Slot::AttnGated);
-    let (width, pitch) = (a.head_dim(), 2 * a.head_dim());
+    let width = a.head_dim();
+    let pitch = Projection::AttnQGate.head_pitch(width);
     let x = source.view(&[rows, a.q_heads(), width])?;
     let shaped = q_gate.view(&[rows, row_width(q_gate, rows) / pitch, pitch])?;
-    let gate = shaped.slice(&[0..rows, heads(&columns, pitch)?, width..pitch])?;
+    let gate = shaped.slice(&[0..rows, heads, width..pitch])?;
     sink.run(
         attention::output_gate(target.partition([1, width]), &x, &gate).generics(a.gate_generics()),
     )?;
