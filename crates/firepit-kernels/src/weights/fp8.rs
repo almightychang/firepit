@@ -64,6 +64,17 @@ impl HostFp8Matrix {
         Self::new(bits, scales, rows, cols, Fp8Scaling::Rows)
     }
 
+    pub fn zeros(rows: usize, cols: usize, scaling: Fp8Scaling) -> Result<Self, &'static str> {
+        let bits = vec![f8e4m3fn(0); rows * cols];
+        match scaling {
+            Fp8Scaling::Blocks { block_n, block_k } => {
+                let scales = vec![0.0; (rows / block_n) * (cols / block_k)];
+                Self::from_parts(bits, scales, rows, cols, block_n, block_k)
+            }
+            Fp8Scaling::Rows => Self::with_row_scales(bits, vec![0.0; rows], rows, cols),
+        }
+    }
+
     fn new(
         bits: Vec<f8e4m3fn>,
         scales: Vec<f32>,

@@ -280,10 +280,10 @@ fn gpu_gate(
 ) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
     let rows = values.len() / d;
     let x = api::copy_host_vec_to_device(&Arc::new(values.to_vec()))
-        .reshape(&[rows, d])
+        .reshape(&[rows, 1, d])
         .sync_on(stream)?;
     let g = api::copy_host_vec_to_device(&Arc::new(gate.to_vec()))
-        .reshape(&[rows, d])
+        .reshape(&[rows, 1, d])
         .sync_on(stream)?;
     let mut out = api::zeros::<f32>(&[rows, d]).sync_on(stream)?;
     output_gate((&mut out).partition([1, d]), &x, &g)
@@ -387,6 +387,37 @@ fn gate_matches_oracle_and_extremes() -> Result<(), Box<dyn std::error::Error>> 
         .map(|(&x, &g)| x as f64 / (1.0 + (-(g as f64)).exp()))
         .collect();
     assert!(check::max_relative(&actual, &expected) < 3e-6);
+    Ok(())
+}
+
+#[test]
+fn gate_reads_interleaved_gate_heads_of_wider_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let (batch, heads, d) = (3, 4, 32);
+    let row = (heads + 1) * 2 * d;
+    let values: Vec<f32> = (0..batch * heads * d)
+        .map(|i| ((i * 17 % 61) as f32 - 30.0) / 8.0)
+        .collect();
+    let buffer: Vec<f32> = (0..batch * row)
+        .map(|i| ((i * 23 % 89) as f32 - 44.0) / 4.0)
+        .collect();
+    let packed: Vec<f32> = (0..batch)
+        .flat_map(|b| (0..heads).map(move |h| b * row + (2 * h + 1) * d))
+        .flat_map(|start| buffer[start..start + d].to_vec())
+        .collect();
+    let expected = gpu_gate(&stream, &values, &packed, d)?;
+    let x = api::copy_host_vec_to_device(&Arc::new(values))
+        .reshape(&[batch, heads, d])
+        .sync_on(&stream)?;
+    let rows = api::copy_host_vec_to_device(&Arc::new(buffer))
+        .reshape(&[batch, row / (2 * d), 2 * d])
+        .sync_on(&stream)?;
+    let gate = rows.slice(&[0..batch, 0..heads, d..2 * d])?;
+    let mut out = api::zeros::<f32>(&[batch, heads * d]).sync_on(&stream)?;
+    output_gate((&mut out).partition([1, d]), &x, &gate)
+        .generics(vec![d.to_string()])
+        .sync_on(&stream)?;
+    assert_eq!(out.to_host_vec().sync_on(&stream)?, expected);
     Ok(())
 }
 

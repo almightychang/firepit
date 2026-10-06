@@ -159,12 +159,18 @@ mod kernels {
     #[cutile::entry()]
     pub fn output_gate<const D: i32>(
         out: &mut Tensor<f32, { [1, D] }>,
-        input: &Tensor<f32, { [-1, D] }>,
-        gate: &Tensor<f32, { [-1, D] }>,
+        input: &Tensor<f32, { [-1, -1, D] }>,
+        gate: &Tensor<f32, { [-1, -1, D] }>,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
-        let x: Tile<f32, { [1, D] }> = input.partition(shape![1, D]).load([pid.0, 0]);
-        let g: Tile<f32, { [1, D] }> = gate.partition(shape![1, D]).load([pid.0, 0]);
+        let x: Tile<f32, { [1, D] }> = input
+            .partition(shape![1, 1, D])
+            .load([pid.0, pid.1, 0])
+            .reshape(shape![1, D]);
+        let g: Tile<f32, { [1, D] }> = gate
+            .partition(shape![1, 1, D])
+            .load([pid.0, pid.1, 0])
+            .reshape(shape![1, D]);
         let one: Tile<f32, { [1, D] }> = constant(1.0f32, shape![1, D]);
         out.store(x / (one + exp(g * constant(-1.0f32, shape![1, D]))));
     }

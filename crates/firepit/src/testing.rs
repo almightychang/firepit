@@ -1,6 +1,9 @@
-use crate::checkpoint::Stream;
-use crate::model::{AttentionWeights, GdnWeights, LayerWeights, MixerWeights, Model, MoeWeights};
-use crate::{LayerKind, ModelConfig, Result};
+use crate::checkpoint::{HostBf16Tensor, Stream};
+use crate::model::{
+    AttentionWeights, GdnWeights, HostWeight, LayerWeights, MixerWeights, Model, MoeWeights,
+    Projection, fuse_projections,
+};
+use crate::{LayerKind, ModelConfig, Result, WeightFormat};
 use cuda_async::device_operation::DeviceOp;
 use cutile::tensor::Tensor;
 use firepit_kernels::weights::{DenseMatrix, Weight};
@@ -20,16 +23,20 @@ impl Model {
         let mut random = RandomWeights(seed);
         let embedding = random.tensor(&[dims.vocab(), h], stream)?;
         let mut layers = Vec::with_capacity(dims.layers().len());
+        let mut layouts = Vec::new();
         for &kind in dims.layers() {
             let input_norm = random.norm(h, stream)?;
             let mixer = match kind {
                 LayerKind::Gdn => {
                     let g = dims.gdn();
+                    let projections = vec![
+                        random.projection(Projection::GdnQkv, g.conv_dim(), h),
+                        random.projection(Projection::GdnZ, g.value_dim(), h),
+                        random.projection(Projection::GdnB, g.value_heads(), h),
+                        random.projection(Projection::GdnA, g.value_heads(), h),
+                    ];
                     MixerWeights::Gdn(GdnWeights {
-                        qkv: random.matrix(g.conv_dim(), h, stream)?,
-                        z: random.matrix(g.value_dim(), h, stream)?,
-                        b: random.matrix(g.value_heads(), h, stream)?,
-                        a: random.matrix(g.value_heads(), h, stream)?,
+                        projections: fuse_projections(projections, &mut layouts, stream)?,
                         conv: random.tensor(&[g.conv_dim(), g.conv_kernel()], stream)?,
                         a_log: random.tensor(&[g.value_heads()], stream)?,
                         dt_bias: random.tensor(&[g.value_heads()], stream)?,
@@ -39,10 +46,13 @@ impl Model {
                 }
                 LayerKind::Attention => {
                     let a = dims.attention();
+                    let projections = vec![
+                        random.projection(Projection::AttnQGate, 2 * a.q_heads() * a.head_dim(), h),
+                        random.projection(Projection::AttnK, a.kv_heads() * a.head_dim(), h),
+                        random.projection(Projection::AttnV, a.kv_heads() * a.head_dim(), h),
+                    ];
                     MixerWeights::Attention(AttentionWeights {
-                        q_gate: random.matrix(2 * a.q_heads() * a.head_dim(), h, stream)?,
-                        k: random.matrix(a.kv_heads() * a.head_dim(), h, stream)?,
-                        v: random.matrix(a.kv_heads() * a.head_dim(), h, stream)?,
+                        projections: fuse_projections(projections, &mut layouts, stream)?,
                         q_norm: random.norm(a.head_dim(), stream)?,
                         k_norm: random.norm(a.head_dim(), stream)?,
                         out: random.matrix(h, a.q_heads() * a.head_dim(), stream)?,
@@ -54,11 +64,14 @@ impl Model {
             let stacked = m.with_shared_expert().experts();
             let gate_up = random.dense(stacked * 2 * m.intermediate(), h, stream)?;
             let down = random.dense(stacked * h, m.intermediate(), stream)?;
+            let projections = vec![
+                random.projection(Projection::Router, m.experts(), h),
+                random.projection(Projection::SharedGate, 1, h),
+            ];
             let moe = MoeWeights {
-                router: random.matrix(m.experts(), h, stream)?,
+                projections: fuse_projections(projections, &mut layouts, stream)?,
                 gate_up: Weight::Dense(gate_up),
                 down: Weight::Dense(down),
-                shared_gate: random.matrix(1, h, stream)?,
             };
             layers.push(LayerWeights {
                 input_norm,
@@ -76,6 +89,7 @@ impl Model {
             layers,
             final_norm,
             lm_head,
+            projection_layouts: layouts,
         })
     }
 }
@@ -105,11 +119,30 @@ impl RandomWeights {
         Ok(api::copy_host_vec_to_device(&Arc::new(data)).sync_on(stream)?)
     }
 
+    fn values(&mut self, len: usize) -> Vec<bf16> {
+        (0..len).map(|_| bf16::from_f32(self.next())).collect()
+    }
+
     fn dense(&mut self, rows: usize, cols: usize, stream: &Stream) -> Result<DenseMatrix<bf16>> {
-        let data = (0..rows * cols)
-            .map(|_| bf16::from_f32(self.next()))
-            .collect();
-        Ok(DenseMatrix::upload(data, rows, cols, stream)?)
+        Ok(DenseMatrix::upload(
+            self.values(rows * cols),
+            rows,
+            cols,
+            stream,
+        )?)
+    }
+
+    fn projection(
+        &mut self,
+        projection: Projection,
+        rows: usize,
+        cols: usize,
+    ) -> (Projection, WeightFormat, HostWeight) {
+        let weight = HostWeight::Dense(HostBf16Tensor {
+            shape: vec![rows, cols],
+            data: self.values(rows * cols),
+        });
+        (projection, WeightFormat::Bf16, weight)
     }
 
     fn matrix(&mut self, rows: usize, cols: usize, stream: &Stream) -> Result<Weight> {

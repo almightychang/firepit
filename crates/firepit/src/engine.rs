@@ -311,7 +311,7 @@ impl Engine {
             {
                 return Err("invalid prefill session or tokens".into());
             }
-            for op in StepPlan::ops(&self.model) {
+            for op in StepPlan::ops(&self.model)? {
                 if let crate::plan::Op::Gemv { layer, name, .. } = op {
                     if matches!(
                         crate::execute::weight(&self.model, layer, name),
@@ -613,7 +613,7 @@ mod tests {
         )?;
         assert_trace(
             &trace,
-            StepPlan::ops(&traced.model).into_iter().map(Op::kind),
+            StepPlan::ops(&traced.model)?.into_iter().map(Op::kind),
         );
         Ok(())
     }

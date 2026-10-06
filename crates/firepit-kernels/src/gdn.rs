@@ -266,12 +266,12 @@ mod kernels {
     #[cutile::entry()]
     pub fn gated_silu<const DV: i32>(
         out: &mut Tensor<f32, { [1, DV] }>,
-        input: &Tensor<f32, { [-1, DV] }>,
-        gate: &Tensor<f32, { [-1, DV] }>,
+        input: &Tensor<f32, { [-1, -1] }>,
+        gate: &Tensor<f32, { [-1, -1] }>,
     ) {
         let pid: (i32, i32, i32) = get_tile_block_id();
-        let x: Tile<f32, { [1, DV] }> = input.partition(shape![1, DV]).load([pid.0, 0]);
-        let z: Tile<f32, { [1, DV] }> = gate.partition(shape![1, DV]).load([pid.0, 0]);
+        let x: Tile<f32, { [1, DV] }> = input.partition(shape![1, DV]).load([pid.0, pid.1]);
+        let z: Tile<f32, { [1, DV] }> = gate.partition(shape![1, DV]).load([pid.0, pid.1]);
         let one: Tile<f32, { [1, DV] }> = constant(1.0f32, shape![1, DV]);
         let negative: Tile<f32, { [1, DV] }> = constant(-1.0f32, shape![1, DV]);
         out.store(x * z / (one + exp(z * negative)));

@@ -2,8 +2,11 @@ use crate::Result;
 use crate::checkpoint::Stream;
 #[cfg(feature = "testing")]
 use crate::engine::RoutingLayerTrace;
-use crate::execute::{input_output, two_inputs_output, weight, weight_gemv_tile};
-use crate::model::{MixerWeights, Model};
+use crate::execute::{
+    gdn_gate, heads, input_output, output_gate, rms_norm, row_width, two_inputs_output, weight,
+    weight_gemv_tile,
+};
+use crate::model::{MixerWeights, Model, Projection};
 use crate::plan::{NormName, Op, Slot, StepPlan, WeightName};
 use crate::session::{GdnStateLayout, LayerState, Session};
 use cuda_async::device_operation::DeviceOp;
@@ -19,7 +22,7 @@ use firepit_kernels::gemv::gemv;
 use firepit_kernels::moe::{PrefillLayout as MoePrefillLayout, PrefillPlan as MoePrefillPlan};
 use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::Weight;
-use firepit_kernels::{attention, elementwise, embedding, gdn, gdn_chunk, moe, norm, rope, swiglu};
+use firepit_kernels::{attention, elementwise, embedding, gdn, gdn_chunk, moe, rope, swiglu};
 use std::sync::Arc;
 
 const CHUNK: usize = gdn_chunk::DEFAULT_CHUNK_SIZE;
@@ -129,7 +132,7 @@ pub enum PrefillOp {
     ChunkSecond { layer: usize },
     CacheAppend { layer: usize },
     CausalAttention { layer: usize },
-    TopK,
+    TopK { layer: usize },
     HostSort,
     Gather,
     ExpertGateUp { layer: usize },
@@ -155,7 +158,7 @@ impl PrefillOp {
             Self::ChunkSecond { .. } => "gdn_chunk_second",
             Self::CacheAppend { .. } => "cache_append",
             Self::CausalAttention { .. } => "causal_attention",
-            Self::TopK => "moe_top_k",
+            Self::TopK { .. } => "moe_top_k",
             Self::HostSort => "moe_host_sort",
             Self::Gather => "moe_gather",
             Self::ExpertGateUp { .. } | Self::ExpertDown { .. } => "moe_grouped_gemm",
@@ -249,7 +252,7 @@ impl PrefillPlan {
             DEFAULT_GROUPED_GEMM_TILE.m,
         )?;
         let mut ops = Vec::new();
-        for op in StepPlan::ops(model) {
+        for op in StepPlan::ops(model)? {
             match op {
                 Op::GdnConv { layer } => ops.push(PrefillOp::Conv { layer }),
                 Op::GdnDelta { layer } => {
@@ -265,8 +268,8 @@ impl PrefillPlan {
                 }
                 Op::CacheAppend { layer } => ops.push(PrefillOp::CacheAppend { layer }),
                 Op::OnlineAttention { layer } => ops.push(PrefillOp::CausalAttention { layer }),
-                Op::TopK { .. } => {
-                    ops.push(PrefillOp::TopK);
+                Op::TopK { layer } => {
+                    ops.push(PrefillOp::TopK { layer });
                     ops.push(PrefillOp::HostSort);
                     ops.push(PrefillOp::Gather);
                 }
@@ -276,9 +279,8 @@ impl PrefillPlan {
                 _ => ops.push(PrefillOp::Kernel(op)),
             }
         }
-        let buffers = Slot::ALL
-            .iter()
-            .map(|&slot| {
+        let buffers = Slot::all(model)
+            .map(|slot| {
                 let mut shape = PrefillSlot::Sequence(slot).shape(model, rows, len);
                 if matches!(slot, Slot::ExpertUp | Slot::ExpertAct | Slot::ExpertOut) {
                     shape[0] = max_moe_rows;
@@ -458,7 +460,6 @@ pub(crate) fn run_routing_observed(
 ) -> Result<Vec<RoutingLayerTrace>> {
     let mut layers = Vec::<RoutingLayerTrace>::new();
     let last_row = plan.scored.start;
-    let experts = model.dims.moe().experts();
     let top_k = model.dims.moe().top_k();
     let hidden = model.dims.hidden();
     run_inner(
@@ -470,18 +471,17 @@ pub(crate) fn run_routing_observed(
         last_row,
         |op, plan| {
             match op {
-                PrefillOp::TopK => {
-                    let logits: Vec<f32> = plan.buffers[Slot::Router.index()]
-                        .dup()
-                        .to_host_vec()
-                        .sync_on(stream)?;
+                PrefillOp::TopK { layer } => {
+                    let (router, columns) = Slot::projection(model, layer, Projection::Router)?;
+                    let router = &plan.buffers[router.index()];
+                    let logits: Vec<f32> = router.dup().to_host_vec().sync_on(stream)?;
                     let ids: Vec<i32> = plan.top_ids.dup().to_host_vec().sync_on(stream)?;
                     let width = model.dims.moe().with_shared_expert().width();
                     let mut trace = RoutingLayerTrace::default();
                     trace.router_logits = logits
-                        .chunks_exact(experts)
+                        .chunks_exact(row_width(router, plan.rows))
                         .take(plan.len)
-                        .map(|row| row.to_vec())
+                        .map(|row| row[columns.clone()].to_vec())
                         .collect();
                     trace.selected = ids
                         .chunks_exact(width)
@@ -592,7 +592,7 @@ pub(crate) fn run_isolated_layer(
         last,
         |op, plan| {
             match op {
-                PrefillOp::TopK => {
+                PrefillOp::TopK { .. } => {
                     let width = model.dims.moe().with_shared_expert().width();
                     let ids: Vec<i32> = plan.top_ids.dup().to_host_vec().sync_on(stream)?;
                     trace.selected =
@@ -628,8 +628,6 @@ fn run_inner(
     mut after_op: impl FnMut(PrefillOp, &PrefillPlan) -> Result<()>,
 ) -> Result<()> {
     let d = &model.dims;
-    let g = d.gdn();
-    let a = d.attention();
     let m = d.moe();
     let rows = plan.rows;
     let len = plan.len;
@@ -650,95 +648,13 @@ fn run_inner(
                     input,
                     out,
                 }) => {
-                    let (source, target) = input_output(&mut plan.buffers, input, out);
-                    let (width, count, gamma, eps) = match name {
-                        NormName::Input => (
-                            d.hidden(),
-                            rows,
-                            &model.layers[layer].input_norm,
-                            d.norm_eps(),
-                        ),
-                        NormName::Post => (
-                            d.hidden(),
-                            rows,
-                            &model.layers[layer].post_norm,
-                            d.norm_eps(),
-                        ),
-                        NormName::Final => (
-                            d.hidden(),
-                            plan.scored.outer().len(),
-                            &model.final_norm,
-                            d.norm_eps(),
-                        ),
-                        NormName::Q => {
-                            let MixerWeights::Attention(w) = &model.layers[layer].mixer else {
-                                unreachable!()
-                            };
-                            (a.head_dim(), rows * a.q_heads(), &w.q_norm, d.norm_eps())
-                        }
-                        NormName::K => {
-                            let MixerWeights::Attention(w) = &model.layers[layer].mixer else {
-                                unreachable!()
-                            };
-                            (a.head_dim(), rows * a.kv_heads(), &w.k_norm, d.norm_eps())
-                        }
-                        NormName::GdnGated => {
-                            let MixerWeights::Gdn(w) = &model.layers[layer].mixer else {
-                                unreachable!()
-                            };
-                            (
-                                g.value_head_dim(),
-                                rows * g.value_heads(),
-                                &w.gated_norm,
-                                g.eps(),
-                            )
-                        }
+                    let selected = match name {
+                        NormName::Final if plan.scored.len() == 1 => lm_head_row..lm_head_row + 1,
+                        NormName::Final => plan.scored.outer(),
+                        _ => 0..rows,
                     };
-                    if matches!(name, NormName::Final) {
-                        let shaped = source.view(&[rows, width])?;
-                        let range = if plan.scored.len() == 1 {
-                            lm_head_row..lm_head_row + 1
-                        } else {
-                            plan.scored.outer()
-                        };
-                        let x = shaped.slice(&[range.clone(), 0..width])?;
-                        let y = target.slice_mut(&[range, 0..width])?;
-                        sink.run(
-                            norm::rms_norm(
-                                y.partition([1, width]),
-                                &x,
-                                gamma,
-                                1.0 / width as f32,
-                                eps,
-                            )
-                            .generics(vec![width.to_string()]),
-                        )?;
-                    } else if matches!(name, NormName::Q) {
-                        let shaped = source.view(&[count, 2 * width])?;
-                        let x = shaped.slice(&[0..count, 0..width])?;
-                        sink.run(
-                            norm::rms_norm(
-                                target.partition([1, width]),
-                                &x,
-                                gamma,
-                                1.0 / width as f32,
-                                eps,
-                            )
-                            .generics(vec![width.to_string()]),
-                        )?;
-                    } else {
-                        let x = source.view(&[count, width])?;
-                        sink.run(
-                            norm::rms_norm(
-                                target.partition([1, width]),
-                                &x,
-                                gamma,
-                                1.0 / width as f32,
-                                eps,
-                            )
-                            .generics(vec![width.to_string()]),
-                        )?;
-                    }
+                    let (source, target) = input_output(&mut plan.buffers, input, out);
+                    rms_norm(model, layer, name, source, target, rows, selected, sink)?;
                 }
                 PrefillOp::Kernel(Op::Gemv {
                     layer,
@@ -748,12 +664,7 @@ fn run_inner(
                 }) => {
                     let (source, target) = input_output(&mut plan.buffers, input, out);
                     let w = weight(model, layer, name);
-                    let cols = source
-                        .shape()
-                        .iter()
-                        .map(|&x| x as usize)
-                        .product::<usize>()
-                        / rows;
+                    let cols = row_width(source, rows);
                     let output_rows = w.rows();
                     if matches!(name, WeightName::LmHead) {
                         let shaped = source.view(&[rows, cols])?;
@@ -812,15 +723,8 @@ fn run_inner(
                         }
                     }
                 }
-                PrefillOp::Kernel(Op::GdnGate) => {
-                    let (source, gate, target) =
-                        two_inputs_output(&mut plan.buffers, Slot::MixerNorm, Slot::Z, Slot::Gated);
-                    let x = source.view(&[rows * g.value_heads(), g.value_head_dim()])?;
-                    let z = gate.view(&[rows * g.value_heads(), g.value_head_dim()])?;
-                    sink.run(
-                        gdn::gated_silu(target.partition([1, g.value_head_dim()]), &x, &z)
-                            .generics(vec![g.value_head_dim().to_string()]),
-                    )?;
+                PrefillOp::Kernel(Op::GdnGate { layer }) => {
+                    gdn_gate(model, layer, &mut plan.buffers, rows, sink)?
                 }
                 PrefillOp::Kernel(Op::AttnRope { query }) => {
                     let (input, out, rdims) = if query {
@@ -840,22 +744,8 @@ fn run_inner(
                         .generics(rope::generics(&rdims)),
                     )?;
                 }
-                PrefillOp::Kernel(Op::OutputGate) => {
-                    let (source, qgate, target) = two_inputs_output(
-                        &mut plan.buffers,
-                        Slot::AttnOut,
-                        Slot::QGate,
-                        Slot::AttnGated,
-                    );
-                    let width = a.head_dim();
-                    let count = rows * a.q_heads();
-                    let x = source.view(&[count, width])?;
-                    let shaped = qgate.view(&[count, 2 * width])?;
-                    let gate = shaped.slice(&[0..count, width..2 * width])?;
-                    sink.run(
-                        attention::output_gate(target.partition([1, width]), &x, &gate)
-                            .generics(a.gate_generics()),
-                    )?;
+                PrefillOp::Kernel(Op::OutputGate { layer }) => {
+                    output_gate(model, layer, &mut plan.buffers, rows, sink)?
                 }
                 PrefillOp::Kernel(Op::ExpertSwiglu) => {
                     let count = plan
@@ -916,9 +806,9 @@ fn run_special(
                 unreachable!()
             };
             let layout = GdnStateLayout::new(g);
-            let (source, target) = input_output(&mut plan.buffers, Slot::Qkv, Slot::Conv);
-            let shaped = source.view(&[rows, g.conv_dim()])?;
-            let x = shaped.slice(&[0..len, 0..g.conv_dim()])?;
+            let (qkv, columns) = Slot::projection(model, layer, Projection::GdnQkv)?;
+            let (source, target) = input_output(&mut plan.buffers, qkv, Slot::Conv);
+            let x = source.slice(&[0..len, columns])?;
             let y = target.slice_mut(&[0..len, 0..g.conv_dim()])?;
             let LayerState::Gdn { conv, .. } = &mut session.state[layer] else {
                 unreachable!()
@@ -968,10 +858,10 @@ fn run_special(
             };
             let x = plan.buffers[Slot::Conv.index()].view(&[rows, g.conv_dim()])?;
             let v_slice = x.slice(&[0..rows, 2 * g.key_dim()..g.conv_dim()])?;
-            let a_shaped = plan.buffers[Slot::A.index()].view(&[rows, g.value_heads()])?;
-            let b_shaped = plan.buffers[Slot::B.index()].view(&[rows, g.value_heads()])?;
-            let av = a_shaped.slice(&[0..rows, 0..g.value_heads()])?;
-            let bv = b_shaped.slice(&[0..rows, 0..g.value_heads()])?;
+            let (a_slot, a_columns) = Slot::projection(model, layer, Projection::GdnA)?;
+            let (b_slot, b_columns) = Slot::projection(model, layer, Projection::GdnB)?;
+            let av = plan.buffers[a_slot.index()].slice(&[0..rows, a_columns])?;
+            let bv = plan.buffers[b_slot.index()].slice(&[0..rows, b_columns])?;
             let c = plan.chunk.as_mut().unwrap();
             sink.run(
                 gdn::prepare_chunk_value_gate(
@@ -1112,10 +1002,12 @@ fn run_special(
         PrefillOp::CacheAppend { layer } => {
             let k_shaped =
                 plan.buffers[Slot::KRot.index()].view(&[rows, a.kv_heads(), a.head_dim()])?;
-            let v_shaped =
-                plan.buffers[Slot::V.index()].view(&[rows, a.kv_heads(), a.head_dim()])?;
+            let (v, columns) = Slot::projection(model, layer, Projection::AttnV)?;
+            let v = &plan.buffers[v.index()];
+            let v_shaped = v.view(&[rows, row_width(v, rows) / a.head_dim(), a.head_dim()])?;
             let keys = k_shaped.slice(&[0..len, 0..a.kv_heads(), 0..a.head_dim()])?;
-            let values = v_shaped.slice(&[0..len, 0..a.kv_heads(), 0..a.head_dim()])?;
+            let values =
+                v_shaped.slice(&[0..len, heads(&columns, a.head_dim())?, 0..a.head_dim()])?;
             let LayerState::Attention { k, v } = &mut session.state[layer] else {
                 unreachable!()
             };
@@ -1159,9 +1051,11 @@ fn run_special(
                 .generics(a.prefill_generics(DEFAULT_PREFILL_TILE)),
             )?;
         }
-        PrefillOp::TopK => {
-            let logits = plan.buffers[Slot::Router.index()].slice(&[0..len, 0..m.experts()])?;
-            let gate = plan.buffers[Slot::SharedGate.index()].slice(&[0..len, 0..1])?;
+        PrefillOp::TopK { layer } => {
+            let (router, router_columns) = Slot::projection(model, layer, Projection::Router)?;
+            let (gate, gate_columns) = Slot::projection(model, layer, Projection::SharedGate)?;
+            let logits = plan.buffers[router.index()].slice(&[0..len, router_columns])?;
+            let gate = plan.buffers[gate.index()].slice(&[0..len, gate_columns])?;
             let width = m.with_shared_expert().width();
             sink.run(
                 moe::top_k_prefill(

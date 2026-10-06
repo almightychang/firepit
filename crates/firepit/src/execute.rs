@@ -3,12 +3,12 @@ use crate::Result;
 use crate::checkpoint::Stream;
 #[cfg(feature = "testing")]
 use crate::engine::RoutingLayerTrace;
-use crate::model::{MixerWeights, Model};
+use crate::model::{MixerWeights, Model, Projection};
 use crate::plan::{NormName, Op, Slot, StepPlan, WeightName};
 use crate::session::{LayerState, Session};
 #[cfg(feature = "testing")]
 use cuda_async::device_operation::DeviceOp;
-use cutile::tensor::{IntoPartition, PartitionMut, Tensor};
+use cutile::tensor::{IntoPartition, PartitionMut, Tensor, TensorView};
 use cutile::tile_kernel::TileKernel;
 #[cfg(feature = "testing")]
 use cutile::tile_kernel::ToHostVecOp;
@@ -18,6 +18,7 @@ use firepit_kernels::gemv::{
 use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::{Fp8Scaling, Q8_BLOCK, Weight};
 use firepit_kernels::{attention, elementwise, embedding, gdn, moe, norm, rope, swiglu};
+use std::ops::Range;
 
 pub(crate) fn input_output(
     buffers: &mut [Tensor<f32>],
@@ -78,6 +79,18 @@ pub(crate) fn gemv_tile(rows: usize, cols: usize) -> GemvTile {
     tile
 }
 
+pub(crate) fn fp8_gemv_tile(
+    scaling: Fp8Scaling,
+    rows: usize,
+    cols: usize,
+    groups: usize,
+) -> GemvTile {
+    match scaling {
+        Fp8Scaling::Blocks { block_n, block_k } => fp8_tile(rows, cols, block_n, block_k, groups),
+        Fp8Scaling::Rows => row_scaled_tile(rows, cols, groups),
+    }
+}
+
 pub(crate) fn weight_gemv_tile(
     weight: &Weight,
     rows: usize,
@@ -85,64 +98,197 @@ pub(crate) fn weight_gemv_tile(
     groups: usize,
 ) -> GemvTile {
     match weight {
-        Weight::Fp8(w) => match w.scaling {
-            Fp8Scaling::Blocks { block_n, block_k } => {
-                fp8_tile(rows, cols, block_n, block_k, groups)
-            }
-            Fp8Scaling::Rows => row_scaled_tile(rows, cols, groups),
-        },
+        Weight::Fp8(w) => fp8_gemv_tile(w.scaling, rows, cols, groups),
         Weight::Nvfp4(_) => row_scaled_tile(rows, cols, groups),
         _ => gemv_tile(rows, cols),
     }
 }
 
 pub(crate) fn weight(model: &Model, layer: usize, name: WeightName) -> &Weight {
-    use WeightName::*;
-    if matches!(name, LmHead) {
+    if matches!(name, WeightName::LmHead) {
         return &model.lm_head;
     }
     let layer = &model.layers[layer];
-    match name {
-        GdnQkv => match &layer.mixer {
-            MixerWeights::Gdn(w) => &w.qkv,
-            _ => unreachable!(),
-        },
-        GdnZ => match &layer.mixer {
-            MixerWeights::Gdn(w) => &w.z,
-            _ => unreachable!(),
-        },
-        GdnB => match &layer.mixer {
-            MixerWeights::Gdn(w) => &w.b,
-            _ => unreachable!(),
-        },
-        GdnA => match &layer.mixer {
-            MixerWeights::Gdn(w) => &w.a,
-            _ => unreachable!(),
-        },
-        GdnOut => match &layer.mixer {
-            MixerWeights::Gdn(w) => &w.out,
-            _ => unreachable!(),
-        },
-        AttnQGate => match &layer.mixer {
-            MixerWeights::Attention(w) => &w.q_gate,
-            _ => unreachable!(),
-        },
-        AttnK => match &layer.mixer {
-            MixerWeights::Attention(w) => &w.k,
-            _ => unreachable!(),
-        },
-        AttnV => match &layer.mixer {
-            MixerWeights::Attention(w) => &w.v,
-            _ => unreachable!(),
-        },
-        AttnOut => match &layer.mixer {
-            MixerWeights::Attention(w) => &w.out,
-            _ => unreachable!(),
-        },
-        Router => &layer.moe.router,
-        SharedGate => &layer.moe.shared_gate,
-        LmHead => unreachable!(),
+    match (name, &layer.mixer) {
+        (WeightName::MixerProjection(group), mixer) => &mixer.projections()[group].weight,
+        (WeightName::GdnOut, MixerWeights::Gdn(w)) => &w.out,
+        (WeightName::AttnOut, MixerWeights::Attention(w)) => &w.out,
+        (WeightName::MoeProjection(group), _) => &layer.moe.projections[group].weight,
+        _ => unreachable!(),
     }
+}
+
+pub(crate) fn row_width(tensor: &Tensor<f32>, rows: usize) -> usize {
+    tensor
+        .shape()
+        .iter()
+        .map(|&x| x as usize)
+        .product::<usize>()
+        / rows
+}
+
+pub(crate) fn heads(columns: &Range<usize>, pitch: usize) -> Result<Range<usize>> {
+    if columns.start % pitch != 0 || columns.end % pitch != 0 {
+        return Err(format!("columns {columns:?} do not split into heads of {pitch}").into());
+    }
+    Ok(columns.start / pitch..columns.end / pitch)
+}
+
+struct ProjectionRows<'a> {
+    flat: TensorView<'a, f32>,
+    width: usize,
+    columns: Range<usize>,
+}
+
+impl<'a> ProjectionRows<'a> {
+    fn new(buffer: &'a Tensor<f32>, columns: Range<usize>) -> Result<Self> {
+        let width = buffer.shape()[1] as usize;
+        Ok(Self {
+            flat: buffer.view(&[buffer.shape()[0] as usize * width])?,
+            width,
+            columns,
+        })
+    }
+
+    fn row(&self, row: usize) -> Result<TensorView<'_, f32>> {
+        let start = row * self.width;
+        Ok(self
+            .flat
+            .slice(&[start + self.columns.start..start + self.columns.end])?)
+    }
+}
+
+struct NormInput<'a> {
+    gamma: &'a Tensor<f32>,
+    eps: f32,
+    width: usize,
+    pitch: usize,
+    heads: Range<usize>,
+}
+
+impl<'a> NormInput<'a> {
+    fn rows(gamma: &'a Tensor<f32>, eps: f32, width: usize) -> Self {
+        Self {
+            gamma,
+            eps,
+            width,
+            pitch: width,
+            heads: 0..1,
+        }
+    }
+
+    fn new(model: &'a Model, layer: usize, name: NormName) -> Result<Self> {
+        let d = &model.dims;
+        let head_dim = d.attention().head_dim();
+        Ok(match (name, &model.layers[layer].mixer) {
+            (NormName::Input, _) => {
+                Self::rows(&model.layers[layer].input_norm, d.norm_eps(), d.hidden())
+            }
+            (NormName::Post, _) => {
+                Self::rows(&model.layers[layer].post_norm, d.norm_eps(), d.hidden())
+            }
+            (NormName::Final, _) => Self::rows(&model.final_norm, d.norm_eps(), d.hidden()),
+            (NormName::Q, MixerWeights::Attention(w)) => {
+                let (_, columns) = model.projection(layer, Projection::AttnQGate)?;
+                Self {
+                    gamma: &w.q_norm,
+                    eps: d.norm_eps(),
+                    width: head_dim,
+                    pitch: 2 * head_dim,
+                    heads: heads(&columns, 2 * head_dim)?,
+                }
+            }
+            (NormName::K, MixerWeights::Attention(w)) => {
+                let (_, columns) = model.projection(layer, Projection::AttnK)?;
+                Self {
+                    gamma: &w.k_norm,
+                    eps: d.norm_eps(),
+                    width: head_dim,
+                    pitch: head_dim,
+                    heads: heads(&columns, head_dim)?,
+                }
+            }
+            (NormName::GdnGated, MixerWeights::Gdn(w)) => {
+                let g = d.gdn();
+                Self {
+                    gamma: &w.gated_norm,
+                    eps: g.eps(),
+                    width: g.value_head_dim(),
+                    pitch: g.value_head_dim(),
+                    heads: 0..g.value_heads(),
+                }
+            }
+            _ => unreachable!(),
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rms_norm(
+    model: &Model,
+    layer: usize,
+    name: NormName,
+    source: &Tensor<f32>,
+    target: &mut Tensor<f32>,
+    rows: usize,
+    selected: Range<usize>,
+    sink: &mut impl Sink,
+) -> Result<()> {
+    let norm = NormInput::new(model, layer, name)?;
+    let shaped = source.view(&[rows, row_width(source, rows) / norm.pitch, norm.pitch])?;
+    let y = target.slice_mut(&[selected.clone(), 0..norm.heads.len() * norm.width])?;
+    let x = shaped.slice(&[selected, norm.heads, 0..norm.width])?;
+    sink.run(
+        norm::rms_norm(
+            y.partition([1, norm.width]),
+            &x,
+            norm.gamma,
+            1.0 / norm.width as f32,
+            norm.eps,
+        )
+        .generics(vec![norm.width.to_string()]),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn gdn_gate(
+    model: &Model,
+    layer: usize,
+    buffers: &mut [Tensor<f32>],
+    rows: usize,
+    sink: &mut impl Sink,
+) -> Result<()> {
+    let g = model.dims.gdn();
+    let (z, columns) = Slot::projection(model, layer, Projection::GdnZ)?;
+    let (source, gate, target) = two_inputs_output(buffers, Slot::MixerNorm, z, Slot::Gated);
+    let x = source.view(&[rows, g.value_dim()])?;
+    let z = gate.slice(&[0..rows, columns])?;
+    sink.run(
+        gdn::gated_silu(target.partition([1, g.value_head_dim()]), &x, &z)
+            .generics(vec![g.value_head_dim().to_string()]),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn output_gate(
+    model: &Model,
+    layer: usize,
+    buffers: &mut [Tensor<f32>],
+    rows: usize,
+    sink: &mut impl Sink,
+) -> Result<()> {
+    let a = model.dims.attention();
+    let (q_gate, columns) = Slot::projection(model, layer, Projection::AttnQGate)?;
+    let (source, q_gate, target) =
+        two_inputs_output(buffers, Slot::AttnOut, q_gate, Slot::AttnGated);
+    let (width, pitch) = (a.head_dim(), 2 * a.head_dim());
+    let x = source.view(&[rows, a.q_heads(), width])?;
+    let shaped = q_gate.view(&[rows, row_width(q_gate, rows) / pitch, pitch])?;
+    let gate = shaped.slice(&[0..rows, heads(&columns, pitch)?, width..pitch])?;
+    sink.run(
+        attention::output_gate(target.partition([1, width]), &x, &gate).generics(a.gate_generics()),
+    )?;
+    Ok(())
 }
 
 pub(crate) fn run(
@@ -165,7 +311,6 @@ pub(crate) fn run_routing_observed(
         return Err("routing observation requires one session".into());
     }
     let mut layers = Vec::<RoutingLayerTrace>::new();
-    let experts = model.dims.moe().experts();
     let top_k = model.dims.moe().top_k();
     let hidden = model.dims.hidden();
     run_inner(
@@ -176,7 +321,8 @@ pub(crate) fn run_routing_observed(
         |op, plan| {
             match op {
                 Op::TopK { layer } => {
-                    let logits: Vec<f32> = plan.buffers[Slot::Router.index()]
+                    let (router, columns) = Slot::projection(model, layer, Projection::Router)?;
+                    let logits: Vec<f32> = plan.buffers[router.index()]
                         .dup()
                         .to_host_vec()
                         .sync_on(stream)?;
@@ -186,7 +332,7 @@ pub(crate) fn run_routing_observed(
                         .to_host_vec()
                         .sync_on(stream)?;
                     let mut trace = RoutingLayerTrace::default();
-                    trace.router_logits.push(logits[..experts].to_vec());
+                    trace.router_logits.push(logits[columns].to_vec());
                     trace.selected.push(ids[..top_k].to_vec());
                     layers.push(trace);
                 }
@@ -244,73 +390,7 @@ fn run_inner(
                     out,
                 } => {
                     let (source, target) = input_output(&mut plan.buffers, input, out);
-                    let (width, rows, gamma, eps) = match name {
-                        NormName::Input => (
-                            d.hidden(),
-                            batch,
-                            &model.layers[layer].input_norm,
-                            d.norm_eps(),
-                        ),
-                        NormName::Post => (
-                            d.hidden(),
-                            batch,
-                            &model.layers[layer].post_norm,
-                            d.norm_eps(),
-                        ),
-                        NormName::Final => (d.hidden(), batch, &model.final_norm, d.norm_eps()),
-                        NormName::Q => {
-                            let w = match &model.layers[layer].mixer {
-                                MixerWeights::Attention(w) => w,
-                                _ => unreachable!(),
-                            };
-                            (a.head_dim(), batch * a.q_heads(), &w.q_norm, d.norm_eps())
-                        }
-                        NormName::K => {
-                            let w = match &model.layers[layer].mixer {
-                                MixerWeights::Attention(w) => w,
-                                _ => unreachable!(),
-                            };
-                            (a.head_dim(), batch * a.kv_heads(), &w.k_norm, d.norm_eps())
-                        }
-                        NormName::GdnGated => {
-                            let w = match &model.layers[layer].mixer {
-                                MixerWeights::Gdn(w) => w,
-                                _ => unreachable!(),
-                            };
-                            (
-                                g.value_head_dim(),
-                                batch * g.value_heads(),
-                                &w.gated_norm,
-                                g.eps(),
-                            )
-                        }
-                    };
-                    if matches!(name, NormName::Q) {
-                        let q_gate = source.view(&[rows, 2 * width])?;
-                        let q = q_gate.slice(&[0..rows, 0..width])?;
-                        sink.run(
-                            norm::rms_norm(
-                                target.partition([1, width]),
-                                &q,
-                                gamma,
-                                1.0 / width as f32,
-                                eps,
-                            )
-                            .generics(vec![width.to_string()]),
-                        )?;
-                    } else {
-                        let input = source.view(&[rows, width])?;
-                        sink.run(
-                            norm::rms_norm(
-                                target.partition([1, width]),
-                                &input,
-                                gamma,
-                                1.0 / width as f32,
-                                eps,
-                            )
-                            .generics(vec![width.to_string()]),
-                        )?;
-                    }
+                    rms_norm(model, layer, name, source, target, batch, 0..batch, sink)?;
                 }
                 Op::Gemv {
                     layer,
@@ -319,12 +399,7 @@ fn run_inner(
                     out,
                 } => {
                     let (source, target) = input_output(&mut plan.buffers, input, out);
-                    let cols = source
-                        .shape()
-                        .iter()
-                        .map(|&x| x as usize)
-                        .product::<usize>()
-                        / batch;
+                    let cols = row_width(source, batch);
                     let rows = target.shape()[1] as usize;
                     let x = source.view(&[batch, cols / Q8_BLOCK, Q8_BLOCK])?;
                     let w = weight(model, layer, name);
@@ -340,12 +415,13 @@ fn run_inner(
                         MixerWeights::Gdn(w) => w,
                         _ => unreachable!(),
                     };
-                    let (source, target) = input_output(&mut plan.buffers, Slot::Qkv, Slot::Conv);
+                    let (qkv, columns) = Slot::projection(model, layer, Projection::GdnQkv)?;
+                    let (source, target) = input_output(&mut plan.buffers, qkv, Slot::Conv);
+                    let source = ProjectionRows::new(source, columns)?;
                     let tile = plan.gdn_conv_tile;
                     let kernel_tile = g.conv_kernel().next_power_of_two();
                     for (b, session) in sessions.iter_mut().enumerate() {
-                        let source_row = source.slice(&[b..b + 1, 0..g.conv_dim()])?;
-                        let x = source_row.view(&[g.conv_dim()])?;
+                        let x = source.row(b)?;
                         let y = target.slice_mut(&[b * g.conv_dim()..(b + 1) * g.conv_dim()])?;
                         let LayerState::Gdn { conv, .. } = &mut session.state[layer] else {
                             unreachable!()
@@ -366,13 +442,17 @@ fn run_inner(
                         MixerWeights::Gdn(w) => w,
                         _ => unreachable!(),
                     };
+                    let (b_slot, b_columns) = Slot::projection(model, layer, Projection::GdnB)?;
+                    let (a_slot, a_columns) = Slot::projection(model, layer, Projection::GdnA)?;
                     let (conv, b_values, a_values, output) = three_inputs_output(
                         &mut plan.buffers,
                         Slot::Conv,
-                        Slot::B,
-                        Slot::A,
+                        b_slot,
+                        a_slot,
                         Slot::Mixer,
                     );
+                    let b_values = ProjectionRows::new(b_values, b_columns)?;
+                    let a_values = ProjectionRows::new(a_values, a_columns)?;
                     for (b, session) in sessions.iter_mut().enumerate() {
                         let x = conv.slice(&[b * g.conv_dim()..(b + 1) * g.conv_dim()])?;
                         let q_slice = x.slice(&[0..g.key_dim()])?;
@@ -381,10 +461,8 @@ fn run_inner(
                         let query = q_slice.view(&[g.key_heads(), g.key_head_dim()])?;
                         let key = k_slice.view(&[g.key_heads(), g.key_head_dim()])?;
                         let value = v_slice.view(&[g.value_heads(), g.value_head_dim()])?;
-                        let b_slice = b_values.slice(&[b..b + 1, 0..g.value_heads()])?;
-                        let a_slice = a_values.slice(&[b..b + 1, 0..g.value_heads()])?;
-                        let b_gate = b_slice.view(&[g.value_heads()])?;
-                        let a_gate = a_slice.view(&[g.value_heads()])?;
+                        let b_gate = b_values.row(b)?;
+                        let a_gate = a_values.row(b)?;
                         let y = output.slice_mut(&[
                             b * g.value_heads()..(b + 1) * g.value_heads(),
                             0..1,
@@ -412,16 +490,7 @@ fn run_inner(
                         )?;
                     }
                 }
-                Op::GdnGate => {
-                    let (source, gate, target) =
-                        two_inputs_output(&mut plan.buffers, Slot::MixerNorm, Slot::Z, Slot::Gated);
-                    let x = source.view(&[batch * g.value_heads(), g.value_head_dim()])?;
-                    let z = gate.view(&[batch * g.value_heads(), g.value_head_dim()])?;
-                    sink.run(
-                        gdn::gated_silu(target.partition([1, g.value_head_dim()]), &x, &z)
-                            .generics(vec![g.value_head_dim().to_string()]),
-                    )?;
-                }
+                Op::GdnGate { layer } => gdn_gate(model, layer, &mut plan.buffers, batch, sink)?,
                 Op::AttnRope { query } => {
                     let (input, out, rdims) = if query {
                         (Slot::QNorm, Slot::QRot, d.q_rope())
@@ -442,12 +511,12 @@ fn run_inner(
                 }
                 Op::CacheAppend { layer } => {
                     let keys = &plan.buffers[Slot::KRot.index()];
-                    let values = &plan.buffers[Slot::V.index()];
+                    let (v, columns) = Slot::projection(model, layer, Projection::AttnV)?;
+                    let values = ProjectionRows::new(&plan.buffers[v.index()], columns)?;
                     for (b, session) in sessions.iter_mut().enumerate() {
                         let key_row = keys
                             .slice(&[b * a.kv_heads()..(b + 1) * a.kv_heads(), 0..a.head_dim()])?;
-                        let value_row =
-                            values.slice(&[b..b + 1, 0..a.kv_heads() * a.head_dim()])?;
+                        let value_row = values.row(b)?;
                         let key = key_row.view(&[a.kv_heads(), a.head_dim()])?;
                         let value = value_row.view(&[a.kv_heads(), a.head_dim()])?;
                         let LayerState::Attention { k, v } = &mut session.state[layer] else {
@@ -491,30 +560,21 @@ fn run_inner(
                         )?;
                     }
                 }
-                Op::OutputGate => {
-                    let (source, q_gate, target) = two_inputs_output(
-                        &mut plan.buffers,
-                        Slot::AttnOut,
-                        Slot::QGate,
-                        Slot::AttnGated,
-                    );
-                    let width = a.head_dim();
-                    let q_gate_rows = q_gate.view(&[batch * a.q_heads(), 2 * width])?;
-                    let gate = q_gate_rows.slice(&[0..batch * a.q_heads(), width..2 * width])?;
-                    let x = source.view(&[batch * a.q_heads(), width])?;
-                    sink.run(
-                        attention::output_gate(target.partition([1, width]), &x, &gate)
-                            .generics(a.gate_generics()),
-                    )?;
+                Op::OutputGate { layer } => {
+                    output_gate(model, layer, &mut plan.buffers, batch, sink)?
                 }
                 Op::TopK { layer } => {
-                    let logits = &plan.buffers[Slot::Router.index()];
-                    let gates = &plan.buffers[Slot::SharedGate.index()];
+                    let (router, router_columns) =
+                        Slot::projection(model, layer, Projection::Router)?;
+                    let (gate, gate_columns) =
+                        Slot::projection(model, layer, Projection::SharedGate)?;
+                    let logits =
+                        ProjectionRows::new(&plan.buffers[router.index()], router_columns)?;
+                    let gates = ProjectionRows::new(&plan.buffers[gate.index()], gate_columns)?;
                     for b in 0..sessions.len() {
-                        let router_row = logits.slice(&[b..b + 1, 0..m.experts()])?;
-                        let row = router_row.view(&[m.experts()])?;
-                        let gate = gates.slice(&[b..b + 1, 0..1])?;
-                        plan.selections[layer][b].select(&m, &row, &gate, sink)?;
+                        let gate = gates.row(b)?;
+                        let gate = gate.view(&[1, 1])?;
+                        plan.selections[layer][b].select(&m, &logits.row(b)?, &gate, sink)?;
                     }
                 }
                 Op::ExpertGateUp { layer } => {

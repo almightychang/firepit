@@ -71,6 +71,16 @@ impl HostNvfp4Matrix {
         })
     }
 
+    pub fn zeros(rows: usize, cols: usize) -> Result<Self, &'static str> {
+        Self::from_parts(
+            vec![f4e2m1fnx2::from_bits(0); rows * cols / 2],
+            vec![f8e4m3fn(0); rows * cols / NVFP4_GROUP],
+            0.0,
+            rows,
+            cols,
+        )
+    }
+
     pub fn stack(parts: Vec<Self>) -> Result<Self, &'static str> {
         let mut parts = parts.into_iter();
         let mut stacked = parts.next().ok_or("no NVFP4 matrices to stack")?;

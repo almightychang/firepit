@@ -1,5 +1,5 @@
 use crate::checkpoint::Stream;
-use crate::model::Model;
+use crate::model::{Model, Projection};
 use crate::{LayerKind, Result};
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::DeviceOp;
@@ -7,6 +7,7 @@ use cutile::api;
 use cutile::tensor::Tensor;
 use cutile::tile_kernel::ToHostVecOp;
 use firepit_kernels::moe::ExpertSelection;
+use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Slot {
@@ -14,66 +15,69 @@ pub enum Slot {
     Residual1,
     Normed,
     Delta,
-    Qkv,
-    Z,
-    B,
-    A,
     Conv,
     Mixer,
     MixerNorm,
     Gated,
-    QGate,
-    K,
-    V,
     QNorm,
     KNorm,
     QRot,
     KRot,
     AttnOut,
     AttnGated,
-    Router,
     ExpertUp,
     ExpertAct,
     ExpertOut,
-    SharedGate,
     MoeDelta,
     Logits,
+    Projection(usize),
 }
 
 impl Slot {
-    pub const ALL: [Self; 28] = [
+    pub const ALL: [Self; 19] = [
         Self::Residual0,
         Self::Residual1,
         Self::Normed,
         Self::Delta,
-        Self::Qkv,
-        Self::Z,
-        Self::B,
-        Self::A,
         Self::Conv,
         Self::Mixer,
         Self::MixerNorm,
         Self::Gated,
-        Self::QGate,
-        Self::K,
-        Self::V,
         Self::QNorm,
         Self::KNorm,
         Self::QRot,
         Self::KRot,
         Self::AttnOut,
         Self::AttnGated,
-        Self::Router,
         Self::ExpertUp,
         Self::ExpertAct,
         Self::ExpertOut,
-        Self::SharedGate,
         Self::MoeDelta,
         Self::Logits,
     ];
 
+    pub(crate) fn all(model: &Model) -> impl Iterator<Item = Self> {
+        let projections = (0..model.projection_layouts.len()).map(Self::Projection);
+        Self::ALL.into_iter().chain(projections)
+    }
+
+    pub(crate) fn projection(
+        model: &Model,
+        layer: usize,
+        member: Projection,
+    ) -> Result<(Self, Range<usize>)> {
+        let (layout, columns) = model.projection(layer, member)?;
+        Ok((Self::Projection(layout), columns))
+    }
+
     pub fn index(self) -> usize {
-        self as usize
+        match self {
+            Self::Projection(layout) => Self::ALL.len() + layout,
+            fixed => Self::ALL
+                .iter()
+                .position(|&slot| slot == fixed)
+                .expect("every fixed slot is in Slot::ALL"),
+        }
     }
 
     pub(crate) fn shape(self, model: &Model, batch: usize) -> Vec<usize> {
@@ -81,23 +85,17 @@ impl Slot {
         let g = d.gdn();
         let a = d.attention();
         let m = d.moe();
+        if let Self::Projection(layout) = self {
+            return vec![batch, model.projection_layouts[layout].rows()];
+        }
         if self == Self::Conv {
             return vec![batch * g.conv_dim()];
         }
         if self == Self::Mixer {
             return vec![batch * g.value_heads(), 1, g.value_head_dim()];
         }
-        if matches!(self, Self::MixerNorm | Self::Gated) {
-            return vec![batch * g.value_heads(), g.value_head_dim()];
-        }
         if self == Self::AttnOut {
             return vec![batch * a.q_heads(), a.head_dim()];
-        }
-        if matches!(self, Self::QNorm | Self::AttnGated) {
-            return vec![batch * a.q_heads(), a.head_dim()];
-        }
-        if self == Self::KNorm {
-            return vec![batch * a.kv_heads(), a.head_dim()];
         }
         if self == Self::QRot {
             return vec![batch * a.q_heads(), a.head_dim()];
@@ -109,20 +107,17 @@ impl Slot {
             Self::Residual0 | Self::Residual1 | Self::Normed | Self::Delta | Self::MoeDelta => {
                 d.hidden()
             }
-            Self::Qkv | Self::Conv => g.conv_dim(),
-            Self::Z | Self::Mixer | Self::MixerNorm | Self::Gated => g.value_dim(),
-            Self::B | Self::A => g.value_heads(),
-            Self::QGate => 2 * a.q_heads() * a.head_dim(),
-            Self::K | Self::V | Self::KNorm | Self::KRot => a.kv_heads() * a.head_dim(),
+            Self::Conv => g.conv_dim(),
+            Self::Mixer | Self::MixerNorm | Self::Gated => g.value_dim(),
+            Self::KNorm | Self::KRot => a.kv_heads() * a.head_dim(),
             Self::QNorm | Self::QRot | Self::AttnOut | Self::AttnGated => {
                 a.q_heads() * a.head_dim()
             }
-            Self::Router => m.experts(),
             Self::ExpertUp => 2 * m.intermediate(),
             Self::ExpertAct => m.intermediate(),
             Self::ExpertOut => d.hidden(),
-            Self::SharedGate => 1,
             Self::Logits => d.vocab(),
+            Self::Projection(_) => unreachable!(),
         };
         let rows = if matches!(self, Self::ExpertUp | Self::ExpertAct | Self::ExpertOut) {
             batch * m.with_shared_expert().top_k()
@@ -145,17 +140,10 @@ pub enum NormName {
 
 #[derive(Clone, Copy, Debug)]
 pub enum WeightName {
-    GdnQkv,
-    GdnZ,
-    GdnB,
-    GdnA,
+    MixerProjection(usize),
     GdnOut,
-    AttnQGate,
-    AttnK,
-    AttnV,
     AttnOut,
-    Router,
-    SharedGate,
+    MoeProjection(usize),
     LmHead,
 }
 
@@ -182,7 +170,9 @@ pub enum Op {
     GdnDelta {
         layer: usize,
     },
-    GdnGate,
+    GdnGate {
+        layer: usize,
+    },
     AttnRope {
         query: bool,
     },
@@ -192,7 +182,9 @@ pub enum Op {
     OnlineAttention {
         layer: usize,
     },
-    OutputGate,
+    OutputGate {
+        layer: usize,
+    },
     TopK {
         layer: usize,
     },
@@ -225,11 +217,11 @@ impl Op {
             Self::Gemv { .. } => "gemv",
             Self::GdnConv { .. } => "gdn_conv",
             Self::GdnDelta { .. } => "gdn_delta",
-            Self::GdnGate => "gdn_gate",
+            Self::GdnGate { .. } => "gdn_gate",
             Self::AttnRope { .. } => "rope",
             Self::CacheAppend { .. } => "cache_append",
             Self::OnlineAttention { .. } => "online_attention",
-            Self::OutputGate => "output_gate",
+            Self::OutputGate { .. } => "output_gate",
             Self::TopK { .. } => "moe_top_k",
             Self::ExpertGateUp { .. } | Self::ExpertDown { .. } => "moe_expert_gemv",
             Self::ExpertSwiglu => "swiglu",
@@ -254,33 +246,29 @@ pub struct StepPlan {
 }
 
 impl StepPlan {
-    pub(crate) fn ops(model: &Model) -> Vec<Op> {
+    pub(crate) fn ops(model: &Model) -> Result<Vec<Op>> {
         let mut ops = vec![Op::Embed {
             out: Slot::Residual0,
         }];
         let mut residual = Slot::Residual0;
         for (layer, kind) in model.dims.layers().iter().enumerate() {
+            let weights = &model.layers[layer];
             ops.push(Op::Norm {
                 layer,
                 name: NormName::Input,
                 input: residual,
                 out: Slot::Normed,
             });
+            for (group, projection) in weights.mixer.projections().iter().enumerate() {
+                ops.push(Op::Gemv {
+                    layer,
+                    name: WeightName::MixerProjection(group),
+                    input: Slot::Normed,
+                    out: Slot::Projection(projection.layout),
+                });
+            }
             match kind {
                 LayerKind::Gdn => {
-                    for (name, out) in [
-                        (WeightName::GdnQkv, Slot::Qkv),
-                        (WeightName::GdnZ, Slot::Z),
-                        (WeightName::GdnB, Slot::B),
-                        (WeightName::GdnA, Slot::A),
-                    ] {
-                        ops.push(Op::Gemv {
-                            layer,
-                            name,
-                            input: Slot::Normed,
-                            out,
-                        });
-                    }
                     ops.push(Op::GdnConv { layer });
                     ops.push(Op::GdnDelta { layer });
                     ops.push(Op::Norm {
@@ -289,7 +277,7 @@ impl StepPlan {
                         input: Slot::Mixer,
                         out: Slot::MixerNorm,
                     });
-                    ops.push(Op::GdnGate);
+                    ops.push(Op::GdnGate { layer });
                     ops.push(Op::Gemv {
                         layer,
                         name: WeightName::GdnOut,
@@ -298,35 +286,23 @@ impl StepPlan {
                     });
                 }
                 LayerKind::Attention => {
-                    for (name, out) in [
-                        (WeightName::AttnQGate, Slot::QGate),
-                        (WeightName::AttnK, Slot::K),
-                        (WeightName::AttnV, Slot::V),
-                    ] {
-                        ops.push(Op::Gemv {
-                            layer,
-                            name,
-                            input: Slot::Normed,
-                            out,
-                        });
-                    }
                     ops.push(Op::Norm {
                         layer,
                         name: NormName::Q,
-                        input: Slot::QGate,
+                        input: Slot::projection(model, layer, Projection::AttnQGate)?.0,
                         out: Slot::QNorm,
                     });
                     ops.push(Op::Norm {
                         layer,
                         name: NormName::K,
-                        input: Slot::K,
+                        input: Slot::projection(model, layer, Projection::AttnK)?.0,
                         out: Slot::KNorm,
                     });
                     ops.push(Op::AttnRope { query: true });
                     ops.push(Op::AttnRope { query: false });
                     ops.push(Op::CacheAppend { layer });
                     ops.push(Op::OnlineAttention { layer });
-                    ops.push(Op::OutputGate);
+                    ops.push(Op::OutputGate { layer });
                     ops.push(Op::Gemv {
                         layer,
                         name: WeightName::AttnOut,
@@ -351,18 +327,14 @@ impl StepPlan {
                 input: next,
                 out: Slot::Normed,
             });
-            ops.push(Op::Gemv {
-                layer,
-                name: WeightName::Router,
-                input: Slot::Normed,
-                out: Slot::Router,
-            });
-            ops.push(Op::Gemv {
-                layer,
-                name: WeightName::SharedGate,
-                input: Slot::Normed,
-                out: Slot::SharedGate,
-            });
+            for (group, projection) in weights.moe.projections.iter().enumerate() {
+                ops.push(Op::Gemv {
+                    layer,
+                    name: WeightName::MoeProjection(group),
+                    input: Slot::Normed,
+                    out: Slot::Projection(projection.layout),
+                });
+            }
             ops.push(Op::TopK { layer });
             ops.push(Op::ExpertGateUp { layer });
             ops.push(Op::ExpertSwiglu);
@@ -392,7 +364,7 @@ impl StepPlan {
             input: Slot::Normed,
             out: Slot::Logits,
         });
-        ops
+        Ok(ops)
     }
 
     pub fn new(
@@ -402,10 +374,9 @@ impl StepPlan {
         gdn_conv_tile: usize,
         stream: &Stream,
     ) -> Result<Self> {
-        let ops = Self::ops(model);
-        let buffers = Slot::ALL
-            .iter()
-            .map(|&slot| api::zeros::<f32>(&slot.shape(model, batch)).sync_on(stream))
+        let ops = Self::ops(model)?;
+        let buffers = Slot::all(model)
+            .map(|slot| api::zeros::<f32>(&slot.shape(model, batch)).sync_on(stream))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let tokens = api::zeros::<i32>(&[batch]).sync_on(stream)?;
         let positions = (0..batch)

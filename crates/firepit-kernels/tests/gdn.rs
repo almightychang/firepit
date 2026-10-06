@@ -5,7 +5,7 @@ use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::TileKernel;
-use firepit_kernels::gdn::{GdnDims, conv1d_silu, conv1d_silu_prefill};
+use firepit_kernels::gdn::{GdnDims, conv1d_silu, conv1d_silu_prefill, gated_silu};
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -426,6 +426,44 @@ fn detects_reversed_taps_and_stale_state() -> Result<(), Box<dyn std::error::Err
         check::max_abs(&first, &wrong_taps),
         check::max_abs(&second, &stale)
     );
+    Ok(())
+}
+
+#[test]
+fn gated_silu_reads_gate_heads_from_wider_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let (batch, heads, dv) = (3, 4, 32);
+    let (offset, row) = (40, 40 + heads * dv + 24);
+    let upload = |data: Vec<f32>, shape: &[usize]| {
+        api::copy_host_vec_to_device(&Arc::new(data))
+            .reshape(shape)
+            .sync_on(&stream)
+    };
+    let x: Vec<f32> = (0..batch * heads * dv)
+        .map(|i| ((i * 17 % 61) as f32 - 30.0) / 8.0)
+        .collect();
+    let buffer: Vec<f32> = (0..batch * row)
+        .map(|i| ((i * 23 % 89) as f32 - 44.0) / 8.0)
+        .collect();
+    let packed: Vec<f32> = (0..batch)
+        .flat_map(|b| buffer[b * row + offset..b * row + offset + heads * dv].to_vec())
+        .collect();
+    let input = upload(x, &[batch, heads * dv])?;
+    let input = input.view(&[batch, heads * dv])?;
+    let contiguous = upload(packed, &[batch, heads * dv])?;
+    let rows = upload(buffer, &[batch, row])?;
+    let mut outputs = Vec::new();
+    for gate in [
+        contiguous.view(&[batch, heads * dv])?,
+        rows.slice(&[0..batch, offset..offset + heads * dv])?,
+    ] {
+        let mut out = api::zeros::<f32>(&[batch, heads * dv]).sync_on(&stream)?;
+        gated_silu((&mut out).partition([1, dv]), &input, &gate)
+            .generics(vec![dv.to_string()])
+            .sync_on(&stream)?;
+        outputs.push(out.to_host_vec().sync_on(&stream)?);
+    }
+    assert_eq!(outputs[1], outputs[0]);
     Ok(())
 }
 

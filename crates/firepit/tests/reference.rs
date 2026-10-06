@@ -410,7 +410,7 @@ fn gdn_prefill_layer_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
         let mut normalized = api::zeros::<f32>(&[t * vh, dv]).sync_on(&stream)?;
         rms_norm(
             normalized.partition([1, dv]),
-            &norm_input,
+            &norm_input.view(&[t * vh, 1, dv])?,
             &gamma,
             1.0 / dv as f32,
             dims.eps(),
@@ -722,7 +722,7 @@ fn gdn_delta_norm_and_output_match_hf() -> Result<(), Box<dyn std::error::Error>
                 api::zeros::<f32>(&[dims.value_heads(), dims.value_head_dim()]).sync_on(&stream)?;
             rms_norm(
                 (&mut normalized).partition([1, dims.value_head_dim()]),
-                &norm_input,
+                &norm_input.view(&[dims.value_heads(), 1, dims.value_head_dim()])?,
                 &gamma,
                 1.0 / dims.value_head_dim() as f32,
                 dims.eps(),
@@ -753,7 +753,7 @@ fn gdn_delta_norm_and_output_match_hf() -> Result<(), Box<dyn std::error::Error>
                         .sync_on(&stream)?;
                 rms_norm(
                     (&mut wrong_normalized).partition([1, dims.value_head_dim()]),
-                    &norm_input,
+                    &norm_input.view(&[dims.value_heads(), 1, dims.value_head_dim()])?,
                     &wrong,
                     1.0 / dims.value_head_dim() as f32,
                     dims.eps(),
@@ -879,7 +879,7 @@ fn zero_layer_exit_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
         let mut normalized = api::zeros::<f32>(&[1, H]).sync_on(&stream)?;
         rms_norm(
             (&mut normalized).partition([1, H]),
-            &x,
+            &x.view(&[1, 1, H])?,
             &gamma,
             1.0 / H as f32,
             EPS,
@@ -891,7 +891,7 @@ fn zero_layer_exit_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
         let mut wrong = api::zeros::<f32>(&[1, H]).sync_on(&stream)?;
         rms_norm(
             (&mut wrong).partition([1, H]),
-            &x,
+            &x.view(&[1, 1, H])?,
             &wrong_gamma,
             1.0 / H as f32,
             EPS,
@@ -1167,10 +1167,10 @@ fn attention_projection_and_rope_match_hf() -> Result<(), Box<dyn std::error::Er
             .chunks_exact(2 * D)
             .flat_map(|row| row[D..].iter().copied())
             .collect();
-        let q_in = q_proj.view(&[q_heads, 2 * D])?;
-        let gate_view = q_in.slice(&[0..q_heads, D..2 * D])?;
-        assert_eq!(gate_view.shape(), &[q_heads as i32, D as i32]);
-        let q_in = q_in.slice(&[0..q_heads, 0..D])?;
+        let q_in = q_proj.view(&[q_heads, 1, 2 * D])?;
+        let gate_view = q_in.slice(&[0..q_heads, 0..1, D..2 * D])?;
+        assert_eq!(gate_view.shape(), &[q_heads as i32, 1, D as i32]);
+        let q_in = q_in.slice(&[0..q_heads, 0..1, 0..D])?;
         let mut q_norm = api::zeros::<f32>(&[q_heads, D]).sync_on(&stream)?;
         rms_norm(
             (&mut q_norm).partition([1, D]),
@@ -1181,7 +1181,7 @@ fn attention_projection_and_rope_match_hf() -> Result<(), Box<dyn std::error::Er
         )
         .generics(vec![D.to_string()])
         .sync_on(&stream)?;
-        let k_in = k_proj.view(&[kv_heads, D])?;
+        let k_in = k_proj.view(&[kv_heads, 1, D])?;
         let mut k_norm = api::zeros::<f32>(&[kv_heads, D]).sync_on(&stream)?;
         rms_norm(
             (&mut k_norm).partition([1, D]),
@@ -1381,8 +1381,8 @@ fn attention_decode_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
         let mut gated = api::zeros::<f32>(&[dims.q_heads(), dims.head_dim()]).sync_on(&stream)?;
         output_gate(
             (&mut gated).partition([1, dims.head_dim()]),
-            &attention,
-            &g_device,
+            &attention.view(&[dims.q_heads(), 1, dims.head_dim()])?,
+            &g_device.view(&[dims.q_heads(), 1, dims.head_dim()])?,
         )
         .generics(dims.gate_generics())
         .sync_on(&stream)?;
@@ -1424,8 +1424,8 @@ fn attention_decode_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
                 api::zeros::<f32>(&[dims.q_heads(), dims.head_dim()]).sync_on(&stream)?;
             output_gate(
                 (&mut wrong).partition([1, dims.head_dim()]),
-                &unscaled,
-                &g_device,
+                &unscaled.view(&[dims.q_heads(), 1, dims.head_dim()])?,
+                &g_device.view(&[dims.q_heads(), 1, dims.head_dim()])?,
             )
             .generics(dims.gate_generics())
             .sync_on(&stream)?;
@@ -1531,8 +1531,8 @@ fn attention_prefill_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
     let mut gated = api::zeros::<f32>(&[t * dims.q_heads(), dims.head_dim()]).sync_on(&stream)?;
     output_gate(
         (&mut gated).partition([1, dims.head_dim()]),
-        &attention.view(&[t * dims.q_heads(), dims.head_dim()])?,
-        &g_device,
+        &attention.view(&[t * dims.q_heads(), 1, dims.head_dim()])?,
+        &g_device.view(&[t * dims.q_heads(), 1, dims.head_dim()])?,
     )
     .generics(dims.gate_generics())
     .sync_on(&stream)?;

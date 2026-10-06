@@ -19,7 +19,7 @@ fn gpu(
     let width = gamma.len();
     let batch = input.len() / width;
     let x = api::copy_host_vec_to_device(&Arc::new(input.to_vec()))
-        .reshape(&[batch, width])
+        .reshape(&[batch, 1, width])
         .sync_on(stream)?;
     let weight = api::copy_host_vec_to_device(&Arc::new(gamma.to_vec())).sync_on(stream)?;
     let mut output = api::zeros::<f32>(&[batch, width]).sync_on(stream)?;
@@ -70,5 +70,40 @@ fn rms_norm_preserves_batch_independence_and_weight_scale() -> Result<(), Box<dy
     assert!(check::max_abs(&doubled, &expected) < 1e-5);
     let zero = gpu(&stream, &input, &vec![0.0; width], 1e-5)?;
     assert!(zero.iter().all(|x| *x == 0.0));
+    Ok(())
+}
+
+#[test]
+fn rms_norm_reads_interleaved_heads_of_wider_rows() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let (batch, heads, width) = (3, 4, 64);
+    let pitch = 2 * width;
+    let first = 1;
+    let row = (first + heads + 1) * pitch;
+    let buffer: Vec<f32> = (0..batch * row)
+        .map(|i| ((i * 29 % 97) as f32 - 48.0) / 16.0)
+        .collect();
+    let gamma: Vec<f32> = (0..width).map(|i| 0.5 + i as f32 / width as f32).collect();
+    let packed: Vec<f32> = (0..batch)
+        .flat_map(|b| (0..heads).map(move |h| b * row + (first + h) * pitch))
+        .flat_map(|start| buffer[start..start + width].to_vec())
+        .collect();
+    let expected = gpu(&stream, &packed, &gamma, 1e-6)?;
+    let rows = api::copy_host_vec_to_device(&Arc::new(buffer))
+        .reshape(&[batch, row / pitch, pitch])
+        .sync_on(&stream)?;
+    let x = rows.slice(&[0..batch, first..first + heads, 0..width])?;
+    let weight = api::copy_host_vec_to_device(&Arc::new(gamma)).sync_on(&stream)?;
+    let mut output = api::zeros::<f32>(&[batch, heads * width]).sync_on(&stream)?;
+    rms_norm(
+        (&mut output).partition([1, width]),
+        &x,
+        &weight,
+        1.0 / width as f32,
+        1e-6,
+    )
+    .generics(vec![width.to_string()])
+    .sync_on(&stream)?;
+    assert_eq!(output.to_host_vec().sync_on(&stream)?, expected);
     Ok(())
 }

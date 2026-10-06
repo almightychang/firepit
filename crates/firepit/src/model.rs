@@ -1,12 +1,16 @@
 use crate::checkpoint::{Checkpoint, HostBf16Tensor, Stream};
+use crate::execute::{fp8_gemv_tile, gemv_tile};
 use crate::{LayerKind, ModelConfig, ModelDims, Result, WeightFormat};
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
 use cutile::tensor::Tensor;
+use firepit_kernels::gemv::{GemvTile, row_scaled_tile};
 use firepit_kernels::weights::{HostFp8Matrix, HostNvfp4Matrix, NVFP4_GROUP, Weight};
+use half::bf16;
 use safetensors::Dtype;
 use serde_json::Value;
 use std::fs::File;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::Arc;
@@ -17,11 +21,45 @@ pub struct LoadOptions {
     pub layers: Option<usize>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Projection {
+    GdnQkv,
+    GdnZ,
+    GdnB,
+    GdnA,
+    AttnQGate,
+    AttnK,
+    AttnV,
+    Router,
+    SharedGate,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectionLayout {
+    members: Vec<(Projection, Range<usize>)>,
+    rows: usize,
+}
+
+impl ProjectionLayout {
+    pub fn rows(&self) -> usize {
+        self.rows
+    }
+
+    pub fn columns(&self, member: Projection) -> Option<Range<usize>> {
+        self.members
+            .iter()
+            .find(|(projection, _)| *projection == member)
+            .map(|(_, columns)| columns.clone())
+    }
+}
+
+pub struct ProjectionGroup {
+    pub weight: Weight,
+    pub layout: usize,
+}
+
 pub struct GdnWeights {
-    pub qkv: Weight,
-    pub z: Weight,
-    pub b: Weight,
-    pub a: Weight,
+    pub projections: Vec<ProjectionGroup>,
     pub conv: Tensor<f32>,
     pub a_log: Tensor<f32>,
     pub dt_bias: Tensor<f32>,
@@ -30,24 +68,30 @@ pub struct GdnWeights {
 }
 
 pub struct AttentionWeights {
-    pub q_gate: Weight,
-    pub k: Weight,
-    pub v: Weight,
+    pub projections: Vec<ProjectionGroup>,
     pub q_norm: Tensor<f32>,
     pub k_norm: Tensor<f32>,
     pub out: Weight,
 }
 
 pub struct MoeWeights {
-    pub router: Weight,
+    pub projections: Vec<ProjectionGroup>,
     pub gate_up: Weight,
     pub down: Weight,
-    pub shared_gate: Weight,
 }
 
 pub enum MixerWeights {
     Gdn(GdnWeights),
     Attention(AttentionWeights),
+}
+
+impl MixerWeights {
+    pub fn projections(&self) -> &[ProjectionGroup] {
+        match self {
+            Self::Gdn(w) => &w.projections,
+            Self::Attention(w) => &w.projections,
+        }
+    }
 }
 
 pub struct LayerWeights {
@@ -64,11 +108,31 @@ pub struct Model {
     pub(crate) layers: Vec<LayerWeights>,
     pub(crate) final_norm: Tensor<f32>,
     pub(crate) lm_head: Weight,
+    pub(crate) projection_layouts: Vec<ProjectionLayout>,
 }
 
 impl Model {
     pub fn dims(&self) -> &ModelDims {
         &self.dims
+    }
+
+    pub(crate) fn projection(
+        &self,
+        layer: usize,
+        member: Projection,
+    ) -> Result<(usize, Range<usize>)> {
+        let layer = &self.layers[layer];
+        let groups = match member {
+            Projection::Router | Projection::SharedGate => &layer.moe.projections,
+            _ => layer.mixer.projections(),
+        };
+        groups
+            .iter()
+            .find_map(|group| {
+                let columns = self.projection_layouts[group.layout].columns(member)?;
+                Some((group.layout, columns))
+            })
+            .ok_or_else(|| format!("layer has no {member:?} projection").into())
     }
     pub fn from_checkpoint(
         dir: impl AsRef<Path>,
@@ -96,15 +160,22 @@ impl Model {
             &stream,
         )?;
         let mut layers = Vec::with_capacity(dims.layers().len());
+        let mut layouts = Vec::new();
         for (index, &kind) in dims.layers().iter().enumerate() {
             let prefix = format!("model.language_model.layers.{index}");
             let input_norm =
                 checkpoint.vector(&format!("{prefix}.input_layernorm.weight"), h, 1.0, &stream)?;
             let mixer = match kind {
-                LayerKind::Gdn => MixerWeights::Gdn(load_gdn(&sources, &prefix, &dims, &stream)?),
-                LayerKind::Attention => {
-                    MixerWeights::Attention(load_attention(&sources, &prefix, &dims, &stream)?)
+                LayerKind::Gdn => {
+                    MixerWeights::Gdn(load_gdn(&sources, &prefix, &dims, &mut layouts, &stream)?)
                 }
+                LayerKind::Attention => MixerWeights::Attention(load_attention(
+                    &sources,
+                    &prefix,
+                    &dims,
+                    &mut layouts,
+                    &stream,
+                )?),
             };
             let post_norm = checkpoint.vector(
                 &format!("{prefix}.post_attention_layernorm.weight"),
@@ -112,7 +183,7 @@ impl Model {
                 1.0,
                 &stream,
             )?;
-            let moe = load_moe(&sources, &prefix, &dims, &stream)?;
+            let moe = load_moe(&sources, &prefix, &dims, &mut layouts, &stream)?;
             layers.push(LayerWeights {
                 input_norm,
                 mixer,
@@ -129,6 +200,7 @@ impl Model {
             layers,
             final_norm,
             lm_head,
+            projection_layouts: layouts,
         })
     }
 }
@@ -257,6 +329,89 @@ impl Sources {
     fn matrix(&self, name: &str, shape: [usize; 2], stream: &Stream) -> Result<Weight> {
         self.host(name, shape)?.upload(stream)
     }
+
+    fn projections(
+        &self,
+        members: &[(Projection, String, usize)],
+        cols: usize,
+        layouts: &mut Vec<ProjectionLayout>,
+        stream: &Stream,
+    ) -> Result<Vec<ProjectionGroup>> {
+        let members = members
+            .iter()
+            .map(|(projection, name, rows)| {
+                Ok((
+                    *projection,
+                    self.format(name),
+                    self.host(name, [*rows, cols])?,
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        fuse_projections(members, layouts, stream)
+    }
+}
+
+pub(crate) fn fuse_projections(
+    members: Vec<(Projection, WeightFormat, HostWeight)>,
+    layouts: &mut Vec<ProjectionLayout>,
+    stream: &Stream,
+) -> Result<Vec<ProjectionGroup>> {
+    group_by_format(members)
+        .into_iter()
+        .map(|group| {
+            let (layout, weight) = stack_group(group)?;
+            let layout = match layouts.iter().position(|seen| *seen == layout) {
+                Some(index) => index,
+                None => {
+                    layouts.push(layout);
+                    layouts.len() - 1
+                }
+            };
+            Ok(ProjectionGroup {
+                weight: weight.upload(stream)?,
+                layout,
+            })
+        })
+        .collect()
+}
+
+fn group_by_format(
+    members: Vec<(Projection, WeightFormat, HostWeight)>,
+) -> Vec<Vec<(Projection, HostWeight)>> {
+    let mut groups: Vec<(WeightFormat, Vec<(Projection, HostWeight)>)> = Vec::new();
+    for (projection, format, weight) in members {
+        match groups.iter_mut().find(|(seen, _)| *seen == format) {
+            Some((_, group)) => group.push((projection, weight)),
+            None => groups.push((format, vec![(projection, weight)])),
+        }
+    }
+    groups.into_iter().map(|(_, group)| group).collect()
+}
+
+fn stack_group(members: Vec<(Projection, HostWeight)>) -> Result<(ProjectionLayout, HostWeight)> {
+    let tile = members
+        .iter()
+        .map(|(_, weight)| weight)
+        .max_by_key(|weight| weight.rows())
+        .ok_or("no projections to stack")?
+        .gemv_tile();
+    let mut layout = ProjectionLayout {
+        members: Vec::with_capacity(members.len()),
+        rows: 0,
+    };
+    let mut parts = Vec::with_capacity(members.len() + 1);
+    for (projection, weight) in members {
+        let rows = layout.rows..layout.rows + weight.rows();
+        layout.rows = rows.end;
+        layout.members.push((projection, rows));
+        parts.push(weight);
+    }
+    let padded = layout.rows.next_multiple_of(tile.rows);
+    if padded > layout.rows {
+        parts.push(parts[0].zeros(padded - layout.rows)?);
+        layout.rows = padded;
+    }
+    Ok((layout, HostWeight::stack(parts)?))
 }
 
 fn check_companions(checkpoint: &Checkpoint, name: &str, format: WeightFormat) -> Result<()> {
@@ -326,13 +481,46 @@ pub fn verify_checkpoint(dir: &Path) -> Result<Vec<WeightReport>> {
     Ok(report)
 }
 
-enum HostWeight {
+pub(crate) enum HostWeight {
     Dense(HostBf16Tensor),
     Fp8(HostFp8Matrix),
     Nvfp4(HostNvfp4Matrix),
 }
 
 impl HostWeight {
+    fn shape(&self) -> [usize; 2] {
+        match self {
+            Self::Dense(tensor) => [tensor.shape[0], tensor.shape[1]],
+            Self::Fp8(matrix) => [matrix.rows, matrix.cols],
+            Self::Nvfp4(matrix) => [matrix.rows, matrix.cols],
+        }
+    }
+
+    fn rows(&self) -> usize {
+        self.shape()[0]
+    }
+
+    fn gemv_tile(&self) -> GemvTile {
+        let [rows, cols] = self.shape();
+        match self {
+            Self::Dense(_) => gemv_tile(rows, cols),
+            Self::Fp8(matrix) => fp8_gemv_tile(matrix.scaling, rows, cols, 1),
+            Self::Nvfp4(_) => row_scaled_tile(rows, cols, 1),
+        }
+    }
+
+    fn zeros(&self, rows: usize) -> Result<Self> {
+        let cols = self.shape()[1];
+        Ok(match self {
+            Self::Dense(_) => Self::Dense(HostBf16Tensor {
+                shape: vec![rows, cols],
+                data: vec![bf16::ZERO; rows * cols],
+            }),
+            Self::Fp8(matrix) => Self::Fp8(HostFp8Matrix::zeros(rows, cols, matrix.scaling)?),
+            Self::Nvfp4(_) => Self::Nvfp4(HostNvfp4Matrix::zeros(rows, cols)?),
+        })
+    }
+
     fn load(
         checkpoint: &Checkpoint,
         name: &str,
@@ -447,18 +635,24 @@ fn load_gdn(
     sources: &Sources,
     prefix: &str,
     dims: &ModelDims,
+    layouts: &mut Vec<ProjectionLayout>,
     stream: &Stream,
 ) -> Result<GdnWeights> {
     let checkpoint = sources.base();
     let d = dims.gdn();
     let path = format!("{prefix}.linear_attn");
-    let projection = |name: &str, rows: usize| {
-        sources.matrix(
-            &format!("{path}.in_proj_{name}.weight"),
-            [rows, dims.hidden()],
-            &stream,
-        )
-    };
+    let projection = |name: &str| format!("{path}.in_proj_{name}.weight");
+    let projections = sources.projections(
+        &[
+            (Projection::GdnQkv, projection("qkv"), d.conv_dim()),
+            (Projection::GdnZ, projection("z"), d.value_dim()),
+            (Projection::GdnB, projection("b"), d.value_heads()),
+            (Projection::GdnA, projection("a"), d.value_heads()),
+        ],
+        dims.hidden(),
+        layouts,
+        stream,
+    )?;
     let conv_host = checkpoint.tensor(&format!("{path}.conv1d.weight"))?;
     if conv_host.shape != [d.conv_dim(), 1, d.conv_kernel()] {
         return Err("invalid conv weight shape".into());
@@ -468,10 +662,7 @@ fn load_gdn(
         .reshape(&[d.conv_dim(), d.conv_kernel()])
         .sync_on(stream)?;
     Ok(GdnWeights {
-        qkv: projection("qkv", d.conv_dim())?,
-        z: projection("z", d.value_dim())?,
-        b: projection("b", d.value_heads())?,
-        a: projection("a", d.value_heads())?,
+        projections,
         conv,
         a_log: checkpoint.vector(&format!("{path}.A_log"), d.value_heads(), 0.0, &stream)?,
         dt_bias: checkpoint.vector(&format!("{path}.dt_bias"), d.value_heads(), 0.0, &stream)?,
@@ -493,6 +684,7 @@ fn load_attention(
     sources: &Sources,
     prefix: &str,
     dims: &ModelDims,
+    layouts: &mut Vec<ProjectionLayout>,
     stream: &Stream,
 ) -> Result<AttentionWeights> {
     let checkpoint = sources.base();
@@ -500,21 +692,17 @@ fn load_attention(
     let path = format!("{prefix}.self_attn");
     let q = d.q_heads() * d.head_dim();
     let kv = d.kv_heads() * d.head_dim();
+    let projection = |name: &str| format!("{path}.{name}_proj.weight");
     Ok(AttentionWeights {
-        q_gate: sources.matrix(
-            &format!("{path}.q_proj.weight"),
-            [2 * q, dims.hidden()],
-            &stream,
-        )?,
-        k: sources.matrix(
-            &format!("{path}.k_proj.weight"),
-            [kv, dims.hidden()],
-            &stream,
-        )?,
-        v: sources.matrix(
-            &format!("{path}.v_proj.weight"),
-            [kv, dims.hidden()],
-            &stream,
+        projections: sources.projections(
+            &[
+                (Projection::AttnQGate, projection("q"), 2 * q),
+                (Projection::AttnK, projection("k"), kv),
+                (Projection::AttnV, projection("v"), kv),
+            ],
+            dims.hidden(),
+            layouts,
+            stream,
         )?,
         q_norm: checkpoint.vector(&format!("{path}.q_norm.weight"), d.head_dim(), 1.0, &stream)?,
         k_norm: checkpoint.vector(&format!("{path}.k_norm.weight"), d.head_dim(), 1.0, &stream)?,
@@ -530,6 +718,7 @@ fn load_moe(
     sources: &Sources,
     prefix: &str,
     dims: &ModelDims,
+    layouts: &mut Vec<ProjectionLayout>,
     stream: &Stream,
 ) -> Result<MoeWeights> {
     let checkpoint = sources.base();
@@ -584,14 +773,25 @@ fn load_moe(
     gate_up.extend([shared("gate_proj", [i, h])?, shared("up_proj", [i, h])?]);
     down.push(shared("down_proj", [h, i])?);
     Ok(MoeWeights {
-        router: sources.matrix(&format!("{path}.gate.weight"), [d.experts(), h], stream)?,
-        gate_up: HostWeight::stack(gate_up)?.upload(stream)?,
-        down: HostWeight::stack(down)?.upload(stream)?,
-        shared_gate: sources.matrix(
-            &format!("{path}.shared_expert_gate.weight"),
-            [1, h],
+        projections: sources.projections(
+            &[
+                (
+                    Projection::Router,
+                    format!("{path}.gate.weight"),
+                    d.experts(),
+                ),
+                (
+                    Projection::SharedGate,
+                    format!("{path}.shared_expert_gate.weight"),
+                    1,
+                ),
+            ],
+            h,
+            layouts,
             stream,
         )?,
+        gate_up: HostWeight::stack(gate_up)?.upload(stream)?,
+        down: HostWeight::stack(down)?.upload(stream)?,
     })
 }
 
@@ -714,6 +914,63 @@ mod tests {
         std::fs::write(&index_path, index.to_string())?;
         assert!(verify_checkpoint(&dir).is_err());
         std::fs::remove_dir_all(&dir)?;
+        Ok(())
+    }
+
+    fn dense(rows: usize, cols: usize, value: f32) -> HostWeight {
+        HostWeight::Dense(HostBf16Tensor {
+            shape: vec![rows, cols],
+            data: vec![bf16::from_f32(value); rows * cols],
+        })
+    }
+
+    fn fp8(rows: usize, cols: usize) -> HostWeight {
+        let bits = vec![cuda_core::f8e4m3fn(0x38); rows * cols];
+        HostWeight::Fp8(HostFp8Matrix::with_row_scales(bits, vec![0.5; rows], rows, cols).unwrap())
+    }
+
+    #[test]
+    fn projections_group_by_format_and_pad_to_the_largest_member_tile() -> Result<()> {
+        let cols = 64;
+        let mut groups = group_by_format(vec![
+            (Projection::GdnQkv, WeightFormat::Fp8Tensor, fp8(96, cols)),
+            (Projection::GdnB, WeightFormat::Bf16, dense(256, cols, 1.0)),
+            (Projection::GdnZ, WeightFormat::Fp8Tensor, fp8(40, cols)),
+            (Projection::GdnA, WeightFormat::Bf16, dense(1, cols, 2.0)),
+        ])
+        .into_iter();
+        let (layout, weight) = stack_group(groups.next().ok_or("no FP8 group")?)?;
+        let tile = fp8(96, cols).gemv_tile().rows;
+        assert_eq!(layout.rows(), 136usize.next_multiple_of(tile));
+        assert_eq!(layout.columns(Projection::GdnQkv), Some(0..96));
+        assert_eq!(layout.columns(Projection::GdnZ), Some(96..136));
+        let HostWeight::Fp8(matrix) = weight else {
+            panic!("expected an FP8 group")
+        };
+        assert_eq!(matrix.rows, layout.rows());
+        assert!(matrix.scales.iter().all(|scale| scale.is_finite()));
+        assert!(matrix.bits[136 * cols..].iter().all(|bits| bits.0 == 0));
+
+        let (layout, weight) = stack_group(groups.next().ok_or("no bf16 group")?)?;
+        assert!(groups.next().is_none());
+        assert_eq!(
+            layout.rows(),
+            257usize.next_multiple_of(gemv_tile(256, cols).rows)
+        );
+        assert!(layout.rows() > 257);
+        assert_eq!(layout.columns(Projection::GdnB), Some(0..256));
+        assert_eq!(layout.columns(Projection::GdnA), Some(256..257));
+        assert_eq!(layout.columns(Projection::GdnQkv), None);
+        let HostWeight::Dense(tensor) = weight else {
+            panic!("expected a bf16 group")
+        };
+        assert_eq!(tensor.shape, [layout.rows(), cols]);
+        assert!(
+            tensor.data[256 * cols..257 * cols]
+                .iter()
+                .all(|&x| x == bf16::from_f32(2.0))
+        );
+        assert!(tensor.data[257 * cols..].iter().all(|&x| x == bf16::ZERO));
         Ok(())
     }
 
