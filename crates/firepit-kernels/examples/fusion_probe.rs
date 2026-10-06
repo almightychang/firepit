@@ -1153,6 +1153,7 @@ fn main() -> Result<()> {
     };
     let dims = Dims::from_config(Path::new(config))?;
     let value_tile: usize = value_tile.parse()?;
+    cutile::jit_cache::enable_default()?;
     let stream: Arc<Stream> = Device::new(0)?.new_stream()?;
     let ballast: Vec<Tensor<f32>> = (0..ballast_gib.parse::<usize>()?)
         .map(|_| api::zeros::<f32>(&[1 << 28]).sync_on(&stream))
