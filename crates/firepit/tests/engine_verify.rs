@@ -43,9 +43,25 @@ impl Reference {
     fn flags(self) -> &'static str {
         match self {
             Self::Prefill => "--engine",
-            Self::Tokens => "--engine --tokens-json TOKENS.json",
-            Self::Isolated => "--engine --isolate-layers L0,L1,...",
+            Self::Tokens => {
+                "--engine --tokens-json crates/firepit/tests/fixtures/qwen36-frog-tokens.json"
+            }
+            Self::Isolated => {
+                "--engine --isolate-layers 0,3 --tokens-json crates/firepit/tests/fixtures/qwen36-frog-tokens.json"
+            }
         }
+    }
+
+    fn fixture(self) -> &'static str {
+        match self {
+            Self::Prefill => include_str!("fixtures/qwen36-prompt-tokens.json"),
+            Self::Tokens | Self::Isolated => include_str!("fixtures/qwen36-frog-tokens.json"),
+        }
+    }
+
+    fn tokens(self) -> TestResult<Vec<u32>> {
+        let fixture: serde_json::Value = serde_json::from_str(self.fixture())?;
+        Ok(serde_json::from_value(fixture["tokens"].clone())?)
     }
 
     fn path(self) -> PathBuf {
@@ -83,6 +99,14 @@ impl Reference {
             (Some("engine"), Some("tokens-json"), false) => Some(Self::Tokens),
             _ => None,
         };
+        if found == Some(self) && reference_tokens(&reference)? != self.tokens()? {
+            return Err(format!(
+                "{}: {self:?} reference tokens differ from its fixture (trace_qwen36.py {})",
+                path.display(),
+                self.flags()
+            )
+            .into());
+        }
         if found != Some(self) {
             return Err(format!(
                 "{} is not a {self:?} engine reference (trace_qwen36.py {}): mode={mode:?} \
@@ -112,9 +136,7 @@ fn layers() -> TestResult<Option<usize>> {
 }
 
 fn prompt_tokens() -> TestResult<Vec<u32>> {
-    let fixture: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/qwen36-prompt-tokens.json"))?;
-    Ok(serde_json::from_value(fixture["tokens"].clone())?)
+    Reference::Prefill.tokens()
 }
 
 fn setup() -> TestResult<(Arc<Model>, Arc<Device>, Vec<u32>)> {
@@ -377,11 +399,6 @@ fn routing_flip_append_vs_whole() -> TestResult<()> {
 fn hf_prefill() -> TestResult<()> {
     let reference = Reference::Prefill.open()?;
     let (model, device, tokens) = setup()?;
-    if reference_tokens(&reference)? != tokens {
-        return Err(
-            "prefill reference tokens differ from tests/fixtures/qwen36-prompt-tokens.json".into(),
-        );
-    }
     assert_eq!(
         reference.metadata("layers").unwrap().parse::<usize>()?,
         model.dims().layers().len()
@@ -550,12 +567,13 @@ fn references_are_told_apart_by_metadata() -> TestResult<()> {
     let dir = std::env::temp_dir().join(format!("firepit-engine-refs-{}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let bytes = 1.0f32.to_le_bytes();
-    let write = |name: &str, metadata: &[(&str, &str)]| -> TestResult<PathBuf> {
+    let write = |name: &str, tokens: Reference, metadata: &[(&str, &str)]| -> TestResult<PathBuf> {
         let path = dir.join(name);
-        let metadata = metadata
+        let mut metadata: std::collections::HashMap<String, String> = metadata
             .iter()
             .map(|&(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
+        metadata.insert("tokens".into(), serde_json::to_string(&tokens.tokens()?)?);
         safetensors::serialize_to_file(
             [("logits", TensorView::new(Dtype::F32, vec![1], &bytes)?)],
             Some(metadata),
@@ -563,43 +581,26 @@ fn references_are_told_apart_by_metadata() -> TestResult<()> {
         )?;
         Ok(path)
     };
-    let files = [
-        (
-            Reference::Prefill,
-            write(
-                "prefill",
-                &[("mode", "engine"), ("tokens_source", "prompt")],
-            )?,
-        ),
-        (
-            Reference::Tokens,
-            write(
-                "tokens",
-                &[("mode", "engine"), ("tokens_source", "tokens-json")],
-            )?,
-        ),
-        (
-            Reference::Isolated,
-            write(
-                "isolated",
-                &[
-                    ("mode", "engine"),
-                    ("tokens_source", "prompt"),
-                    ("isolate_layers", "[0]"),
-                ],
-            )?,
-        ),
-        (
-            Reference::Prefill,
-            write("unmarked", &[("mode", "engine")])?,
-        ),
+    use Reference::*;
+    let prompt = [("mode", "engine"), ("tokens_source", "prompt")];
+    let listed = [("mode", "engine"), ("tokens_source", "tokens-json")];
+    let isolated = [
+        ("mode", "engine"),
+        ("tokens_source", "tokens-json"),
+        ("isolate_layers", "[0, 3]"),
     ];
-    for kind in [Reference::Prefill, Reference::Tokens, Reference::Isolated] {
-        for (index, (written, path)) in files.iter().enumerate() {
-            let accepted = kind.open_at(path).is_ok();
+    let files = [
+        (Some(Prefill), write("prefill", Prefill, &prompt)?),
+        (Some(Tokens), write("tokens", Tokens, &listed)?),
+        (Some(Isolated), write("isolated", Isolated, &isolated)?),
+        (None, write("unmarked", Prefill, &[("mode", "engine")])?),
+        (None, write("other tokens", Tokens, &prompt)?),
+    ];
+    for kind in [Prefill, Tokens, Isolated] {
+        for (accepted_by, path) in &files {
             assert_eq!(
-                accepted,
-                index < 3 && *written == kind,
+                kind.open_at(path).is_ok(),
+                *accepted_by == Some(kind),
                 "{kind:?} {}",
                 path.display()
             );

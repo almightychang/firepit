@@ -537,6 +537,8 @@ def main():
             parser.error("--isolate-layers must contain model layer indices")
     if args.tokens_json is not None:
         tokens = json.loads(args.tokens_json.read_text())
+        if isinstance(tokens, dict):
+            tokens = tokens["tokens"]
     elif args.prefill or args.engine:
         source = args.prompt * 100
         tokens = tokenizer(source, add_special_tokens=False)["input_ids"][:150]

@@ -58,8 +58,8 @@ GEMV는 oracle 비교와 선형성·배치 독립·가중치 행 치환을 검�
 | 테스트 | 생성 플래그 | 변수 | 기본 파일(`refs/`) |
 |---|---|---|---|
 | `hf_prefill` | `--engine`(위 150 토큰) | `FIREPIT_VERIFY_PREFILL_REF` | `qwen36-engine-prefill.safetensors` |
-| `hf_locate_divergence` | `--engine --tokens-json TOKENS.json` | `FIREPIT_VERIFY_TOKENS_REF` | `qwen36-engine-tokens.safetensors` |
-| `hf_isolated_layers` | `--engine --isolate-layers L0,L1,...` | `FIREPIT_VERIFY_ISOLATED_REF` | `qwen36-engine-isolated.safetensors` |
+| `hf_locate_divergence` | `--engine --tokens-json crates/firepit/tests/fixtures/qwen36-frog-tokens.json` | `FIREPIT_VERIFY_TOKENS_REF` | `qwen36-engine-tokens.safetensors` |
+| `hf_isolated_layers` | `--engine --isolate-layers 0,3 --tokens-json crates/firepit/tests/fixtures/qwen36-frog-tokens.json` | `FIREPIT_VERIFY_ISOLATED_REF` | `qwen36-engine-isolated.safetensors` |
 
 - HF 비교: 마지막 토큰 logits의 top-1과 top-5 집합이 같아야 한다. logits의 최대 절대·상대 오차와 상대 L2, 층별 마지막 residual 행의 같은 세 수치는 기록한다.
 - 경로 동치: `prefill(T)`와 `step_eager` T회, `prefill(A)` 뒤 `prefill(B)`와 `prefill(A+B)`의 마지막 logits top-1·top-5 집합이 같아야 한다. 두 경로의 logits 및 모든 층의 GDN conv·recurrent 또는 attention K·V state 차이를 기록한다. 현재 고정 입력은 T=150, A=100, B=50이다.
@@ -103,11 +103,11 @@ GB10 측정과 신·구 커밋 비교는 `scripts/spark-bench.sh [--out DIR] REV
 ```sh
 cd /work/src-<rev>/tools/reference   # spark-bench가 푼 소스 또는 같은 커밋의 checkout
 uv run python trace_qwen36.py --model /work/qwen3.6-35b-a3b --engine --out /work/refs/qwen36-engine-prefill.safetensors
-uv run python trace_qwen36.py --model /work/qwen3.6-35b-a3b --engine --tokens-json TOKENS.json --out /work/refs/qwen36-engine-tokens.safetensors
-uv run python trace_qwen36.py --model /work/qwen3.6-35b-a3b --engine --isolate-layers L0,L1 --tokens-json TOKENS.json --out /work/refs/qwen36-engine-isolated.safetensors
+uv run python trace_qwen36.py --model /work/qwen3.6-35b-a3b --engine --tokens-json ../../crates/firepit/tests/fixtures/qwen36-frog-tokens.json --out /work/refs/qwen36-engine-tokens.safetensors
+uv run python trace_qwen36.py --model /work/qwen3.6-35b-a3b --engine --isolate-layers 0,3 --tokens-json ../../crates/firepit/tests/fixtures/qwen36-frog-tokens.json --out /work/refs/qwen36-engine-isolated.safetensors
 ```
 
-`TOKENS.json`은 조사할 token ID 배열이고, `--isolate-layers`는 입력·mixer 출력을 저장할 층이다. 세 파일은 서로 바꿔 쓸 수 없다. `tokens_source` metadata는 이 절의 도구 버전부터 기록되므로, 그 전에 만든 파일은 다시 만들어야 한다.
+`--tokens-json`은 WikiText-2 quality 기준 묶음 69의 0~2861행 token ID다(firepit이 ' frog'를, HF bf16이 '2'를 예측하는 위치까지, [quality floor 기록](research/measurements/quality-floor-gb10.md)). `--isolate-layers 0,3`은 GDN 층 하나와 attention 층 하나다. 테스트는 각 정답지의 토큰이 해당 fixture와 같은지도 확인한다. 세 파일은 서로 바꿔 쓸 수 없다. `tokens_source` metadata는 이 절의 도구 버전부터 기록되므로, 그 전에 만든 파일은 다시 만들어야 한다.
 
 `spark-bench.sh`로 검증할 때는 COMMAND 안에서 변수를 넘긴다.
 
