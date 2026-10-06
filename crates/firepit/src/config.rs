@@ -5,6 +5,8 @@ use firepit_kernels::moe::MoeDims;
 use firepit_kernels::rope::RopeDims;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WeightFormat {
@@ -180,6 +182,25 @@ impl ModelConfig {
         };
         ModelDims::parse(&text, 1, None)?;
         Ok(Self { text, quantization })
+    }
+
+    pub fn open(dir: &Path) -> Result<Self> {
+        let json = |name: &str| -> Result<Value> {
+            Ok(serde_json::from_reader(File::open(dir.join(name))?)?)
+        };
+        let modelopt = dir
+            .join("hf_quant_config.json")
+            .exists()
+            .then(|| json("hf_quant_config.json"))
+            .transpose()?;
+        Self::new(json("config.json")?, modelopt)
+    }
+
+    pub fn max_positions(&self) -> Result<usize> {
+        Ok(self.text["max_position_embeddings"]
+            .as_u64()
+            .ok_or("missing or invalid max_position_embeddings")?
+            .try_into()?)
     }
 
     pub fn dims(&self, max_seq: usize, prefix_layers: Option<usize>) -> Result<ModelDims> {

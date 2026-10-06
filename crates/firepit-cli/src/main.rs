@@ -7,7 +7,7 @@ use catalog::{MEASUREMENTS, ModelRef, RECIPES};
 use clap::{Parser, Subcommand};
 use cuda_core::Device;
 use firepit::generation::{eos_ids, greedy};
-use firepit::{Engine, LoadOptions, Model, Result, SessionId};
+use firepit::{Engine, LoadOptions, Model, ModelConfig, Result, SessionId};
 use remote::HuggingFace;
 use std::io::{self, Read, Write};
 use std::path::Path;
@@ -107,7 +107,8 @@ fn run(dir: &Path, prompt: &str, max_new_tokens: usize, eager: bool) -> Result<(
     if input.is_empty() {
         return Err("prompt is empty".into());
     }
-    let max_seq = jit::cache_capacity(input.len() + max_new_tokens);
+    let limit = ModelConfig::open(dir)?.max_positions()?;
+    let max_seq = jit::cache_capacity(input.len() + max_new_tokens, limit);
     let eos = eos_ids(dir, &tokenizer)?;
     let device = Device::new(0)?;
     let compiles = jit::Counts::now();

@@ -38,10 +38,16 @@ pub fn enable_disk_cache(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// KV cache length rounded up to the largest shape divisibility cuTile
-/// specializes on, so prompts of different lengths reuse the compiled kernels.
-pub fn cache_capacity(tokens: usize) -> usize {
-    tokens.next_multiple_of(DivHint::default().max as usize)
+/// KV cache length for `tokens`, capped at `limit`. Decode `cache_append` takes
+/// the cache length as a compile-time slab shape (cuTile requires static shapes
+/// on written tensors), so lengths are rounded to powers of two, no smaller than
+/// the largest shape divisibility cuTile specializes on: logarithmically many
+/// compiled variants, at most twice the cache memory the tokens need.
+pub fn cache_capacity(tokens: usize, limit: usize) -> usize {
+    tokens
+        .next_power_of_two()
+        .max(DivHint::default().max as usize)
+        .min(limit)
 }
 
 #[derive(Clone, Copy)]
@@ -108,14 +114,16 @@ mod tests {
     }
 
     #[test]
-    fn cache_capacity_rounds_up_to_the_specialized_divisibility() {
-        let step = DivHint::default().max as usize;
-        assert_eq!(cache_capacity(1), step);
-        assert_eq!(cache_capacity(step), step);
-        assert_eq!(cache_capacity(step + 1), 2 * step);
-        assert_eq!(
-            DivHint::from_value(cache_capacity(37) as i32),
-            DivHint::from_value(cache_capacity(4000) as i32)
-        );
+    fn cache_capacity_rounds_to_powers_of_two_within_the_limit() {
+        let floor = DivHint::default().max as usize;
+        assert_eq!(cache_capacity(1, 1 << 18), floor);
+        assert_eq!(cache_capacity(floor + 1, 1 << 18), 2 * floor);
+        assert_eq!(cache_capacity(100, 1 << 18), 128);
+        assert_eq!(cache_capacity(128, 1 << 18), 128);
+        assert_eq!(cache_capacity(3000, 2048 + 1000), 3048);
+        let distinct: std::collections::BTreeSet<_> = (1..=4096)
+            .map(|tokens| cache_capacity(tokens, 1 << 18))
+            .collect();
+        assert_eq!(distinct.len(), (4096 / floor).ilog2() as usize + 1);
     }
 }

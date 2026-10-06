@@ -8,8 +8,6 @@ use firepit_kernels::gemv::{GemvTile, row_scaled_tile};
 use firepit_kernels::weights::{HostFp8Matrix, HostNvfp4Matrix, NVFP4_GROUP, Weight};
 use half::bf16;
 use safetensors::Dtype;
-use serde_json::Value;
-use std::fs::File;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -312,17 +310,9 @@ struct Source {
 
 impl Source {
     fn open(dir: &Path) -> Result<Self> {
-        let json = |name: &str| -> Result<Value> {
-            Ok(serde_json::from_reader(File::open(dir.join(name))?)?)
-        };
-        let modelopt = dir
-            .join("hf_quant_config.json")
-            .exists()
-            .then(|| json("hf_quant_config.json"))
-            .transpose()?;
         Ok(Self {
             checkpoint: Checkpoint::open(dir)?,
-            config: ModelConfig::new(json("config.json")?, modelopt)?,
+            config: ModelConfig::open(dir)?,
         })
     }
 }
@@ -850,6 +840,7 @@ mod tests {
     use half::bf16;
     use safetensors::Dtype;
     use safetensors::tensor::{TensorView, serialize_to_file};
+    use serde_json::Value;
 
     const PROJECTION: &str = "model.language_model.layers.0.linear_attn.in_proj_z.weight";
 
