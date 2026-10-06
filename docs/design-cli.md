@@ -50,10 +50,11 @@ cuTile JIT는 세 단계다. stage1은 Rust 커널을 Tile IR bytecode로 만들
   - 이미 있는 디렉터리가 group·others에 열려 있으면 거부한다.
   - 0700 재설정은 소유자만 성공하므로 소유자 검사를 겸한다.
   - cuTile이 기본 위치(`~/.cache/cutile/kernels`)에 적용하는 정책과 같다. 위치를 `$FIREPIT_HOME` 아래에 둔 것은 두 가지 때문이다. 모델과 함께 지우고 옮길 수 있다. probe 예제들이 쓰는 기본 위치의 2 GiB 한도를 나눠 쓰지 않는다.
-- **KV cache 길이를 올림한다.** decode `cache_append`는 cache 길이를 컴파일 상수(`MAX_SEQ`)로 받지 않고 런타임 extent로 받는다.
-  - `run`은 `max_seq`(입력 길이 + 생성 길이)를 cuTile이 특수화하는 shape 나눔의 최댓값(`DivHint::default().max`)의 배수로 올린다.
-  - 그래서 프롬프트 길이가 달라도 attention 커널을 다시 컴파일하지 않는다.
-  - 메모리 증가는 최대 15 위치분이다.
+- **KV cache 길이를 2의 거듭제곱으로 올린다.** decode `cache_append`는 cache 길이를 컴파일 상수(`MAX_SEQ`, 출력 slab shape)로 받는다.
+  - cuTile은 쓰기 tensor 인자에 정적 shape를 요구한다(cuTile book "Writable tensor parameters use static tile shapes"). 출력 slab을 `-1`로 두면 launch 검사가 거부한다(GB10에서 확인, 2026-10-07).
+  - 한 행 view를 출력으로 넘길 수도 없다. graph 재생 중 위치를 장치에서 읽기 때문이다([design-e3](design-e3.md)).
+  - 그래서 `run`은 `max_seq`(입력 길이 + 생성 길이)를 2의 거듭제곱으로 올린다. 하한은 cuTile이 특수화하는 shape 나눔의 최댓값(`DivHint::default().max`), 상한은 `max_position_embeddings`다.
+  - 컴파일 변형은 길이의 로그 수만큼이다(16~4096 사이 9개). KV cache 메모리는 필요량의 최대 2배다. Qwen3.6은 토큰당 40 KB(attention 10층 × K·V × 2 head × 256 × 4 B)라, 4096 토큰 구간이면 최대 164 MB다.
 - **사후 보고.** `run` 끝에 "컴파일한 커널 수, 그중 `tileiras`가 만든 수, 디스크 캐시에서 온 수"를 한 줄로 쓴다(cuTile 공개 카운터).
   - 진행 중 표시를 위한 hook은 없다.
   - JIT 누적 시간을 주는 공개 카운터도 없다. 단계별 시간은 `CUTILE_JIT_TIMING=1`로 본다.
