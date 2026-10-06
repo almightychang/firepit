@@ -1,0 +1,7 @@
+# Pin the compiler so local, container and GB10 builds agree; the trybuild
+# expected stderr files in crates/firepit/tests/ui hold this compiler's wording.
+# Same channel as vendor/cutile-rs.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
