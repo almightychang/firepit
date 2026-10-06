@@ -3,9 +3,9 @@ mod kernels {
     use cutile::core::*;
 
     #[cutile::entry()]
-    pub fn cache_append<const MAX_SEQ: i32, const KV_HEADS: i32, const D: i32>(
-        k_cache: &mut Tensor<f32, { [MAX_SEQ, 1, D] }>,
-        v_cache: &mut Tensor<f32, { [MAX_SEQ, 1, D] }>,
+    pub fn cache_append<const KV_HEADS: i32, const D: i32>(
+        k_cache: &mut Tensor<f32, { [-1, 1, D] }>,
+        v_cache: &mut Tensor<f32, { [-1, 1, D] }>,
         key: &Tensor<f32, { [KV_HEADS, D] }>,
         value: &Tensor<f32, { [KV_HEADS, D] }>,
         position: &Tensor<i32, { [1] }>,
@@ -260,11 +260,7 @@ impl AttentionDims {
         1.0 / (self.head_dim as f32).sqrt()
     }
     pub fn cache_generics(&self) -> Vec<String> {
-        vec![
-            self.max_seq.to_string(),
-            self.kv_heads.to_string(),
-            self.head_dim.to_string(),
-        ]
+        vec![self.kv_heads.to_string(), self.head_dim.to_string()]
     }
     pub fn attention_generics(&self) -> Vec<String> {
         vec![
@@ -286,14 +282,68 @@ impl AttentionDims {
             self.kv_heads.to_string(),
         ]
     }
-    pub fn prefill_cache_generics(&self) -> Vec<String> {
-        vec![self.kv_heads.to_string(), self.head_dim.to_string()]
-    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::AttentionDims;
+    use super::kernels::__module_ast_self;
+    use cutile::compile_api::KernelCompiler;
+    use cutile::cutile_compiler::specialization::{SpecializationBits, compute_spec};
+
+    fn contiguous(shape: &[i32]) -> Vec<i32> {
+        let mut strides = vec![1; shape.len()];
+        for axis in (0..shape.len() - 1).rev() {
+            strides[axis] = strides[axis + 1] * shape[axis + 1];
+        }
+        strides
+    }
+
+    fn cache_append_ir(dims: &AttentionDims) -> String {
+        let cache = [dims.max_seq(), dims.kv_heads(), dims.head_dim()].map(|x| x as i32);
+        let row = [dims.kv_heads(), dims.head_dim()].map(|x| x as i32);
+        let position = [1];
+        let arguments: [(&str, &[i32]); 5] = [
+            ("k_cache", &cache),
+            ("v_cache", &cache),
+            ("key", &row),
+            ("value", &row),
+            ("position", &position),
+        ];
+        let strides: Vec<(&str, Vec<i32>)> = arguments
+            .iter()
+            .map(|&(name, shape)| {
+                let hint = contiguous(shape)
+                    .iter()
+                    .map(|&stride| if stride == 1 { 1 } else { -1 })
+                    .collect();
+                (name, hint)
+            })
+            .collect();
+        let stride_refs: Vec<(&str, &[i32])> = strides
+            .iter()
+            .map(|(name, hint)| (*name, hint.as_slice()))
+            .collect();
+        let specs: Vec<(&str, SpecializationBits)> = arguments
+            .iter()
+            .map(|&(name, shape)| (name, compute_spec(16, shape, &contiguous(shape), 4)))
+            .collect();
+        KernelCompiler::new(__module_ast_self, "kernels", "cache_append")
+            .target("sm_121")
+            .generics(dims.cache_generics())
+            .strides(&stride_refs)
+            .spec_args(&specs)
+            .compile()
+            .unwrap()
+            .ir_text()
+    }
+
+    #[test]
+    fn cache_append_compiles_once_for_cache_lengths_of_equal_divisibility() {
+        let short = AttentionDims::new(48, 16, 2, 256).unwrap();
+        let long = AttentionDims::new(4096, 16, 2, 256).unwrap();
+        assert_eq!(cache_append_ir(&short), cache_append_ir(&long));
+    }
 
     #[test]
     fn rejects_invalid_dimensions() {
