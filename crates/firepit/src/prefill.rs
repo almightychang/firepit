@@ -1060,7 +1060,7 @@ fn run_special(
                     &keys,
                     &values,
                 )
-                .generics(a.cache_generics()),
+                .generics(a.prefill_cache_generics()),
             )?;
         }
         PrefillOp::CausalAttention { layer } => {

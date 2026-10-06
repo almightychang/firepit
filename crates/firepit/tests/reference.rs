@@ -1515,7 +1515,7 @@ fn attention_prefill_matches_hf() -> Result<(), Box<dyn std::error::Error>> {
         &k_device,
         &v_device,
     )
-    .generics(dims.cache_generics())
+    .generics(dims.prefill_cache_generics())
     .sync_on(&stream)?;
     let mut attention = api::zeros::<f32>(&q.shape).sync_on(&stream)?;
     causal_attention_prefill(

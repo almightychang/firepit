@@ -88,7 +88,7 @@ fn gpu_prefill(
         &key,
         &value,
     )
-    .generics(dims.cache_generics())
+    .generics(dims.prefill_cache_generics())
     .sync_on(stream)?;
     let mut out = api::zeros::<f32>(&[t, h, d]).sync_on(stream)?;
     causal_attention_prefill(
@@ -501,7 +501,7 @@ fn prefill_matches_small_oracle() -> Result<(), Box<dyn std::error::Error>> {
         &k_device,
         &v_device,
     )
-    .generics(dims.cache_generics())
+    .generics(dims.prefill_cache_generics())
     .sync_on(&stream)?;
     let mut out = api::zeros::<f32>(&[t, dims.q_heads(), dims.head_dim()]).sync_on(&stream)?;
     causal_attention_prefill(
