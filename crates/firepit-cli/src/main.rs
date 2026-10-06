@@ -41,6 +41,19 @@ enum Command {
         #[arg(long)]
         eager: bool,
     },
+    /// Show which op produces and consumes each buffer in one decode step
+    Flow {
+        model: ModelRef,
+        /// Sessions in the decode batch
+        #[arg(long, default_value_t = 1)]
+        batch: usize,
+        /// Load only the first N layers
+        #[arg(long)]
+        layers: Option<usize>,
+        /// Record the flow without launching kernels
+        #[arg(long)]
+        dry: bool,
+    },
 }
 
 fn models(store: &Store) -> Result<()> {
@@ -147,6 +160,23 @@ fn run(dir: &Path, prompt: &str, max_new_tokens: usize, eager: bool) -> Result<(
     Ok(())
 }
 
+fn flow(dir: &Path, batch: usize, layers: Option<usize>, dry: bool) -> Result<()> {
+    let device = Device::new(0)?;
+    let model = Arc::new(Model::from_checkpoint(
+        dir,
+        LoadOptions { max_seq: 1, layers },
+        &device,
+    )?);
+    let mut engine = Engine::new(model, &device)?;
+    let mut sessions = (0..batch)
+        .map(|id| engine.new_session(SessionId(id as u64)))
+        .collect::<Result<Vec<_>>>()?;
+    let entries = sessions.iter_mut().map(|session| (session, 0));
+    let nodes = engine.step_flow(engine.batch(entries)?, dry)?;
+    print!("{}", engine.flow_report(&nodes));
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let store = Store::from_env()?;
@@ -173,6 +203,15 @@ fn main() -> Result<()> {
             };
             let dir = store.pull(model.recipe(), &HuggingFace::new())?;
             run(&dir, &prompt, max_new_tokens, eager)
+        }
+        Command::Flow {
+            model,
+            batch,
+            layers,
+            dry,
+        } => {
+            let dir = store.pull(model.recipe(), &HuggingFace::new())?;
+            flow(&dir, batch, layers, dry)
         }
     }
 }

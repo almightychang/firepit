@@ -1,12 +1,12 @@
-use crate::access::{Ctx, DecodeStore};
 use crate::checkpoint::Stream;
 use crate::model::{Model, Projection};
 use crate::session::Session;
+use crate::store::{Ctx, DecodeStore};
 use crate::{LayerKind, Result};
 use cuda_async::cuda_graph::CudaGraph;
 use std::ops::Range;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Slot {
     Residual0,
     Residual1,
@@ -144,7 +144,7 @@ pub enum NormName {
     GdnGated,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum WeightName {
     MixerProjection(usize),
     GdnOut,
@@ -214,6 +214,35 @@ pub enum Op {
 }
 
 impl Op {
+    pub(crate) fn layer(self) -> Option<usize> {
+        match self {
+            Self::Norm {
+                name: NormName::Final,
+                ..
+            }
+            | Self::Gemv {
+                name: WeightName::LmHead,
+                ..
+            }
+            | Self::Embed { .. }
+            | Self::AttnRope { .. }
+            | Self::ExpertSwiglu
+            | Self::Add { .. } => None,
+            Self::Norm { layer, .. }
+            | Self::Gemv { layer, .. }
+            | Self::GdnConv { layer }
+            | Self::GdnDelta { layer }
+            | Self::GdnGate { layer }
+            | Self::CacheAppend { layer }
+            | Self::OnlineAttention { layer }
+            | Self::OutputGate { layer }
+            | Self::TopK { layer }
+            | Self::ExpertGateUp { layer }
+            | Self::ExpertDown { layer }
+            | Self::Combine { layer } => Some(layer),
+        }
+    }
+
     pub(crate) fn kind(self) -> &'static str {
         match self {
             Self::Embed { .. } => "embedding",

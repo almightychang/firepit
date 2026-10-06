@@ -1,5 +1,4 @@
 use crate::Result;
-use crate::access::weight;
 use crate::checkpoint::Stream;
 #[cfg(feature = "testing")]
 use crate::engine::RoutingLayerTrace;
@@ -7,6 +6,7 @@ use crate::execute::{gdn_gate, output_gate, rms_norm, row_width, weight_gemv_til
 use crate::model::{MixerWeights, Model, Projection};
 use crate::plan::{NormName, Op, Slot, StepPlan, WeightName};
 use crate::session::{GdnStateLayout, LayerState, Session};
+use crate::store::weight;
 use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{IntoPartition, PartitionMut, Reshape, Tensor, TensorView};

@@ -7,6 +7,7 @@ use crate::plan::{GdnTiles, StepPlan};
 pub use crate::prefill::IsolatedLayerTrace;
 use crate::prefill::{self, PrefillPlan, ScoredRows};
 use crate::session::{Batch, Session, SessionId};
+use crate::store::OpNode;
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
@@ -14,7 +15,7 @@ use cuda_core::Device;
 #[cfg(feature = "testing")]
 use cutile::tile_kernel::ToHostVecOp;
 use firepit_kernels::rope;
-use firepit_kernels::sink::{Eager, Graph, Trace, Traced};
+use firepit_kernels::sink::{Dry, Eager, Graph, Trace, Traced};
 use firepit_kernels::tile::{MIN_ROW_TILE, channel_tile, row_tile};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,6 +121,13 @@ impl Engine {
         Ok(())
     }
 
+    pub(crate) fn tiles(&self) -> GdnTiles {
+        GdnTiles {
+            value: self.gdn_value_tile,
+            conv: self.gdn_conv_tile,
+        }
+    }
+
     pub fn batch<'a>(
         &self,
         entries: impl IntoIterator<Item = (&'a mut Session, u32)>,
@@ -133,6 +141,24 @@ impl Engine {
             run(ops, tiles, &mut ctx, &mut Eager(stream))
         })
         .map(|(logits, ())| logits)
+    }
+
+    pub fn step_flow(&mut self, batch: Batch<'_>, dry: bool) -> Result<Vec<OpNode>> {
+        self.step_with(batch, |model, plan, sessions, stream| {
+            let (ops, tiles, mut ctx) = plan.context(model, sessions);
+            ctx.record();
+            if dry {
+                run(ops, tiles, &mut ctx, &mut Dry)?;
+            } else {
+                run(ops, tiles, &mut ctx, &mut Eager(stream))?;
+            }
+            Ok(ctx.nodes())
+        })
+        .map(|(_, nodes)| nodes)
+    }
+
+    pub fn flow_report(&self, nodes: &[OpNode]) -> String {
+        crate::flow::report(&self.model, nodes)
     }
 
     pub fn step_eager_traced(&mut self, batch: Batch<'_>) -> Result<(Vec<f32>, Trace)> {
@@ -317,7 +343,7 @@ impl Engine {
             for op in StepPlan::ops(&self.model)? {
                 if let crate::plan::Op::Gemv { layer, name, .. } = op {
                     if matches!(
-                        crate::access::weight(&self.model, layer, name),
+                        crate::store::weight(&self.model, layer, name),
                         firepit_kernels::weights::Weight::Q8(_)
                     ) {
                         return Err("Q8 prefill is unsupported".into());
@@ -384,15 +410,7 @@ impl Engine {
                 size,
                 CachedPlan {
                     instances,
-                    plan: StepPlan::new(
-                        &self.model,
-                        size,
-                        GdnTiles {
-                            value: self.gdn_value_tile,
-                            conv: self.gdn_conv_tile,
-                        },
-                        &self.stream,
-                    )?,
+                    plan: StepPlan::new(&self.model, size, self.tiles(), &self.stream)?,
                 },
             );
         }

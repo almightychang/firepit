@@ -1,11 +1,11 @@
 use crate::Result;
-use crate::access::{Ctx, Parts, Read, View};
 #[cfg(feature = "testing")]
 use crate::checkpoint::Stream;
 #[cfg(feature = "testing")]
 use crate::engine::RoutingLayerTrace;
 use crate::model::{MixerWeights, Model, Projection};
 use crate::plan::{GdnTiles, NormName, Op, Slot, WeightName};
+use crate::store::{Ctx, Parts, Read, View};
 #[cfg(feature = "testing")]
 use cuda_async::device_operation::DeviceOp;
 use cutile::tensor::{IntoPartition, PartitionMut, Tensor, TensorView};
@@ -307,6 +307,7 @@ fn run_inner(
     let sessions = ctx.sessions();
     for (op_index, &op) in ops.iter().enumerate() {
         let result = sink.span(op.kind(), |sink| -> Result<()> {
+            ctx.begin(op_index, op.kind(), op.layer());
             let Parts {
                 mut buffers,
                 inputs,

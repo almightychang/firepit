@@ -19,7 +19,33 @@ pub enum Weight {
     Q8(Q8Matrix),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MatrixFormat {
+    Bf16,
+    Fp8(Fp8Scaling),
+    Nvfp4,
+    Q8,
+}
+
 impl Weight {
+    pub fn format(&self) -> MatrixFormat {
+        match self {
+            Self::Dense(_) => MatrixFormat::Bf16,
+            Self::Fp8(w) => MatrixFormat::Fp8(w.scaling),
+            Self::Nvfp4(_) => MatrixFormat::Nvfp4,
+            Self::Q8(_) => MatrixFormat::Q8,
+        }
+    }
+
+    pub fn cols(&self) -> usize {
+        match self {
+            Self::Dense(w) => w.cols,
+            Self::Fp8(w) => w.weights.cols,
+            Self::Nvfp4(w) => w.cols,
+            Self::Q8(w) => w.cols,
+        }
+    }
+
     pub fn rows(&self) -> usize {
         match self {
             Self::Dense(w) => w.rows,

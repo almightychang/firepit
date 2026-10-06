@@ -42,3 +42,48 @@ fn nvfp4_prefix_runs_prefill_and_decode() -> Result<()> {
     println!("NVFP4 layers=2 lm_head GEMM vs GEMV last row max_abs={max_abs}");
     Ok(())
 }
+
+#[test]
+#[ignore = "requires the ModelOpt NVFP4 checkpoint and a GPU"]
+fn nvfp4_flow_shows_the_four_projection_groups() -> Result<()> {
+    use firepit::Projection::*;
+    use firepit_kernels::weights::{Fp8Scaling, MatrixFormat};
+    let dir = std::env::var_os("FIREPIT_NVFP4_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("HOME")).join("Models/qwen3.6-35b-a3b-nvfp4"));
+    let device = Device::new(0)?;
+    let model = Arc::new(Model::from_checkpoint(
+        &dir,
+        LoadOptions {
+            max_seq: 1,
+            layers: Some(4),
+        },
+        &device,
+    )?);
+    let mut engine = Engine::new(model.clone(), &device)?;
+    let mut session = engine.new_session(SessionId(1))?;
+    let nodes = engine.step_flow(engine.batch([(&mut session, 0)])?, true)?;
+    let analysis = firepit::flow::analyze(&model, &nodes);
+    let mut groups: Vec<_> = analysis
+        .fused(&model)
+        .map(|group| (group.members, group.format, group.padding))
+        .collect();
+    groups.sort_by_key(|(members, ..)| format!("{members:?}"));
+    groups.dedup();
+    assert_eq!(
+        groups,
+        [
+            (
+                vec![AttnQGate, AttnK, AttnV],
+                MatrixFormat::Fp8(Fp8Scaling::Rows),
+                0
+            ),
+            (vec![GdnB, GdnA], MatrixFormat::Bf16, 0),
+            (vec![GdnQkv, GdnZ], MatrixFormat::Fp8(Fp8Scaling::Rows), 0),
+            (vec![Router, SharedGate], MatrixFormat::Bf16, 15),
+        ]
+    );
+    assert!(analysis.candidates().is_empty());
+    assert!(analysis.unproduced.is_empty());
+    Ok(())
+}

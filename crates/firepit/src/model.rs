@@ -21,7 +21,7 @@ pub struct LoadOptions {
     pub layers: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Projection {
     GdnQkv,
     GdnZ,
@@ -52,6 +52,14 @@ pub struct ProjectionLayout {
 impl ProjectionLayout {
     pub fn rows(&self) -> usize {
         self.rows
+    }
+
+    pub fn members(&self) -> impl Iterator<Item = Projection> + '_ {
+        self.members.iter().map(|(member, _)| *member)
+    }
+
+    pub fn padding(&self) -> usize {
+        self.rows - self.members.last().map_or(0, |(_, rows)| rows.end)
     }
 
     pub fn columns(&self, member: Projection) -> Option<Range<usize>> {

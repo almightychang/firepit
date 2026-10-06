@@ -1,4 +1,4 @@
-# decode 접근 기록 설계
+# decode step 흐름(flow) 설계
 
 상태: 확정 (2026-10-07, Sam 승인).
 
@@ -39,7 +39,7 @@ to-be
         ctx.model() ─► &'m Model (dims, 가중치 벡터; 기록 안 함)
                   │ log: Some일 때
                   ▼
-          Vec<OpRecord> ─► access_log::report ─► bench --access-log
+          Vec<OpNode> ─► flow::report ─► firepit flow
                              ① 수평 합치기  ② 생산→소비·소비자 수·앞선 쓰기 없는 읽기
 ```
 
@@ -47,7 +47,7 @@ to-be
 
 ### 저장소와 접근자
 
-새 모듈 `crates/firepit/src/access.rs`:
+새 모듈 `crates/firepit/src/store.rs`:
 
 ```rust
 pub(crate) struct DecodeStore {           // 필드 private
@@ -109,7 +109,7 @@ for b in 0..batch {
 
 ### 우회 금지
 
-- `DecodeStore`의 필드는 `access` 모듈 private이다. 형제 모듈인 `execute.rs`에서 직접 접근하면 컴파일 에러(E0616)다.
+- `DecodeStore`의 필드는 `store` 모듈 private이다. 형제 모듈인 `execute.rs`에서 직접 접근하면 컴파일 에러(E0616)다.
 - runner 시그니처는 `run(ops, ctx, sink)`다. `StepPlan`과 `Session`을 받지 않으므로 세션 state로 가는 다른 길이 없다.
 - 컴파일러가 강제하는 것은 decode 저장소(버퍼, 입력, 선택)와 세션 state다. 가중치 행렬은 `ctx.model()`로 닿을 수 있다. 그래서 `Weights::matrix`를 쓰는 것은 규칙이다. `execute.rs`에서 `weight(`와 `.moe.gate_up`/`.moe.down` 직접 호출을 grep 테스트로 막는다.
 
@@ -129,7 +129,7 @@ decode 실행 경로 접근 지점은 `execute.rs`에서 testing 관찰 코드�
 
 | 파일 | 내용 | 줄 |
 |---|---|---|
-| `access.rs` (새) | `DecodeStore`, `Read`, `View`, `Ctx`, `Parts`, handle 5개 | +230 |
+| `store.rs` (새) | `DecodeStore`, `Read`, `View`, `Ctx`, `Parts`, handle 5개 | +230 |
 | `execute.rs` | 접근 51곳을 handle로. helper 3개를 `prefill.rs`로 옮김. `gdn_gate`·`output_gate` 인자 | 수정 ~100, −50 |
 | `prefill.rs` | helper 3개 받음. `gdn_gate`·`output_gate` 호출 2곳 | +50, 수정 ~6 |
 | `plan.rs` | `StepPlan`의 저장소 필드를 `store: DecodeStore`로. `WeightName` 2개 | +12, −30 |
@@ -143,9 +143,9 @@ decode 실행 경로 접근 지점은 `execute.rs`에서 testing 관찰 코드�
 ### 기록
 
 ```rust
-pub struct OpRecord { pub op: u32, pub kind: &'static str, pub layer: Option<u16>, pub accesses: Vec<Access> }
-pub struct Access { pub what: What, pub write: bool }
-pub enum What {
+pub struct OpNode { pub op: u32, pub kind: &'static str, pub layer: Option<u16>, pub uses: Vec<Use> }
+pub struct Use { pub buffer: Buffer, pub write: bool }
+pub enum Buffer {
     Slot(Slot),
     Member { layer: u16, member: Projection },
     Token, Position(u16), Cos, Sin,
@@ -155,7 +155,7 @@ pub enum What {
 }
 ```
 
-- `Ctx`에 `log: Option<RefCell<Vec<OpRecord>>>`를 둔다. 꺼져 있을 때 비용은 handle 호출마다 `Option` 검사 하나다. handle은 `&RefCell`을 나눠 가진다.
+- `Ctx`에 `log: Option<RefCell<Vec<OpNode>>>`를 둔다. 꺼져 있을 때 비용은 handle 호출마다 `Option` 검사 하나다. handle은 `&RefCell`을 나눠 가진다.
 - runner 루프가 op마다 `ctx.begin(index, op.kind(), op.layer())`를 부른다. `Op::layer()`를 새로 두고, layer 필드가 없는 op는 `None`이다.
 - 기록 규칙: `io`의 입력은 읽기, 출력은 쓰기다. `read`는 읽기다. `States::gdn`/`attention`은 쓰기, `attention_ref`는 읽기다. `Selections::get_mut`는 쓰기, `get`은 읽기다. `Inputs`와 `Weights`는 읽기다.
 - 가중치 형식·열 수는 기록하지 않는다. 분석이 `Model`에서 찾는다(firepit-kernels `Weight::format()`·`cols()` 추가).
@@ -172,9 +172,9 @@ pub enum What {
 - decode runner는 graph capture가 되는 경로라 host 동기화가 없다. 그래서 Dry로 끝까지 지나갈 것으로 본다. 테스트 1이 확인한다.
 - graph capture 중에는 기록하지 않는다.
 
-### 분석 (`crates/firepit/src/access_log.rs`)
+### 분석 (`crates/firepit/src/flow.rs`)
 
-값은 `(What, 쓴 op)`다. `Member`는 해당 묶음 `Slot::Projection(i)`를 마지막에 쓴 op와 잇는다.
+값은 `(Buffer, 쓴 op)`다. `Member`는 해당 묶음 `Slot::Projection(i)`를 마지막에 쓴 op와 잇는다.
 
 1. **수평 합치기.** `kind == "gemv"`인 op를 입력 값으로 묶는다.
    - 기존 묶음: 출력 `Projection(i)`의 layout 멤버가 둘 이상인 것. 멤버, 형식, padding 행, prefill 멤버별 분할(`gemm_rows`)을 보인다.
@@ -187,13 +187,13 @@ pub enum What {
 
 리포트 주석으로 둘을 고정해 적는다. q/gate 멤버 단위 오차(아래 한계)와 layer 재사용 slot의 순서 검출 한계다.
 
-### `bench --access-log`
+### `firepit flow`
 
 ```
-bench --model M --access-log [--dry] [--batches B] [--layers N]
+firepit flow <model> [--dry] [--batch B] [--layers N]
 ```
 
-decode 한 step을 기록해 텍스트 리포트를 출력한다. 예상 형태(`cfdb01f` + NVFP4, 코드에서 추론, 미실행):
+decode 한 step에서 op마다 어떤 버퍼를 만들고 쓰는지 기록해 텍스트 리포트를 출력한다. 시간 측정 도구(bench)와 섞지 않으려고 CLI subcommand로 둔다. CUDA graph와 헷갈리지 않게 이름은 graph가 아니라 flow다. 예상 형태(`cfdb01f` + NVFP4, 코드에서 추론, 미실행):
 
 ```
 == 수평 합치기
@@ -210,10 +210,10 @@ Residual 2 · [qkv|z].qkv → gdn_conv 1 · [qkv|z].z → gdn_gate 1 · [q_gate|
 
 | 테스트 | 위치 | 확인 |
 |---|---|---|
-| Dry 기록 = 실행+기록 기록 | `tests/engine.rs`, 작은 무작위 모델 | 같은 `Vec<OpRecord>` |
+| Dry 기록 = 실행+기록 기록 | `tests/engine.rs`, 작은 무작위 모델 | 같은 `Vec<OpNode>` |
 | 세션별 접근 | 같음, B = 2 | 세션 op마다 `State` 접근이 세션 수만큼 |
 | 정상 plan | 같음 | 앞선 쓰기 없는 읽기 0. 작은 모델은 투영이 모두 bf16이라 기존 묶음 `[qkv|z|b|a]`, `[q_gate|k|v]`, `[router|shared_gate]` |
-| 순서 뒤집기 검출 | `access_log.rs` 단위 테스트. `StepPlan::ops`에서 layer 0의 MoE 투영 gemv와 `TopK`를 바꾼다 | `TopK`의 `Member{router}`, `Member{shared_gate}`가 앞선 쓰기 없는 읽기 |
+| 순서 뒤집기 검출 | `flow.rs` 단위 테스트. `StepPlan::ops`에서 layer 0의 MoE 투영 gemv와 `TopK`를 바꾼다 | `TopK`의 `Member{router}`, `Member{shared_gate}`가 앞선 쓰기 없는 읽기 |
 | 재사용 slot 한계 | 같음, layer 1에서 바꾼다 | 앞선 쓰기 없는 읽기 0, layer 0 값으로 가는 간선. 한계를 테스트로 고정 |
 | 기존 묶음 4개 (ignored) | `tests/nvfp4_prefix.rs` 옆, NVFP4 앞 4층, Dry | `[qkv|z]` fp8, `[b|a]` bf16, `[q_gate|k|v]` fp8, `[router|shared_gate]` bf16 padding 15. 남은 후보 0 |
 
@@ -223,13 +223,13 @@ Residual 2 · [qkv|z].qkv → gdn_conv 1 · [qkv|z].z → gdn_gate 1 · [q_gate|
 
 | 파일 | 내용 | 줄 |
 |---|---|---|
-| `access.rs` | `log`, `OpRecord`, `begin`, handle마다 기록 한 줄 | +80 |
+| `store.rs` | `log`, `OpNode`, `begin`, handle마다 기록 한 줄 | +80 |
 | `plan.rs` | `Op::layer()` | +25 |
 | firepit-kernels `sink.rs` | `Dry` | +12 |
 | firepit-kernels `weights/mod.rs` | `format()`, `cols()` | +20 |
-| `access_log.rs` (새) | 값·간선, 소비자, 앞선 쓰기 없는 읽기, 수평 합치기, 텍스트 | +230 |
-| `engine.rs` | `step_access_log(batch, dry) -> Vec<OpRecord>` | +35 |
-| `examples/bench.rs` | `--access-log`, `--dry` | +35 |
+| `flow.rs` (새) | 값·간선, 소비자, 앞선 쓰기 없는 읽기, 수평 합치기, 텍스트 | +230 |
+| `engine.rs` | `step_flow(batch, dry) -> Vec<OpNode>`, `flow_report` | +35 |
+| firepit-cli `main.rs` | `flow` subcommand(`--batch`, `--layers`, `--dry`) | +35 |
 | 테스트 | 위 표 | +120 |
 
 합: 약 +560.
@@ -260,6 +260,6 @@ GPU 검증은 GB10에서 `scripts/spark-bench.sh`로 한다. 커밋 전(`B`)과 
 | 1 | handle 호출이 decode host 비용을 늘림 | `spark-bench.sh B A -- '$BIN/bench … --batches 1 --warmup 8 --steps 128 --max-seq 256'`를 3회 교대. graph decode는 캡처 후 재생이라 차이가 없을 것으로 본다. prefill 5000 wall도 같은 방식으로 잰다(prefill 코드는 helper 이동만). 잡음 범위 밖이면 보고 |
 | 2 | Dry가 decode 경로에서 host 동기화를 만남 | 테스트 1(Dry = 실행+기록)이 실패로 드러냄 |
 | 2 | 기록이 꺼져 있을 때 비용 | 커밋 1과 같은 decode bench 교대 측정 |
-| 2 | 리포트가 기존 묶음을 잘못 읽음 | ignored 테스트(NVFP4 앞 4층)를 GB10에서 `spark-bench.sh A -- 'cd $SRC && cargo test --release -p firepit --test nvfp4_prefix -- --ignored'`로, `$BIN/bench --access-log --dry`의 전체 모델 리포트를 함께 기록 |
+| 2 | 리포트가 기존 묶음을 잘못 읽음 | ignored 테스트(NVFP4 앞 4층)를 GB10에서 `spark-bench.sh A -- 'cd $SRC && cargo test --release -p firepit --test nvfp4_prefix -- --ignored'`로, `$FIREPIT flow <model> --dry`의 전체 모델 리포트를 함께 기록 |
 
 pod 안의 모델 경로는 `docs/testing.md`의 GB10 예와 같은 `/work/…` 조립본을 쓴다. ignored 테스트가 읽는 모델·정답지 경로를 pod 경로로 넘기는 방법(환경 변수 등)은 구현 때 확인한다.

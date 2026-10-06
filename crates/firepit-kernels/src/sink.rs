@@ -123,6 +123,17 @@ impl Sink for Eager<'_> {
     }
 }
 
+pub struct Dry;
+
+impl Sink for Dry {
+    fn run<T: Send, O: GraphNode + DeviceOp<Output = T>>(
+        &mut self,
+        _op: O,
+    ) -> Result<(), DeviceError> {
+        Ok(())
+    }
+}
+
 pub struct Graph<'a>(pub &'a Scope);
 
 impl Sink for Graph<'_> {

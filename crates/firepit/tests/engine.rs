@@ -212,3 +212,67 @@ fn close_session_and_max_seq() -> TestResult {
     engine.step(batch)?;
     Ok(())
 }
+
+fn flow(
+    model: &Arc<Model>,
+    device: &Arc<Device>,
+    size: usize,
+    dry: bool,
+) -> Result<Vec<firepit::OpNode>, Box<dyn std::error::Error>> {
+    let mut engine = Engine::new(model.clone(), device)?;
+    let mut sessions = sessions(&engine, size)?;
+    let batch = engine.batch(sessions.iter_mut().map(|session| (session, 1)))?;
+    engine.step_flow(batch, dry)
+}
+
+#[test]
+fn dry_flow_matches_executed_flow() -> TestResult {
+    let (model, device) = setup()?;
+    for size in [1, 2] {
+        assert_eq!(
+            flow(&model, &device, size, true)?,
+            flow(&model, &device, size, false)?
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn flow_touches_state_once_per_session() -> TestResult {
+    let (model, device) = setup()?;
+    let size = 2;
+    let nodes = flow(&model, &device, size, true)?;
+    let stateful = ["gdn_conv", "gdn_delta", "cache_append", "online_attention"];
+    let touched = nodes.iter().filter(|node| stateful.contains(&node.kind));
+    for node in touched {
+        let states = node
+            .uses
+            .iter()
+            .filter(|usage| matches!(usage.buffer, firepit::Buffer::State { .. }))
+            .count();
+        assert_eq!(states, size, "{node:?}");
+    }
+    Ok(())
+}
+
+#[test]
+fn bf16_flow_reads_nothing_unwritten_and_fuses_each_input() -> TestResult {
+    use firepit::Projection::*;
+    let (model, device) = setup()?;
+    let analysis = firepit::flow::analyze(&model, &flow(&model, &device, 1, true)?);
+    assert!(analysis.unproduced.is_empty(), "{:?}", analysis.unproduced);
+    assert!(analysis.candidates().is_empty());
+    let mut fused: Vec<Vec<firepit::Projection>> =
+        analysis.fused(&model).map(|group| group.members).collect();
+    fused.dedup();
+    assert_eq!(
+        fused,
+        [
+            vec![GdnQkv, GdnZ, GdnB, GdnA],
+            vec![Router, SharedGate],
+            vec![AttnQGate, AttnK, AttnV],
+            vec![Router, SharedGate],
+        ]
+    );
+    Ok(())
+}
