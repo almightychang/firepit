@@ -108,6 +108,43 @@ mod kernels {
         }
         out.store(sum);
     }
+
+    #[cutile::entry()]
+    pub fn combine_add_norm_kernel<const H: i32>(
+        out: &mut Tensor<f32, { [1, H] }>,
+        normed: &mut Tensor<f32, { [1, H] }>,
+        routed: &Tensor<f32, { [-1, H] }>,
+        inverse: &Tensor<i32, { [-1, -1] }>,
+        weights: &Tensor<f32, { [-1, -1] }>,
+        residual: &Tensor<f32, { [-1, H] }>,
+        gamma: &Tensor<f32, { [H] }>,
+        inv_h: f32,
+        eps: f32,
+        slots: i32,
+    ) {
+        let pid: (i32, i32, i32) = get_tile_block_id();
+        let mut sum: Tile<f32, { [1, H] }> = constant(0.0f32, shape![1, H]);
+        for rank in 0i32..slots {
+            let location: Tile<i32, { [1, 1] }> =
+                inverse.partition(shape![1, 1]).load([pid.0, rank]);
+            let row: i32 = tile_to_scalar(location.reshape(shape![]));
+            let value: Tile<f32, { [1, H] }> = routed.partition(shape![1, H]).load([row, 0]);
+            let weight: Tile<f32, { [1, 1] }> = weights.partition(shape![1, 1]).load([pid.0, rank]);
+            sum = sum + value * weight.broadcast(shape![1, H]);
+        }
+        let r: Tile<f32, { [1, H] }> = residual.partition(shape![1, H]).load([pid.0, 0]);
+        let x = r + sum;
+        out.store(x);
+        let squares: Tile<f32, { [1] }> = reduce_sum(x * x, 1);
+        let squares: Tile<f32, { [1, 1] }> = squares.reshape(shape![1, 1]);
+        let scale = rsqrt(
+            squares * inv_h.broadcast(shape![1, 1]) + eps.broadcast(shape![1, 1]),
+            ftz::Disabled,
+        );
+        let gamma: Tile<f32, { [H] }> = gamma.partition(shape![H]).load([0]);
+        let gamma: Tile<f32, { [1, H] }> = gamma.reshape(shape![1, H]);
+        normed.store(x * scale.broadcast(shape![1, H]) * gamma);
+    }
 }
 
 pub use kernels::top_k_prefill;
@@ -741,30 +778,6 @@ pub fn combine_prefill<'a>(
         .generics(dims.combine_generics())
 }
 
-pub fn combine_prefill_sliced<'a>(
-    out: Partition<&'a mut Tensor<f32>>,
-    routed: &'a TensorView<'a, f32>,
-    plan: &'a PrefillPlan,
-) -> impl DeviceOp<
-    Output = (
-        Partition<&'a mut Tensor<f32>>,
-        &'a TensorView<'a, f32>,
-        &'a Tensor<i32>,
-        &'a Tensor<f32>,
-        i32,
-    ),
-> + GraphNode
-+ 'a {
-    let dims = plan.dims;
-    assert_eq!(out.partition_shape, vec![1, dims.hidden]);
-    assert_eq!(
-        routed.shape(),
-        &[plan.layout.padded_rows() as i32, dims.hidden as i32]
-    );
-    kernels::combine_prefill_kernel(out, routed, &plan.inverse, &plan.weights, dims.top_k as i32)
-        .generics(dims.combine_generics())
-}
-
 pub fn combine<'a>(
     out: Partition<&'a mut Tensor<f32>>,
     routed: &'a Tensor<f32>,
@@ -792,31 +805,79 @@ pub fn combine<'a>(
     .generics(dims.combine_generics())
 }
 
-pub fn combine_view<'a>(
+pub struct ResidualNorm<'a> {
+    pub residual: &'a TensorView<'a, f32>,
+    pub gamma: &'a Tensor<f32>,
+    pub eps: f32,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combine_add_norm_launch<'a>(
     out: Partition<TensorViewMut<'a, f32>>,
+    normed: Partition<TensorViewMut<'a, f32>>,
     routed: &'a TensorView<'a, f32>,
-    selection: &'a ExpertSelection,
-) -> impl DeviceOp<
-    Output = (
-        Partition<TensorViewMut<'a, f32>>,
-        &'a TensorView<'a, f32>,
-        &'a Tensor<i32>,
-        &'a Tensor<f32>,
-        i32,
-    ),
-> + GraphNode
-+ 'a {
-    let dims = selection.dims;
+    inverse: &'a Tensor<i32>,
+    weights: &'a Tensor<f32>,
+    norm: ResidualNorm<'a>,
+    dims: MoeDims,
+    rows: usize,
+) -> impl DeviceOp<Output = impl Send> + GraphNode + 'a {
     assert_eq!(out.partition_shape, vec![1, dims.hidden]);
-    assert_eq!(routed.shape(), &[dims.top_k as i32, dims.hidden as i32]);
-    kernels::combine_prefill_kernel(
+    assert_eq!(normed.partition_shape, vec![1, dims.hidden]);
+    assert_eq!(routed.shape(), &[rows as i32, dims.hidden as i32]);
+    assert_eq!(norm.residual.shape()[1], dims.hidden as i32);
+    kernels::combine_add_norm_kernel(
         out,
+        normed,
         routed,
-        &selection.inverse,
-        &selection.weights,
+        inverse,
+        weights,
+        norm.residual,
+        norm.gamma,
+        1.0 / dims.hidden as f32,
+        norm.eps,
         dims.top_k as i32,
     )
     .generics(dims.combine_generics())
+}
+
+pub fn combine_add_norm_view<'a>(
+    out: Partition<TensorViewMut<'a, f32>>,
+    normed: Partition<TensorViewMut<'a, f32>>,
+    routed: &'a TensorView<'a, f32>,
+    selection: &'a ExpertSelection,
+    norm: ResidualNorm<'a>,
+) -> impl DeviceOp<Output = impl Send> + GraphNode + 'a {
+    let dims = selection.dims;
+    combine_add_norm_launch(
+        out,
+        normed,
+        routed,
+        &selection.inverse,
+        &selection.weights,
+        norm,
+        dims,
+        dims.top_k,
+    )
+}
+
+pub fn combine_add_norm_prefill<'a>(
+    out: Partition<TensorViewMut<'a, f32>>,
+    normed: Partition<TensorViewMut<'a, f32>>,
+    routed: &'a TensorView<'a, f32>,
+    plan: &'a PrefillPlan,
+    norm: ResidualNorm<'a>,
+) -> impl DeviceOp<Output = impl Send> + GraphNode + 'a {
+    combine_add_norm_launch(
+        out,
+        normed,
+        routed,
+        &plan.inverse,
+        &plan.weights,
+        norm,
+        plan.dims,
+        plan.layout.padded_rows(),
+    )
 }
 
 #[cfg(test)]

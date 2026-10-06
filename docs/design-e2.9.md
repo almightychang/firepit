@@ -40,17 +40,15 @@ E1의 원칙은 그대로 둔다: 설계 D(가중치 op는 batch 전체에 한 �
 ## 4. layer별 op 목록 (B = batch, ● = 세션마다 launch)
 
 ```
-GDN layer
-  rms_norm(input_layernorm)            Residual → Normed            [B, H]
+GDN layer (첫 층만 rms_norm(input_layernorm) Residual → Normed; 이후 층은 앞 층 combine_add_norm이 Normed를 쓴다)
   gemv [qkv|z] / [b|a] (형식별 묶음)    Normed → Projection 묶음     [B, 12288] [B, 64] (bf16이면 [B, 12352] 하나)
 ● conv1d_silu  (conv state)            qkv 열 행 b → Conv 행 b      [1, 8192]
 ● gdn_step     (S)                     Conv·b·a 열 행 b → Mixer 행 b [32, 128]
   rms_norm 행 + silu gate (gated norm) Mixer, z 열 → Gated          [B, 32·128]
   gemv out_proj                        Gated → Delta                [B, H]
-  add                                  Residual + Delta → Residual'
+  add_norm(post_attention_layernorm)   Residual + Delta → Residual', Normed
 
-Attention layer
-  rms_norm(input_layernorm)            Residual → Normed
+Attention layer (input norm은 GDN과 같음)
   gemv [q_gate|k|v]                    Normed → Projection 묶음     [B, 9216]
   rms_norm head (q_norm, k_norm)       q_gate head의 q 절반, k 열   [B, 16·256] [B, 2·256]
   rope (행별 위치)                      q, k
@@ -58,23 +56,24 @@ Attention layer
 ● online_attention                     q 행 b + 세션 cache → Mixer 행 b   [16, 256]
   output_gate                          Mixer, gate 열 → Gated
   gemv o_proj                          Gated → Delta
-  add
+  add_norm(post_attention_layernorm)   Residual + Delta → Residual', Normed
 
 MoE (모든 layer, shared expert는 항상 선택되는 마지막 expert: design-e4 4.3)
-  rms_norm(post_attention_layernorm)   Residual → Normed
   gemv [router|shared_expert_gate]     Normed → Projection 묶음     [B, 272] (257행을 타일 16 배수로)
   top_k                                router·gate 열 → ExpertSelection   토큰별 8 + shared 1칸
   ◆ expert_gemv gate_up                Normed 행 b → ExpertUp       [9, 1024]   ◆ = 토큰마다
   ◆ swiglu                             ExpertUp → ExpertAct         [9, 512]
   ◆ expert_gemv down                   ExpertAct → ExpertOut        [9, H]
-  ◆ combine                            ExpertOut → Delta 행 b
-  add
+  ◆ combine_add_norm(다음 층 input_layernorm, 마지막 층은 final norm)
+                                       Residual' + combine(ExpertOut) → Residual'', Normed 행 b
 
 Final
-  rms_norm(final) → gemv lm_head → Logits [B, vocab]
+  gemv lm_head                         Normed → Logits [B, vocab]
 ```
 
 숫자는 Qwen3.6 값이고 모두 config에서 계산한다.
+
+residual add와 그 뒤 rms_norm은 한 커널이 두 출력(새 residual, normed)을 쓴다(design-e4 4.3의 5번). 합과 norm의 f32 연산 순서는 따로 실행하던 add·combine·rms_norm과 같아서 결과 비트가 같다. prefill도 같은 op를 행 T개에 쓴다.
 
 같은 입력을 받는 투영은 로드할 때 형식별로 행 방향으로 이어 붙인다(design-e4 4.3의 4번). 묶음 하나가 GEMV(prefill은 GEMM) 1회다. 단 padding한 묶음은 prefill에서 멤버별로 가중치 행 slice와 출력 열 slice view에 GEMM한다(design-e4 4.3의 4번). 출력 slot `Projection(i)`는 묶음 배치(layout)마다 하나다. 소비 op는 자기 열 범위를 slice view로 읽는다. q_gate는 head마다 [q|gate]가 번갈아 있으므로 q norm과 output gate는 `[행, head, 2·D]` view의 절반을 읽는다.
 

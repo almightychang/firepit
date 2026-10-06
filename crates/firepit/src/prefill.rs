@@ -3,12 +3,13 @@ use crate::checkpoint::Stream;
 #[cfg(feature = "testing")]
 use crate::engine::RoutingLayerTrace;
 use crate::execute::{
-    gdn_gate, heads, norm_read, output_gate, rms_norm, row_width, weight_gemv_tile,
+    add_norm, gdn_gate, heads, norm_read, norm_weight, output_gate, rms_norm, row_width,
+    weight_gemv_tile,
 };
 use crate::model::{MixerWeights, Model, Projection};
 use crate::plan::{NormName, Op, Slot, StepPlan, WeightName};
 use crate::session::{GdnStateLayout, LayerState, Session};
-use crate::store::{View, resolve, weight};
+use crate::store::{View, resolve, split_slots, weight};
 use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{IntoPartition, PartitionMut, Reshape, Tensor, TensorView};
@@ -22,42 +23,12 @@ use firepit_kernels::gemv::gemv;
 use firepit_kernels::moe::{PrefillLayout as MoePrefillLayout, PrefillPlan as MoePrefillPlan};
 use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::Weight;
-use firepit_kernels::{attention, elementwise, embedding, gdn, gdn_chunk, moe, rope, swiglu};
+use firepit_kernels::{attention, embedding, gdn, gdn_chunk, moe, rope, swiglu};
 use std::ops::Range;
 use std::sync::Arc;
 
 const CHUNK: usize = gdn_chunk::DEFAULT_CHUNK_SIZE;
 const BLOCK: usize = gdn_chunk::DEFAULT_BLOCK_SIZE;
-
-fn input_output(
-    buffers: &mut [Tensor<f32>],
-    input: Slot,
-    output: Slot,
-) -> (&Tensor<f32>, &mut Tensor<f32>) {
-    let i = input.index();
-    let o = output.index();
-    assert_ne!(i, o);
-    let (before, at) = buffers.split_at_mut(o);
-    let (out, after) = at.split_first_mut().unwrap();
-    (if i < o { &before[i] } else { &after[i - o - 1] }, out)
-}
-
-fn two_inputs_output(
-    buffers: &mut [Tensor<f32>],
-    a: Slot,
-    b: Slot,
-    output: Slot,
-) -> (&Tensor<f32>, &Tensor<f32>, &mut Tensor<f32>) {
-    let o = output.index();
-    let (before, at) = buffers.split_at_mut(o);
-    let (out, after) = at.split_first_mut().unwrap();
-    let get = |slot: Slot| {
-        let i = slot.index();
-        assert_ne!(i, o);
-        if i < o { &before[i] } else { &after[i - o - 1] }
-    };
-    (get(a), get(b), out)
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScoredRows {
@@ -119,7 +90,7 @@ pub enum PrefillSlot {
 }
 
 impl PrefillSlot {
-    fn shape(self, model: &Model, rows: usize, len: usize) -> Vec<usize> {
+    fn shape(self, model: &Model, rows: usize) -> Vec<usize> {
         let g = model.dims.gdn();
         let flat = rows / CHUNK * g.value_heads();
         match self {
@@ -135,7 +106,6 @@ impl PrefillSlot {
                     vec![1, slot.shape(model, 1)[1]]
                 }
                 Slot::Logits => vec![1, model.dims.vocab()],
-                Slot::MoeDelta => vec![len, model.dims.hidden()],
                 _ => slot.shape(model, rows),
             },
             Self::Query | Self::Key => vec![rows, g.key_heads(), g.key_head_dim()],
@@ -168,7 +138,6 @@ pub enum PrefillOp {
     Gather,
     ExpertGateUp { layer: usize },
     ExpertDown { layer: usize },
-    Combine,
 }
 
 impl PrefillOp {
@@ -193,7 +162,6 @@ impl PrefillOp {
             Self::HostSort => "moe_host_sort",
             Self::Gather => "moe_gather",
             Self::ExpertGateUp { .. } | Self::ExpertDown { .. } => "moe_grouped_gemm",
-            Self::Combine => "moe_combine",
         }
     }
 }
@@ -220,19 +188,19 @@ impl ChunkSlots {
             Ok(api::zeros::<f32>(shape).sync_on(stream)?)
         };
         Ok(Self {
-            q: zeros(&PrefillSlot::Query.shape(model, rows, rows))?,
-            k: zeros(&PrefillSlot::Key.shape(model, rows, rows))?,
-            v: zeros(&PrefillSlot::Value.shape(model, rows, rows))?,
-            gate: zeros(&PrefillSlot::Gate.shape(model, rows, rows))?,
-            beta: zeros(&PrefillSlot::Beta.shape(model, rows, rows))?,
-            ut: zeros(&PrefillSlot::Ut.shape(model, rows, rows))?,
-            intra: zeros(&PrefillSlot::Intra.shape(model, rows, rows))?,
-            cum: zeros(&PrefillSlot::Cum.shape(model, rows, rows))?,
-            diagonal: zeros(&PrefillSlot::Diagonal.shape(model, rows, rows))?,
-            inverse: zeros(&PrefillSlot::Inverse.shape(model, rows, rows))?,
-            next_inverse: zeros(&PrefillSlot::NextInverse.shape(model, rows, rows))?,
-            u: zeros(&PrefillSlot::U.shape(model, rows, rows))?,
-            w: zeros(&PrefillSlot::W.shape(model, rows, rows))?,
+            q: zeros(&PrefillSlot::Query.shape(model, rows))?,
+            k: zeros(&PrefillSlot::Key.shape(model, rows))?,
+            v: zeros(&PrefillSlot::Value.shape(model, rows))?,
+            gate: zeros(&PrefillSlot::Gate.shape(model, rows))?,
+            beta: zeros(&PrefillSlot::Beta.shape(model, rows))?,
+            ut: zeros(&PrefillSlot::Ut.shape(model, rows))?,
+            intra: zeros(&PrefillSlot::Intra.shape(model, rows))?,
+            cum: zeros(&PrefillSlot::Cum.shape(model, rows))?,
+            diagonal: zeros(&PrefillSlot::Diagonal.shape(model, rows))?,
+            inverse: zeros(&PrefillSlot::Inverse.shape(model, rows))?,
+            next_inverse: zeros(&PrefillSlot::NextInverse.shape(model, rows))?,
+            u: zeros(&PrefillSlot::U.shape(model, rows))?,
+            w: zeros(&PrefillSlot::W.shape(model, rows))?,
         })
     }
 }
@@ -306,13 +274,12 @@ impl PrefillPlan {
                 }
                 Op::ExpertGateUp { layer } => ops.push(PrefillOp::ExpertGateUp { layer }),
                 Op::ExpertDown { layer } => ops.push(PrefillOp::ExpertDown { layer }),
-                Op::Combine { .. } => ops.push(PrefillOp::Combine),
                 _ => ops.push(PrefillOp::Kernel(op)),
             }
         }
         let buffers = Slot::all(model)
             .map(|slot| {
-                let mut shape = PrefillSlot::Sequence(slot).shape(model, rows, len);
+                let mut shape = PrefillSlot::Sequence(slot).shape(model, rows);
                 if matches!(slot, Slot::ExpertUp | Slot::ExpertAct | Slot::ExpertOut) {
                     shape[0] = max_moe_rows;
                 }
@@ -485,12 +452,7 @@ pub(crate) fn run_observed(
         &mut firepit_kernels::sink::Eager(stream),
         row,
         |op, plan| {
-            if let PrefillOp::Kernel(Op::Add {
-                delta: Slot::MoeDelta,
-                out,
-                ..
-            }) = op
-            {
+            if let PrefillOp::Kernel(Op::CombineAddNorm { out, .. }) = op {
                 let values: Vec<f32> = plan.buffers[out.index()]
                     .dup()
                     .to_host_vec()
@@ -541,11 +503,7 @@ pub(crate) fn run_routing_observed(
                         .collect();
                     layers.push(trace);
                 }
-                PrefillOp::Kernel(Op::Add {
-                    delta: Slot::MoeDelta,
-                    out,
-                    ..
-                }) => {
+                PrefillOp::Kernel(Op::CombineAddNorm { out, .. }) => {
                     let values: Vec<f32> = plan.buffers[out.index()]
                         .dup()
                         .to_host_vec()
@@ -585,36 +543,34 @@ pub(crate) fn run_isolated_layer(
     if layer >= model.dims.layers().len() || input.len() != plan.len * width {
         return Err("invalid isolated layer input".into());
     }
-    let start = plan.ops.iter().position(|op| matches!(
-        op,
-        PrefillOp::Kernel(Op::Norm { layer: found, name: NormName::Input, .. }) if *found == layer
-    )).ok_or("isolated layer start missing")?;
+    let start = plan
+        .ops
+        .iter()
+        .position(|op| match op {
+            PrefillOp::Kernel(Op::Norm {
+                layer: 0,
+                name: NormName::Input,
+                ..
+            }) => layer == 0,
+            PrefillOp::Kernel(Op::CombineAddNorm { layer: found, .. }) => found + 1 == layer,
+            _ => false,
+        })
+        .ok_or("isolated layer start missing")?;
     let end = plan
         .ops
         .iter()
-        .enumerate()
-        .skip(start + 1)
-        .find(|(_, op)| {
-            matches!(
-                op,
-                PrefillOp::Kernel(Op::Norm {
-                    name: NormName::Input | NormName::Final,
-                    ..
-                })
-            )
+        .position(|op| {
+            matches!(op, PrefillOp::Kernel(Op::CombineAddNorm { layer: found, .. }) if *found == layer)
         })
-        .map(|(index, _)| index)
         .ok_or("isolated layer end missing")?;
-    if !matches!(
-        plan.ops[end - 1],
-        PrefillOp::Kernel(Op::Add {
-            delta: Slot::MoeDelta,
-            ..
-        })
-    ) {
-        return Err("isolated layer has no final residual".into());
-    }
-    plan.ops = plan.ops[start..end].to_vec();
+    let mut ops = vec![PrefillOp::Kernel(Op::Norm {
+        layer,
+        name: NormName::Input,
+        input: Slot::Residual0,
+        out: Slot::Normed,
+    })];
+    ops.extend_from_slice(&plan.ops[start + 1..=end]);
+    plan.ops = ops;
     let mut padded = input.to_vec();
     padded.resize(plan.rows * width, 0.0);
     plan.buffers[Slot::Residual0.index()] = api::copy_host_vec_to_device(&Arc::new(padded))
@@ -627,6 +583,7 @@ pub(crate) fn run_isolated_layer(
         selected: Vec::new(),
     };
     let last = plan.len - 1;
+    let mut mixed = Vec::new();
     let last_row = |slot: Slot, plan: &PrefillPlan| -> Result<Vec<f32>> {
         let values: Vec<f32> = plan.buffers[slot.index()]
             .dup()
@@ -649,17 +606,18 @@ pub(crate) fn run_isolated_layer(
                     trace.selected =
                         ids[last * width..last * width + model.dims.moe().top_k()].to_vec();
                 }
-                PrefillOp::Kernel(Op::Add {
-                    delta: Slot::Delta, ..
-                }) => {
-                    trace.mixer = last_row(Slot::Delta, plan)?;
+                PrefillOp::Kernel(Op::AddNorm { delta, out, .. }) => {
+                    trace.mixer = last_row(delta, plan)?;
+                    mixed = last_row(out, plan)?;
                 }
-                PrefillOp::Kernel(Op::Add {
-                    delta: Slot::MoeDelta,
-                    ..
-                }) => {
-                    trace.moe = last_row(Slot::MoeDelta, plan)?;
-                    trace.hidden = last_row(Slot::Residual0, plan)?;
+                PrefillOp::Kernel(Op::CombineAddNorm { out, .. }) => {
+                    trace.hidden = last_row(out, plan)?;
+                    trace.moe = trace
+                        .hidden
+                        .iter()
+                        .zip(&mixed)
+                        .map(|(h, m)| h - m)
+                        .collect();
                 }
                 _ => {}
             }
@@ -706,7 +664,7 @@ fn run_inner(
                     };
                     let read = norm_read(layer, name, input);
                     let columns = resolve(model, &plan.buffers, rows, read)?.columns;
-                    let (tensor, target) = input_output(&mut plan.buffers, input, out);
+                    let ([tensor], [target]) = split_slots(&mut plan.buffers, [input], [out])?;
                     let source = View { tensor, columns };
                     rms_norm(model, layer, name, &source, target, rows, selected, sink)?;
                 }
@@ -716,7 +674,7 @@ fn run_inner(
                     input,
                     out,
                 }) => {
-                    let (source, target) = input_output(&mut plan.buffers, input, out);
+                    let ([source], [target]) = split_slots(&mut plan.buffers, [input], [out])?;
                     let w = weight(model, layer, name);
                     let cols = row_width(source, rows);
                     let output_rows = w.rows();
@@ -751,8 +709,8 @@ fn run_inner(
                 }
                 PrefillOp::Kernel(Op::GdnGate { layer }) => {
                     let (z, columns) = Slot::projection(model, layer, Projection::GdnZ)?;
-                    let (source, gate, target) =
-                        two_inputs_output(&mut plan.buffers, Slot::MixerNorm, z, Slot::Gated);
+                    let ([source, gate], [target]) =
+                        split_slots(&mut plan.buffers, [Slot::MixerNorm, z], [Slot::Gated])?;
                     gdn_gate(model, source, gate, columns, target, rows, sink)?
                 }
                 PrefillOp::Kernel(Op::AttnRope { query }) => {
@@ -761,7 +719,7 @@ fn run_inner(
                     } else {
                         (Slot::KNorm, Slot::KRot, d.k_rope())
                     };
-                    let (source, target) = input_output(&mut plan.buffers, input, out);
+                    let ([source], [target]) = split_slots(&mut plan.buffers, [input], [out])?;
                     let x = source.view(&[rows * rdims.heads(), rdims.head_dim()])?;
                     sink.run(
                         rope::rope(
@@ -775,12 +733,11 @@ fn run_inner(
                 }
                 PrefillOp::Kernel(Op::OutputGate { layer }) => {
                     let (q_gate, columns) = Slot::projection(model, layer, Projection::AttnQGate)?;
-                    let (source, q_gate, target) = two_inputs_output(
+                    let ([source, q_gate], [target]) = split_slots(
                         &mut plan.buffers,
-                        Slot::AttnOut,
-                        q_gate,
-                        Slot::AttnGated,
-                    );
+                        [Slot::AttnOut, q_gate],
+                        [Slot::AttnGated],
+                    )?;
                     output_gate(model, source, q_gate, columns, target, rows, sink)?
                 }
                 PrefillOp::Kernel(Op::ExpertSwiglu) => {
@@ -790,8 +747,8 @@ fn run_inner(
                         .ok_or("missing MoE layout")?
                         .layout()
                         .padded_rows();
-                    let (source, target) =
-                        input_output(&mut plan.buffers, Slot::ExpertUp, Slot::ExpertAct);
+                    let ([source], [target]) =
+                        split_slots(&mut plan.buffers, [Slot::ExpertUp], [Slot::ExpertAct])?;
                     let x = source.slice(&[0..count, 0..2 * m.intermediate()])?;
                     let y = target.slice_mut(&[0..count, 0..m.intermediate()])?;
                     sink.run(
@@ -799,15 +756,54 @@ fn run_inner(
                             .generics(vec![m.intermediate().to_string()]),
                     )?;
                 }
-                PrefillOp::Kernel(Op::Add { input, delta, out }) => {
-                    let (x, y, target) = two_inputs_output(&mut plan.buffers, input, delta, out);
-                    let x = x.slice(&[0..len, 0..d.hidden()])?;
-                    let y = y.slice(&[0..len, 0..d.hidden()])?;
-                    let target = target.slice_mut(&[0..len, 0..d.hidden()])?;
-                    sink.run(
-                        elementwise::add(target.partition([1, d.hidden()]), &x, &y)
-                            .generics(vec![d.hidden().to_string()]),
+                PrefillOp::Kernel(Op::AddNorm {
+                    norm,
+                    input,
+                    delta,
+                    out,
+                    normed,
+                }) => {
+                    let ([x, y], [target, normed]) =
+                        split_slots(&mut plan.buffers, [input, delta], [out, normed])?;
+                    let tokens = [0..len, 0..d.hidden()];
+                    add_norm(
+                        model,
+                        norm,
+                        &x.slice(&tokens)?,
+                        &y.slice(&tokens)?,
+                        target.slice_mut(&tokens)?,
+                        normed.slice_mut(&tokens)?,
+                        sink,
                     )?;
+                }
+                PrefillOp::Kernel(Op::CombineAddNorm {
+                    norm,
+                    input,
+                    out,
+                    normed,
+                    ..
+                }) => {
+                    let layout = plan.moe.as_ref().ok_or("missing MoE layout")?;
+                    let ([routed, residual], [target, normed]) =
+                        split_slots(&mut plan.buffers, [Slot::ExpertOut, input], [out, normed])?;
+                    let tokens = [0..len, 0..d.hidden()];
+                    let routed =
+                        routed.slice(&[0..layout.layout().padded_rows(), 0..d.hidden()])?;
+                    let residual = residual.slice(&tokens)?;
+                    let target = target.slice_mut(&tokens)?;
+                    let normed = normed.slice_mut(&tokens)?;
+                    let (gamma, eps) = norm_weight(model, norm);
+                    sink.run(moe::combine_add_norm_prefill(
+                        target.partition([1, d.hidden()]),
+                        normed.partition([1, d.hidden()]),
+                        &routed,
+                        layout,
+                        moe::ResidualNorm {
+                            residual: &residual,
+                            gamma,
+                            eps,
+                        },
+                    ))?;
                 }
                 PrefillOp::Kernel(_) => unreachable!(),
                 _ => run_special(model, plan, session, sink, op, stream)?,
@@ -843,7 +839,7 @@ fn run_special(
             };
             let layout = GdnStateLayout::new(g);
             let (qkv, columns) = Slot::projection(model, layer, Projection::GdnQkv)?;
-            let (source, target) = input_output(&mut plan.buffers, qkv, Slot::Conv);
+            let ([source], [target]) = split_slots(&mut plan.buffers, [qkv], [Slot::Conv])?;
             let x = source.slice(&[0..len, columns])?;
             let y = target.slice_mut(&[0..len, 0..g.conv_dim()])?;
             let LayerState::Gdn { conv, .. } = &mut session.state[layer] else {
@@ -1068,7 +1064,8 @@ fn run_special(
             )?;
         }
         PrefillOp::CausalAttention { layer } => {
-            let (query, target) = input_output(&mut plan.buffers, Slot::QRot, Slot::AttnOut);
+            let ([query], [target]) =
+                split_slots(&mut plan.buffers, [Slot::QRot], [Slot::AttnOut])?;
             let q_shaped = query.view(&[rows, a.q_heads(), a.head_dim()])?;
             let q = q_shaped.slice(&[0..len, 0..a.q_heads(), 0..a.head_dim()])?;
             let y = target.slice_mut(&[0..len, 0..a.q_heads(), 0..a.head_dim()])?;
@@ -1182,8 +1179,8 @@ fn run_special(
         }
         PrefillOp::ExpertDown { layer } => {
             let layout = plan.moe.as_ref().ok_or("missing MoE layout")?;
-            let (source, target) =
-                input_output(&mut plan.buffers, Slot::ExpertAct, Slot::ExpertOut);
+            let ([source], [target]) =
+                split_slots(&mut plan.buffers, [Slot::ExpertAct], [Slot::ExpertOut])?;
             let count = layout.layout().padded_rows();
             let x = source.slice(&[0..count, 0..m.intermediate()])?;
             let y = target.slice_mut(&[0..count, 0..d.hidden()])?;
@@ -1218,16 +1215,6 @@ fn run_special(
                 .submit(sink)?,
                 Weight::Q8(_) => return Err("Q8 expert prefill is unsupported".into()),
             }
-        }
-        PrefillOp::Combine => {
-            let layout = plan.moe.as_ref().ok_or("missing MoE layout")?;
-            let (routed, target) = input_output(&mut plan.buffers, Slot::ExpertOut, Slot::MoeDelta);
-            let routed = routed.slice(&[0..layout.layout().padded_rows(), 0..d.hidden()])?;
-            sink.run(moe::combine_prefill_sliced(
-                target.partition([1, d.hidden()]),
-                &routed,
-                layout,
-            ))?;
         }
         PrefillOp::Kernel(_) => unreachable!(),
     }

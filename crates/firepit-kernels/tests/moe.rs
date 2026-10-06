@@ -5,7 +5,9 @@ use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::ToHostVecOp;
 use firepit_kernels::gemv::GemvTile;
 use firepit_kernels::gemv::expert_gemv;
-use firepit_kernels::moe::{ExpertSelection, MoeDims, combine};
+use firepit_kernels::moe::{
+    ExpertSelection, MoeDims, ResidualNorm, combine, combine_add_norm_view,
+};
 use firepit_kernels::weights::DenseMatrix;
 use std::sync::Arc;
 
@@ -147,7 +149,7 @@ fn combine_gpu_smoke() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 mod common;
-use common::{check, strategy};
+use common::{check, oracle, strategy};
 use proptest::prelude::*;
 
 fn deep_cases() -> bool {
@@ -398,4 +400,164 @@ fn combine_matches_f64_oracle() {
             Ok(())
         })
         .unwrap();
+}
+
+struct CombineNormCase {
+    h: usize,
+    routed: Vec<f32>,
+    selection: ExpertSelection,
+    residual: Vec<f32>,
+    gamma: Vec<f32>,
+    eps: f32,
+}
+
+type Rows = Vec<f32>;
+
+fn gpu_combine_add_norm(
+    stream: &Arc<cuda_core::Stream>,
+    case: &CombineNormCase,
+) -> Result<(Rows, Rows), Box<dyn std::error::Error>> {
+    let h = case.h;
+    let routed = api::copy_host_vec_to_device(&Arc::new(case.routed.clone()))
+        .reshape(&[case.routed.len() / h, h])
+        .sync_on(stream)?;
+    let residual = api::copy_host_vec_to_device(&Arc::new(case.residual.clone()))
+        .reshape(&[1, h])
+        .sync_on(stream)?;
+    let gamma = api::copy_host_vec_to_device(&Arc::new(case.gamma.clone())).sync_on(stream)?;
+    let mut out = api::zeros::<f32>(&[1, h]).sync_on(stream)?;
+    let mut normed = api::zeros::<f32>(&[1, h]).sync_on(stream)?;
+    let routed = routed.view(&[case.routed.len() / h, h])?;
+    let residual = residual.view(&[1, h])?;
+    combine_add_norm_view(
+        cutile::tensor::IntoPartition::partition(out.slice_mut(&[0..1, 0..h])?, [1, h]),
+        cutile::tensor::IntoPartition::partition(normed.slice_mut(&[0..1, 0..h])?, [1, h]),
+        &routed,
+        &case.selection,
+        ResidualNorm {
+            residual: &residual,
+            gamma: &gamma,
+            eps: case.eps,
+        },
+    )
+    .sync_on(stream)?;
+    Ok((
+        out.to_host_vec().sync_on(stream)?,
+        normed.to_host_vec().sync_on(stream)?,
+    ))
+}
+
+fn combine_norm_case(
+    stream: &Arc<cuda_core::Stream>,
+    (h, k): (usize, usize),
+    (routed, weights, residual, gamma): (Rows, Rows, Rows, Rows),
+) -> Result<(CombineNormCase, Rows), Box<dyn std::error::Error>> {
+    let scores: Rows = weights.iter().map(|&weight| weight.abs() + 1.0).collect();
+    let dims = MoeDims::new(h, 32, 32, k, k)?;
+    let ids: Vec<i32> = (0..k as i32).collect();
+    let selection = ExpertSelection::parse(&ids, &scores, &dims, stream)?;
+    Ok((
+        CombineNormCase {
+            h,
+            routed,
+            selection,
+            residual,
+            gamma,
+            eps: 1e-6,
+        },
+        scores,
+    ))
+}
+
+#[test]
+fn combine_add_norm_matches_f64_oracle() {
+    let stream = common::stream();
+    let cases =
+        (prop::sample::select(vec![32usize, 128, 2048]), 1usize..=8).prop_flat_map(|(h, k)| {
+            (
+                Just((h, k)),
+                strategy::values(h * k),
+                strategy::values(k),
+                strategy::values(h),
+                strategy::values(h),
+            )
+        });
+    common::runner(64, file!())
+        .run(&cases, |((h, k), routed, weights, residual, gamma)| {
+            let (case, scores) =
+                combine_norm_case(&stream, (h, k), (routed, weights, residual, gamma))
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let (out, normed) = gpu_combine_add_norm(&stream, &case)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let term =
+                |rank: usize, col: usize| scores[rank] as f64 * case.routed[rank * h + col] as f64;
+            let expected: Vec<f64> = (0..h)
+                .map(|col| {
+                    case.residual[col] as f64 + (0..k).map(|rank| term(rank, col)).sum::<f64>()
+                })
+                .collect();
+            let magnitude: Vec<f64> = (0..h)
+                .map(|col| {
+                    (case.residual[col] as f64).abs()
+                        + (0..k).map(|rank| term(rank, col).abs()).sum::<f64>()
+                })
+                .collect();
+            prop_assert!(check::inner_product_excess(&out, &expected, &magnitude, k + 2) <= 1.0);
+            let expected = oracle::rms_norm(&out, &case.gamma, case.eps);
+            prop_assert!(check::max_relative(&normed, &expected) < 2e-5);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn combine_add_norm_matches_combine_add_and_norm_bits() -> Result<(), Box<dyn std::error::Error>> {
+    use cutile::tile_kernel::TileKernel;
+    use firepit_kernels::elementwise::add;
+    use firepit_kernels::norm::rms_norm;
+    let stream = common::stream();
+    let (h, k) = (2048, 9);
+    let unit = |i: usize, a: usize, b: usize| ((i * a % b) as f32 - b as f32 / 2.0) / b as f32;
+    let (case, _) = combine_norm_case(
+        &stream,
+        (h, k),
+        (
+            (0..h * k).map(|i| unit(i, 13, 71)).collect(),
+            (0..k).map(|i| unit(i, 7, 11)).collect(),
+            (0..h).map(|i| unit(i, 29, 53)).collect(),
+            (0..h).map(|i| 0.5 + unit(i, 17, 19)).collect(),
+        ),
+    )?;
+    let (out, normed) = gpu_combine_add_norm(&stream, &case)?;
+
+    let routed = api::copy_host_vec_to_device(&Arc::new(case.routed.clone()))
+        .reshape(&[k, h])
+        .sync_on(&stream)?;
+    let residual = api::copy_host_vec_to_device(&Arc::new(case.residual.clone()))
+        .reshape(&[1, h])
+        .sync_on(&stream)?;
+    let gamma = api::copy_host_vec_to_device(&Arc::new(case.gamma.clone())).sync_on(&stream)?;
+    let mut delta = api::zeros::<f32>(&[1, h]).sync_on(&stream)?;
+    combine((&mut delta).partition([1, h]), &routed, &case.selection).sync_on(&stream)?;
+    let mut sum = api::zeros::<f32>(&[1, h]).sync_on(&stream)?;
+    add((&mut sum).partition([1, h]), &residual, &delta)
+        .generics(vec![h.to_string()])
+        .sync_on(&stream)?;
+    let mut separate = api::zeros::<f32>(&[1, h]).sync_on(&stream)?;
+    rms_norm(
+        (&mut separate).partition([1, h]),
+        &sum.view(&[1, 1, h])?,
+        &gamma,
+        1.0 / h as f32,
+        case.eps,
+    )
+    .generics(vec![h.to_string()])
+    .sync_on(&stream)?;
+    let bits = |values: &[f32]| values.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    assert_eq!(bits(&out), bits(&sum.to_host_vec().sync_on(&stream)?));
+    assert_eq!(
+        bits(&normed),
+        bits(&separate.to_host_vec().sync_on(&stream)?)
+    );
+    Ok(())
 }

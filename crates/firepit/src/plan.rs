@@ -25,13 +25,12 @@ pub enum Slot {
     ExpertUp,
     ExpertAct,
     ExpertOut,
-    MoeDelta,
     Logits,
     Projection(usize),
 }
 
 impl Slot {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 18] = [
         Self::Residual0,
         Self::Residual1,
         Self::Normed,
@@ -49,7 +48,6 @@ impl Slot {
         Self::ExpertUp,
         Self::ExpertAct,
         Self::ExpertOut,
-        Self::MoeDelta,
         Self::Logits,
     ];
 
@@ -101,9 +99,7 @@ impl Slot {
             return vec![batch * a.kv_heads(), a.head_dim()];
         }
         let width = match self {
-            Self::Residual0 | Self::Residual1 | Self::Normed | Self::Delta | Self::MoeDelta => {
-                d.hidden()
-            }
+            Self::Residual0 | Self::Residual1 | Self::Normed | Self::Delta => d.hidden(),
             Self::Conv => g.conv_dim(),
             Self::Mixer | Self::MixerNorm | Self::Gated => g.value_dim(),
             Self::KNorm | Self::KRot => a.kv_heads() * a.head_dim(),
@@ -133,6 +129,12 @@ pub enum NormName {
     Q,
     K,
     GdnGated,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct NormAt {
+    pub layer: usize,
+    pub name: NormName,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -194,13 +196,19 @@ pub enum Op {
     ExpertDown {
         layer: usize,
     },
-    Combine {
-        layer: usize,
-    },
-    Add {
+    AddNorm {
+        norm: NormAt,
         input: Slot,
         delta: Slot,
         out: Slot,
+        normed: Slot,
+    },
+    CombineAddNorm {
+        layer: usize,
+        norm: NormAt,
+        input: Slot,
+        out: Slot,
+        normed: Slot,
     },
 }
 
@@ -217,8 +225,8 @@ impl Op {
             }
             | Self::Embed { .. }
             | Self::AttnRope { .. }
-            | Self::ExpertSwiglu
-            | Self::Add { .. } => None,
+            | Self::ExpertSwiglu => None,
+            Self::AddNorm { norm, .. } => Some(norm.layer),
             Self::Norm { layer, .. }
             | Self::Gemv { layer, .. }
             | Self::GdnConv { layer }
@@ -230,7 +238,7 @@ impl Op {
             | Self::TopK { layer }
             | Self::ExpertGateUp { layer }
             | Self::ExpertDown { layer }
-            | Self::Combine { layer } => Some(layer),
+            | Self::CombineAddNorm { layer, .. } => Some(layer),
         }
     }
 
@@ -253,8 +261,8 @@ impl Op {
             Self::TopK { .. } => "moe_top_k",
             Self::ExpertGateUp { .. } | Self::ExpertDown { .. } => "moe_expert_gemv",
             Self::ExpertSwiglu => "swiglu",
-            Self::Combine { .. } => "moe_combine",
-            Self::Add { .. } => "add",
+            Self::AddNorm { .. } => "add_norm",
+            Self::CombineAddNorm { .. } => "moe_combine_add_norm",
         }
     }
 }
@@ -274,18 +282,24 @@ pub struct StepPlan {
 
 impl StepPlan {
     pub(crate) fn ops(model: &Model) -> Result<Vec<Op>> {
-        let mut ops = vec![Op::Embed {
-            out: Slot::Residual0,
-        }];
+        let layers = model.dims.layers().len();
+        if layers == 0 {
+            return Err("a step plan needs at least one layer".into());
+        }
+        let mut ops = vec![
+            Op::Embed {
+                out: Slot::Residual0,
+            },
+            Op::Norm {
+                layer: 0,
+                name: NormName::Input,
+                input: Slot::Residual0,
+                out: Slot::Normed,
+            },
+        ];
         let mut residual = Slot::Residual0;
         for (layer, kind) in model.dims.layers().iter().enumerate() {
             let weights = &model.layers[layer];
-            ops.push(Op::Norm {
-                layer,
-                name: NormName::Input,
-                input: residual,
-                out: Slot::Normed,
-            });
             for (group, projection) in weights.mixer.projections().iter().enumerate() {
                 ops.push(Op::Gemv {
                     layer,
@@ -343,16 +357,15 @@ impl StepPlan {
             } else {
                 Slot::Residual0
             };
-            ops.push(Op::Add {
+            ops.push(Op::AddNorm {
+                norm: NormAt {
+                    layer,
+                    name: NormName::Post,
+                },
                 input: residual,
                 delta: Slot::Delta,
                 out: next,
-            });
-            ops.push(Op::Norm {
-                layer,
-                name: NormName::Post,
-                input: next,
-                out: Slot::Normed,
+                normed: Slot::Normed,
             });
             for (group, projection) in weights.moe.projections.iter().enumerate() {
                 ops.push(Op::Gemv {
@@ -366,25 +379,31 @@ impl StepPlan {
             ops.push(Op::ExpertGateUp { layer });
             ops.push(Op::ExpertSwiglu);
             ops.push(Op::ExpertDown { layer });
-            ops.push(Op::Combine { layer });
             let after_moe = if next == Slot::Residual0 {
                 Slot::Residual1
             } else {
                 Slot::Residual0
             };
-            ops.push(Op::Add {
+            let norm = if layer + 1 < layers {
+                NormAt {
+                    layer: layer + 1,
+                    name: NormName::Input,
+                }
+            } else {
+                NormAt {
+                    layer,
+                    name: NormName::Final,
+                }
+            };
+            ops.push(Op::CombineAddNorm {
+                layer,
+                norm,
                 input: next,
-                delta: Slot::MoeDelta,
                 out: after_moe,
+                normed: Slot::Normed,
             });
             residual = after_moe;
         }
-        ops.push(Op::Norm {
-            layer: 0,
-            name: NormName::Final,
-            input: residual,
-            out: Slot::Normed,
-        });
         ops.push(Op::Gemv {
             layer: 0,
             name: WeightName::LmHead,

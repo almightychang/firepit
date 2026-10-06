@@ -6,7 +6,8 @@ use cuda_core::Stream;
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, ToHostVec};
 use cutile::tile_kernel::TileKernel;
-use firepit_kernels::norm::rms_norm;
+use firepit_kernels::elementwise::add;
+use firepit_kernels::norm::{add_norm, rms_norm};
 use proptest::prelude::*;
 use std::sync::Arc;
 
@@ -105,5 +106,114 @@ fn rms_norm_reads_interleaved_heads_of_wider_rows() -> Result<(), Box<dyn std::e
     .generics(vec![width.to_string()])
     .sync_on(&stream)?;
     assert_eq!(output.to_host_vec().sync_on(&stream)?, expected);
+    Ok(())
+}
+
+type Rows = Vec<f32>;
+
+fn upload(
+    stream: &Arc<Stream>,
+    values: &[f32],
+    width: usize,
+) -> Result<cutile::tensor::Tensor<f32>, Box<dyn std::error::Error>> {
+    Ok(api::copy_host_vec_to_device(&Arc::new(values.to_vec()))
+        .reshape(&[values.len() / width, width])
+        .sync_on(stream)?)
+}
+
+fn gpu_add_norm(
+    stream: &Arc<Stream>,
+    residual: &[f32],
+    delta: &[f32],
+    gamma: &[f32],
+    eps: f32,
+) -> Result<(Rows, Rows), Box<dyn std::error::Error>> {
+    let width = gamma.len();
+    let batch = residual.len() / width;
+    let (r, d) = (
+        upload(stream, residual, width)?,
+        upload(stream, delta, width)?,
+    );
+    let weight = api::copy_host_vec_to_device(&Arc::new(gamma.to_vec())).sync_on(stream)?;
+    let mut out = api::zeros::<f32>(&[batch, width]).sync_on(stream)?;
+    let mut normed = api::zeros::<f32>(&[batch, width]).sync_on(stream)?;
+    add_norm(
+        (&mut out).partition([1, width]),
+        (&mut normed).partition([1, width]),
+        &r,
+        &d,
+        &weight,
+        1.0 / width as f32,
+        eps,
+    )
+    .generics(vec![width.to_string()])
+    .sync_on(stream)?;
+    Ok((
+        out.to_host_vec().sync_on(stream)?,
+        normed.to_host_vec().sync_on(stream)?,
+    ))
+}
+
+fn gpu_add_then_norm(
+    stream: &Arc<Stream>,
+    residual: &[f32],
+    delta: &[f32],
+    gamma: &[f32],
+    eps: f32,
+) -> Result<(Rows, Rows), Box<dyn std::error::Error>> {
+    let width = gamma.len();
+    let batch = residual.len() / width;
+    let (r, d) = (
+        upload(stream, residual, width)?,
+        upload(stream, delta, width)?,
+    );
+    let mut sum = api::zeros::<f32>(&[batch, width]).sync_on(stream)?;
+    add((&mut sum).partition([1, width]), &r, &d)
+        .generics(vec![width.to_string()])
+        .sync_on(stream)?;
+    let sum: Rows = sum.to_host_vec().sync_on(stream)?;
+    let normed = gpu(stream, &sum, gamma, eps)?;
+    Ok((sum, normed))
+}
+
+fn add_norm_case() -> impl Strategy<Value = (strategy::NormCase, Rows)> {
+    strategy::norm_case().prop_flat_map(|case| {
+        let len = case.input.len();
+        (Just(case), strategy::values(len))
+    })
+}
+
+#[test]
+fn add_norm_matches_f64_oracle() {
+    let stream = common::stream();
+    common::runner(64, file!())
+        .run(&add_norm_case(), |(case, delta)| {
+            let (out, normed) = gpu_add_norm(&stream, &case.input, &delta, &case.gamma, case.eps)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let sum: Rows = case.input.iter().zip(&delta).map(|(r, d)| r + d).collect();
+            prop_assert_eq!(&out, &sum);
+            let expected = oracle::rms_norm(&sum, &case.gamma, case.eps);
+            prop_assert!(check::max_relative(&normed, &expected) < 2e-5);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn add_norm_matches_add_then_norm_bits() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let width = 2048;
+    let residual: Rows = (0..3 * width)
+        .map(|i| ((i * 13 % 71) as f32 - 35.0) / 8.0)
+        .collect();
+    let delta: Rows = (0..3 * width)
+        .map(|i| ((i * 29 % 53) as f32 - 26.0) / 16.0)
+        .collect();
+    let gamma: Rows = (0..width).map(|i| 0.5 + (i % 17) as f32 / 16.0).collect();
+    let bits = |values: &[f32]| values.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+    let (out, normed) = gpu_add_norm(&stream, &residual, &delta, &gamma, 1e-6)?;
+    let (sum, separate) = gpu_add_then_norm(&stream, &residual, &delta, &gamma, 1e-6)?;
+    assert_eq!(bits(&out), bits(&sum));
+    assert_eq!(bits(&normed), bits(&separate));
     Ok(())
 }

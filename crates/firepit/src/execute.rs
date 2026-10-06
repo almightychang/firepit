@@ -4,11 +4,11 @@ use crate::checkpoint::Stream;
 #[cfg(feature = "testing")]
 use crate::engine::RoutingLayerTrace;
 use crate::model::{MixerWeights, Model, Projection};
-use crate::plan::{GdnTiles, NormName, Op, Slot, WeightName};
+use crate::plan::{GdnTiles, NormAt, NormName, Op, Slot, WeightName};
 use crate::store::{Ctx, Parts, Read, View};
 #[cfg(feature = "testing")]
 use cuda_async::device_operation::DeviceOp;
-use cutile::tensor::{IntoPartition, PartitionMut, Tensor, TensorView};
+use cutile::tensor::{IntoPartition, PartitionMut, Tensor, TensorView, TensorViewMut};
 use cutile::tile_kernel::TileKernel;
 #[cfg(feature = "testing")]
 use cutile::tile_kernel::ToHostVecOp;
@@ -17,7 +17,7 @@ use firepit_kernels::gemv::{
 };
 use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::{Fp8Scaling, Q8_BLOCK, Weight};
-use firepit_kernels::{attention, elementwise, embedding, gdn, moe, norm, rope, swiglu};
+use firepit_kernels::{attention, embedding, gdn, moe, norm, rope, swiglu};
 use std::ops::Range;
 
 pub(crate) fn gemv_tile(rows: usize, cols: usize) -> GemvTile {
@@ -193,6 +193,37 @@ pub(crate) fn rms_norm(
     Ok(())
 }
 
+pub(crate) fn norm_weight(model: &Model, norm: NormAt) -> (&Tensor<f32>, f32) {
+    let input = NormInput::new(model, norm.layer, norm.name);
+    (input.gamma, input.eps)
+}
+
+pub(crate) fn add_norm(
+    model: &Model,
+    norm: NormAt,
+    residual: &TensorView<'_, f32>,
+    delta: &TensorView<'_, f32>,
+    out: TensorViewMut<'_, f32>,
+    normed: TensorViewMut<'_, f32>,
+    sink: &mut impl Sink,
+) -> Result<()> {
+    let input = NormInput::new(model, norm.layer, norm.name);
+    let width = input.width;
+    sink.run(
+        norm::add_norm(
+            out.partition([1, width]),
+            normed.partition([1, width]),
+            residual,
+            delta,
+            input.gamma,
+            1.0 / width as f32,
+            input.eps,
+        )
+        .generics(vec![width.to_string()]),
+    )?;
+    Ok(())
+}
+
 pub(crate) fn gdn_gate(
     model: &Model,
     source: &Tensor<f32>,
@@ -279,11 +310,7 @@ pub(crate) fn run_routing_observed(
                     trace.selected.push(ids[..top_k].to_vec());
                     layers.push(trace);
                 }
-                Op::Add {
-                    delta: Slot::MoeDelta,
-                    out,
-                    ..
-                } => {
+                Op::CombineAddNorm { out, .. } => {
                     let values: Vec<f32> = ctx
                         .peek(Read::Whole(out))?
                         .tensor
@@ -331,7 +358,7 @@ fn run_inner(
             } = ctx.parts();
             match op {
                 Op::Embed { out } => {
-                    let ([], target) = buffers.io([], out)?;
+                    let ([], [target]) = buffers.io([], [out])?;
                     sink.run(
                         embedding::embedding(
                             target.partition([1, d.hidden()]),
@@ -347,7 +374,8 @@ fn run_inner(
                     input,
                     out,
                 } => {
-                    let ([source], target) = buffers.io([norm_read(layer, name, input)], out)?;
+                    let ([source], [target]) =
+                        buffers.io([norm_read(layer, name, input)], [out])?;
                     rms_norm(model, layer, name, &source, target, batch, 0..batch, sink)?;
                 }
                 Op::Gemv {
@@ -356,7 +384,7 @@ fn run_inner(
                     input,
                     out,
                 } => {
-                    let ([source], target) = buffers.io([Read::Whole(input)], out)?;
+                    let ([source], [target]) = buffers.io([Read::Whole(input)], [out])?;
                     let cols = row_width(source.tensor, batch);
                     let rows = target.shape()[1] as usize;
                     let x = source.tensor.view(&[batch, cols / Q8_BLOCK, Q8_BLOCK])?;
@@ -376,7 +404,7 @@ fn run_inner(
                         layer,
                         member: Projection::GdnQkv,
                     };
-                    let ([qkv], target) = buffers.io([qkv], Slot::Conv)?;
+                    let ([qkv], [target]) = buffers.io([qkv], [Slot::Conv])?;
                     let source = ProjectionRows::new(&qkv)?;
                     let kernel_tile = g.conv_kernel().next_power_of_two();
                     for b in 0..sessions {
@@ -399,13 +427,13 @@ fn run_inner(
                         unreachable!()
                     };
                     let member = |member| Read::Member { layer, member };
-                    let ([conv, b_values, a_values], output) = buffers.io(
+                    let ([conv, b_values, a_values], [output]) = buffers.io(
                         [
                             Read::Whole(Slot::Conv),
                             member(Projection::GdnB),
                             member(Projection::GdnA),
                         ],
-                        Slot::Mixer,
+                        [Slot::Mixer],
                     )?;
                     let b_values = ProjectionRows::new(&b_values)?;
                     let a_values = ProjectionRows::new(&a_values)?;
@@ -450,8 +478,8 @@ fn run_inner(
                         layer,
                         member: Projection::GdnZ,
                     };
-                    let ([source, z], target) =
-                        buffers.io([Read::Whole(Slot::MixerNorm), z], Slot::Gated)?;
+                    let ([source, z], [target]) =
+                        buffers.io([Read::Whole(Slot::MixerNorm), z], [Slot::Gated])?;
                     gdn_gate(
                         model,
                         source.tensor,
@@ -468,7 +496,7 @@ fn run_inner(
                     } else {
                         (Slot::KNorm, Slot::KRot, d.k_rope())
                     };
-                    let ([source], target) = buffers.io([Read::Whole(input)], out)?;
+                    let ([source], [target]) = buffers.io([Read::Whole(input)], [out])?;
                     let x = source
                         .tensor
                         .view(&[batch * rdims.heads(), rdims.head_dim()])?;
@@ -510,7 +538,8 @@ fn run_inner(
                     }
                 }
                 Op::OnlineAttention { layer } => {
-                    let ([queries], out) = buffers.io([Read::Whole(Slot::QRot)], Slot::AttnOut)?;
+                    let ([queries], [out]) =
+                        buffers.io([Read::Whole(Slot::QRot)], [Slot::AttnOut])?;
                     for b in 0..sessions {
                         let q_row = queries
                             .tensor
@@ -539,8 +568,8 @@ fn run_inner(
                         layer,
                         member: Projection::AttnQGate,
                     };
-                    let ([source, q_gate], target) =
-                        buffers.io([Read::Whole(Slot::AttnOut), q_gate], Slot::AttnGated)?;
+                    let ([source, q_gate], [target]) =
+                        buffers.io([Read::Whole(Slot::AttnOut), q_gate], [Slot::AttnGated])?;
                     output_gate(
                         model,
                         source.tensor,
@@ -566,8 +595,8 @@ fn run_inner(
                     }
                 }
                 Op::ExpertGateUp { layer } => {
-                    let ([input], output) =
-                        buffers.io([Read::Whole(Slot::Normed)], Slot::ExpertUp)?;
+                    let ([input], [output]) =
+                        buffers.io([Read::Whole(Slot::Normed)], [Slot::ExpertUp])?;
                     let w = weights.matrix(layer, WeightName::ExpertGateUp);
                     let tile = weight_gemv_tile(w, 2 * m.intermediate(), d.hidden(), slots);
                     for b in 0..sessions {
@@ -588,8 +617,8 @@ fn run_inner(
                     }
                 }
                 Op::ExpertSwiglu => {
-                    let ([source], target) =
-                        buffers.io([Read::Whole(Slot::ExpertUp)], Slot::ExpertAct)?;
+                    let ([source], [target]) =
+                        buffers.io([Read::Whole(Slot::ExpertUp)], [Slot::ExpertAct])?;
                     for b in 0..sessions {
                         let x = source
                             .tensor
@@ -603,8 +632,8 @@ fn run_inner(
                     }
                 }
                 Op::ExpertDown { layer } => {
-                    let ([source], target) =
-                        buffers.io([Read::Whole(Slot::ExpertAct)], Slot::ExpertOut)?;
+                    let ([source], [target]) =
+                        buffers.io([Read::Whole(Slot::ExpertAct)], [Slot::ExpertOut])?;
                     let w = weights.matrix(layer, WeightName::ExpertDown);
                     let tile = weight_gemv_tile(w, d.hidden(), m.intermediate(), slots);
                     for b in 0..sessions {
@@ -625,28 +654,55 @@ fn run_inner(
                         .submit(sink)?;
                     }
                 }
-                Op::Combine { layer } => {
-                    let ([routed], out) =
-                        buffers.io([Read::Whole(Slot::ExpertOut)], Slot::MoeDelta)?;
+                Op::AddNorm {
+                    norm,
+                    input,
+                    delta,
+                    out,
+                    normed,
+                } => {
+                    let reads = [Read::Whole(input), Read::Whole(delta)];
+                    let ([residual, delta], [out, normed]) = buffers.io(reads, [out, normed])?;
+                    let rows = [0..batch, 0..d.hidden()];
+                    add_norm(
+                        model,
+                        norm,
+                        &residual.tensor.slice(&rows)?,
+                        &delta.tensor.slice(&rows)?,
+                        out.slice_mut(&rows)?,
+                        normed.slice_mut(&rows)?,
+                        sink,
+                    )?;
+                }
+                Op::CombineAddNorm {
+                    layer,
+                    norm,
+                    input,
+                    out,
+                    normed,
+                } => {
+                    let reads = [Read::Whole(Slot::ExpertOut), Read::Whole(input)];
+                    let ([routed, residual], [out, normed]) = buffers.io(reads, [out, normed])?;
+                    let (gamma, eps) = norm_weight(model, norm);
                     for b in 0..sessions {
                         let r = routed
                             .tensor
                             .slice(&[b * slots..(b + 1) * slots, 0..d.hidden()])?;
+                        let residual = residual.tensor.slice(&[b..b + 1, 0..d.hidden()])?;
                         let y = out.slice_mut(&[b..b + 1, 0..d.hidden()])?;
-                        sink.run(moe::combine_view(
+                        let n = normed.slice_mut(&[b..b + 1, 0..d.hidden()])?;
+                        sink.run(moe::combine_add_norm_view(
                             y.partition([1, d.hidden()]),
+                            n.partition([1, d.hidden()]),
                             &r,
                             selections.get(layer, b),
+                            moe::ResidualNorm {
+                                residual: &residual,
+                                gamma,
+                                eps,
+                            },
                         ))?;
                     }
-                }
-                Op::Add { input, delta, out } => {
-                    let ([a, b], target) =
-                        buffers.io([Read::Whole(input), Read::Whole(delta)], out)?;
-                    sink.run(
-                        elementwise::add(target.partition([1, d.hidden()]), a.tensor, b.tensor)
-                            .generics(vec![d.hidden().to_string()]),
-                    )?;
                 }
             }
             Ok(())

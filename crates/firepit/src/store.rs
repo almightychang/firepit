@@ -298,6 +298,50 @@ pub(crate) fn resolve<'b>(
     })
 }
 
+pub(crate) fn split_slots<'b, const N: usize, const M: usize>(
+    buffers: &'b mut [Tensor<f32>],
+    reads: [Slot; N],
+    writes: [Slot; M],
+) -> Result<([&'b Tensor<f32>; N], [&'b mut Tensor<f32>; M])> {
+    let mut order: Vec<usize> = writes.iter().map(|slot| slot.index()).collect();
+    order.sort_unstable();
+    if order.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(format!("{writes:?} writes a slot twice").into());
+    }
+    if let Some(slot) = reads.iter().find(|slot| order.contains(&slot.index())) {
+        return Err(format!("{slot:?} is both read and written").into());
+    }
+    let mut kept: Vec<(usize, &'b [Tensor<f32>])> = Vec::with_capacity(M + 1);
+    let mut targets: Vec<(usize, &'b mut Tensor<f32>)> = Vec::with_capacity(M);
+    let (mut rest, mut start) = (buffers, 0);
+    for index in order {
+        let (segment, tail) = rest.split_at_mut(index - start);
+        let (target, tail) = tail
+            .split_first_mut()
+            .ok_or("written slot is not allocated")?;
+        kept.push((start, segment));
+        targets.push((index, target));
+        (rest, start) = (tail, index + 1);
+    }
+    kept.push((start, rest));
+    let read = |slot: Slot| {
+        let index = slot.index();
+        kept.iter()
+            .find(|(start, segment)| (*start..*start + segment.len()).contains(&index))
+            .map(|(start, segment)| &segment[index - start])
+            .expect("read slot is allocated")
+    };
+    let reads = reads.map(read);
+    let writes = writes.map(|slot| {
+        let at = targets
+            .iter()
+            .position(|(index, _)| *index == slot.index())
+            .expect("each write was carved out");
+        targets.swap_remove(at).1
+    });
+    Ok((reads, writes))
+}
+
 pub(crate) struct Buffers<'c, 'm> {
     model: &'m Model,
     buffers: &'c mut Vec<Tensor<f32>>,
@@ -315,29 +359,26 @@ impl Buffers<'_, '_> {
         Ok(located.try_into().expect("one location per read"))
     }
 
-    pub(crate) fn io<const N: usize>(
+    pub(crate) fn io<const N: usize, const M: usize>(
         &mut self,
         reads: [Read; N],
-        write: Slot,
-    ) -> Result<([View<'_>; N], &mut Tensor<f32>)> {
+        writes: [Slot; M],
+    ) -> Result<([View<'_>; N], [&mut Tensor<f32>; M])> {
         let located = self.locate(reads)?;
-        self.recorder.write(Buffer::Slot(write));
-        let output = write.index();
-        if let Some((slot, _)) = located.iter().find(|(slot, _)| slot.index() == output) {
-            return Err(format!("{slot:?} is both read and written").into());
+        for write in writes {
+            self.recorder.write(Buffer::Slot(write));
         }
-        let (before, at) = self.buffers.split_at_mut(output);
-        let (target, after) = at.split_first_mut().expect("written slot exists");
-        let views = located.map(|(slot, columns)| {
-            let index = slot.index();
-            let tensor = if index < output {
-                &before[index]
-            } else {
-                &after[index - output - 1]
-            };
-            View { tensor, columns }
+        let (tensors, targets) = split_slots(
+            self.buffers,
+            located.each_ref().map(|(slot, _)| *slot),
+            writes,
+        )?;
+        let mut columns = located.into_iter().map(|(_, columns)| columns);
+        let views = tensors.map(|tensor| View {
+            tensor,
+            columns: columns.next().expect("one column range per read"),
         });
-        Ok((views, target))
+        Ok((views, targets))
     }
 
     pub(crate) fn read<const N: usize>(&self, reads: [Read; N]) -> Result<[View<'_>; N]> {
