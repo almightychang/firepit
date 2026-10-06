@@ -1,9 +1,9 @@
 <!--
 상태: 초안 (미게시)
 대상: https://github.com/NVlabs/cutile-rs/issues (불일치 보고 + 기능 요청)
-확인 버전: vendor/cutile-rs a620b40 (main 9fe5756 기반), GB10 (sm_121, driver 580.178.04, CUDA 13.3 toolkit)
+확인 버전: vendor/cutile-rs a620b40 (main 9fe5756 기반), GB10 (sm_121, driver 580.178.04, CUDA 13.3 toolkit, rustc 1.98.0)
 발견: firepit JIT 지연 작업. decode `cache_append`의 출력 slab을 `[MAX_SEQ, 1, D]`에서 `[-1, 1, D]`로 바꾼 커밋(e9cefef)이 driver-free Tile IR 테스트는 통과했지만 GB10 launch에서 모든 decode가 실패했다(`k_cache partition shape mismatch. Expected [-1, 1, 32], got [8, 1, 32]`). 되돌림 3e2c491
-재현: 014-dynamic-output-extent-probe.rs (GPU에서 실행 필요. 아직 이 예제로는 돌리지 않았다)
+재현: 014-dynamic-output-extent-probe.rs (GB10에서 실행, 출력은 본문 Reproduction)
 관련: NVlabs/cutile-rs#130 (닫힘, PR #131): 커널 안에서 동적 extent tensor에 `partition_mut`을 하는 경로의 JIT 오류를 고침
 -->
 
@@ -84,15 +84,15 @@ The program does three things:
 2. Launches `write_row_static` on an `[8, 32]` slab partitioned `[8, 32]`.
 3. Launches `write_row_dynamic` on the same slab and partition.
 
-Expected output, from what we saw with `cache_append`:
+Output on GB10 (sm_121, CUDA 13.3, rustc 1.98.0):
 
 ```text
-write_row_dynamic Tile IR: ok (...)
+write_row_dynamic Tile IR: ok (3113 bytes)
 write_row_static launch: ok, row 3 written: true
-write_row_dynamic launch: ERROR ... slab partition shape mismatch. Expected [-1, 32], got [8, 32]
+write_row_dynamic launch: ERROR kernel launch error: slab partition shape mismatch. Expected [-1, 32], got [8, 32]
 ```
 
-What we have actually observed is the same pattern on our real kernel, not on this program yet. A driver-free test compiled `cache_append` with a `[-1, 1, D]` slab for cache lengths 48 and 4096 and got identical Tile IR. On GB10 every launch of that kernel failed with the message in the Summary (attention, engine, and reference tests).
+The same kernel body compiles for the dynamic slab, launches and writes correctly with the static slab, and is refused at launch with the dynamic one. We first hit this on our real kernel: `cache_append` with a `[-1, 1, D]` slab compiled to identical Tile IR for cache lengths 48 and 4096, and every launch on GB10 failed with the message in the Summary.
 
 ## Where it seems to come from
 
