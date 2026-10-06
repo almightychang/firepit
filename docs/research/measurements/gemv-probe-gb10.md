@@ -103,3 +103,21 @@ probe 제품 경로(ms, 이전 커밋도 같은 pod에서 다시 잼):
 
 배제한 가설: pipeline 깊이(`load_pipelined`), 반복마다 끝내는 reduce, CTA 수·메모리 병렬도(8 CTA에서 이미 포화), 데이터 값, eager 대 graph, 지속 부하.
 이슈 초안: 010(graph 병렬 분기), 011(FP8 반복당 scale), 012(FP4 그룹 scale), 008(FP4 unpack 후 reduce).
+
+## 적용: FP8 행 scale(A)과 같은 입력 GEMV 이어 붙이기(B) (`fc8667a` → `cdee4a9`, GB10 같은 pod, 3회 교대)
+
+design-e4 4.3의 3·4번. 테스트: firepit --lib 전체(음성 대조 포함), engine, reference(ignored), nvfp4_prefix, fp8_prefix, kernels 전부 통과.
+
+| 항목 | 기준 | A+B | 변화 |
+|---|---:|---:|---:|
+| decode `qwen3.6:nvfp4` | 16.72 ms (59.8 tok/s) | **15.79 ms (63.3 tok/s)** | −0.93 ms (A −0.35, B −0.54) |
+| decode FP8 | 18.39 ms | 17.68 ms | −0.71 ms |
+| decode bf16 | 27.51 ms | 26.85 ms | −0.66 ms |
+| prefill 5000 (nvfp4) | 4053 ms | 4127 ms | +74 ms (+1.8%, 범위 겹침) |
+| 품질 prefill 72묶음 NVFP4 ΔNLL | 1.076e-2 | 1.093e-2 | CI ±2.2e-3 안 |
+| 품질 decode 8묶음 NVFP4 ΔNLL | 1.145e-2 | 1.133e-2 | CI ±5.8e-3 안 |
+
+- 처음 B는 router 묶음(padding 272행)을 prefill에서도 한 GEMM으로 돌려 GEMM 타일이 16으로 작아졌다(층당 3263 µs). padding한 묶음을 prefill에서 멤버별로 돌리게 고쳐(`714308f`) 층당 781 µs가 됐다.
+- 남은 prefill +62 ms(gemm)는 행 scale GEMM의 형상별 차이다. 루프 안에 작은 load 하나가 있느냐에 따라 tileiras가 pipeline·unroll을 다르게 골라 형상마다 ±15~25%다(out·o 2048×4096에서 +22~28%, 묶음 `[qkv|z]`에서는 더 빠름). firepit 쪽 원칙적 우회는 없고 이슈 후보로 기록했다. 같은 측정이 프로세스 사이 최대 14% 흔들려 형상별 수치는 방향만 신뢰한다.
+- 출력 80토큰 이상이면 decode 이득이 prefill 손실보다 크다.
+- 음성 대조 `reset_rope_position_breaks_append`는 `41bf08d`(shared expert 통합)부터 무작위 소형 모델의 top-5 우연으로 실패하고 있었다. 판정을 정상 비교와 같은 허용 오차 함수로 바꿨다(`cdee4a9`).
