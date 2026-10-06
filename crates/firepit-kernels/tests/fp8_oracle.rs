@@ -42,6 +42,16 @@ fn gpu(
     cols: usize,
 ) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
     let matrix = HostFp8Matrix::from_parts(bits, scales, rows, cols, 128, 128)?.upload(stream)?;
+    dense_gpu(stream, &matrix, input, rows, cols)
+}
+
+fn dense_gpu(
+    stream: &Arc<Stream>,
+    matrix: &Fp8Matrix,
+    input: &[f32],
+    rows: usize,
+    cols: usize,
+) -> Result<(Vec<f32>, Vec<f32>), Box<dyn std::error::Error>> {
     let x = api::copy_host_vec_to_device(&Arc::new(input.to_vec()))
         .reshape(&[1, cols / 32, 32])
         .sync_on(stream)?;
@@ -61,7 +71,7 @@ fn gpu(
         .sync_on(stream)?;
     let mut y = api::zeros::<f32>(&[64, rows]).sync_on(stream)?;
     fp8_gemm(
-        &matrix,
+        matrix,
         &x.view(&[64, cols])?,
         (&mut y).partition([DEFAULT_GEMM_TILE.m, DEFAULT_GEMM_TILE.n]),
         DEFAULT_GEMM_TILE,
@@ -356,4 +366,111 @@ fn fp8_extreme_finite_values_match_f64_oracle() {
             })
             .unwrap();
     }
+}
+
+#[test]
+fn fp8_row_scales_match_f64_oracle() {
+    let stream = common::stream();
+    const VALUES: [(u8, f32); 6] = [
+        (0xb8, -1.0),
+        (0x38, 1.0),
+        (0x30, 0.5),
+        (0x7e, 448.0),
+        (0x39, 1.125),
+        (0x01, 0.001953125),
+    ];
+    const SCALES: [f32; 4] = [0.8125, 1.203125, 2.25, 9.1e-4];
+    common::runner(16, file!())
+        .run(&(0usize..2, any::<u64>()), |(k_blocks, seed)| {
+            let fail = |e: Box<dyn std::error::Error>| TestCaseError::fail(e.to_string());
+            let (rows, cols, seed) = (256usize, (k_blocks + 1) * 128, seed as usize);
+            let codes: Vec<usize> = (0..rows * cols)
+                .map(|i| (i.wrapping_mul(17) ^ seed) % VALUES.len())
+                .collect();
+            let scales: Vec<f32> = (0..rows)
+                .map(|row| SCALES[(row.wrapping_mul(5) ^ seed) % SCALES.len()])
+                .collect();
+            let weights: Vec<f32> = codes
+                .iter()
+                .enumerate()
+                .map(|(i, &code)| VALUES[code].1 * scales[i / cols])
+                .collect();
+            let input: Vec<f32> = (0..cols)
+                .map(|i| ((i.wrapping_mul(13) ^ seed) % 41) as f32 / 37.0 - 0.5)
+                .collect();
+            let matrix = HostFp8Matrix::with_row_scales(
+                codes.iter().map(|&code| f8e4m3fn(VALUES[code].0)).collect(),
+                scales,
+                rows,
+                cols,
+            )
+            .map_err(|e| TestCaseError::fail(e.to_string()))?
+            .upload(&stream)
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let expected = oracle::dense(&weights, &input, rows, cols);
+            let magnitude = oracle::dense_magnitude(&weights, &input, rows, cols);
+
+            let (gemv, gemm) = dense_gpu(&stream, &matrix, &input, rows, cols).map_err(fail)?;
+            prop_assert!(
+                check::inner_product_excess(&gemv, &expected, &magnitude, cols + 1) <= 1.0
+            );
+            for ((&actual, &value), &sum) in gemm.iter().zip(&expected).zip(&magnitude) {
+                prop_assert!(gemm_within_bound(actual, value, sum, cols));
+            }
+
+            let dims = MoeDims::new(cols, 128, 128, 2, 1).map_err(|e| fail(e.into()))?;
+            let selected = seed % 2;
+            let selection =
+                ExpertSelection::parse(&[selected as i32], &[1.0], &dims, &stream).map_err(fail)?;
+            let x = api::copy_host_vec_to_device(&Arc::new(input.clone()))
+                .reshape(&[1, cols / 32, 32])
+                .sync_on(&stream)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let mut y = api::zeros::<f32>(&[1, 128])
+                .sync_on(&stream)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            expert_gemv_weight_view(
+                &Weight::Fp8(matrix.clone()),
+                &x.view(&[1, cols / 32, 32])
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?,
+                &selection,
+                y.slice_mut(&[0..1, 0..128])
+                    .map_err(|e| TestCaseError::fail(e.to_string()))?
+                    .partition([1, DEFAULT_GEMV_TILE.rows]),
+                128,
+                0,
+                DEFAULT_GEMV_TILE,
+            )
+            .submit(&mut Eager(&stream))
+            .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let actual: Vec<f32> = y
+                .to_host_vec()
+                .sync_on(&stream)
+                .map_err(|e| TestCaseError::fail(e.to_string()))?;
+            let rows = selected * 128..(selected + 1) * 128;
+            prop_assert!(
+                check::inner_product_excess(
+                    &actual,
+                    &expected[rows.clone()],
+                    &magnitude[rows],
+                    cols + 1
+                ) <= 1.0
+            );
+
+            let grouped = grouped_gpu(&stream, &matrix, &input, &dims, 128).map_err(fail)?;
+            for (index, row) in grouped.chunks_exact(128).enumerate() {
+                let expert = index / DEFAULT_GROUPED_GEMM_TILE.m;
+                for output in 0..128 {
+                    let index = expert * 128 + output;
+                    prop_assert!(gemm_within_bound(
+                        row[output],
+                        expected[index],
+                        magnitude[index],
+                        cols,
+                    ));
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
 }

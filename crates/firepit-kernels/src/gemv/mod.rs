@@ -53,7 +53,7 @@ pub fn fp8_tile(
     tile
 }
 
-pub fn nvfp4_tile(rows: usize, cols: usize, groups: usize) -> GemvTile {
+pub fn row_scaled_tile(rows: usize, cols: usize, groups: usize) -> GemvTile {
     fp8_tile(rows, cols, rows, cols, groups)
 }
 

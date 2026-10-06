@@ -4,7 +4,7 @@ use cuda_core::{Device, Stream, f4e2m1fnx2, f8e4m3fn};
 use cutile::api::{self, DeviceOpReshape};
 use cutile::tensor::{PartitionMut, Tensor};
 use cutile::tile_kernel::TileKernel;
-use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile, fp8_tile, gemv, nvfp4_tile};
+use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, GemvTile, fp8_tile, gemv, row_scaled_tile};
 use firepit_kernels::sink::Eager;
 use firepit_kernels::weights::{DenseMatrix, HostFp8Matrix, HostNvfp4Matrix, Weight};
 use half::bf16;
@@ -219,7 +219,7 @@ fn sweep(probe: &mut Probe, rows: usize, cols: usize) -> Result<()> {
     let stream = probe.stream.clone();
     let fp8 = fp8_tile(rows, cols, SCALE_BLOCK, SCALE_BLOCK, 1);
     let bf = dense_tile(rows, cols);
-    let nv = nvfp4_tile(rows, cols, 1);
+    let nv = row_scaled_tile(rows, cols, 1);
     let shape = format!("N={rows} K={cols}");
     probe.repeat(
         &format!("sweep fp8 {shape} BN={} KT={}", fp8.rows, fp8.blocks * 32),

@@ -5,7 +5,7 @@ mod q8;
 mod q8_format;
 
 pub use dense::DenseMatrix;
-pub use fp8::{Fp8Matrix, HostFp8Matrix};
+pub use fp8::{Fp8Matrix, Fp8Scaling, HostFp8Matrix};
 use half::bf16;
 pub use nvfp4::{HostNvfp4Matrix, NVFP4_GROUP, Nvfp4Matrix};
 pub use q8::Q8Matrix;

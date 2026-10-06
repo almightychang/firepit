@@ -375,11 +375,9 @@ impl HostWeight {
                     return Err(shape_error().into());
                 }
                 let scale = checkpoint.scalar_f32(&companion(".weight_scale"))?;
-                Ok(Self::Fp8(HostFp8Matrix::from_parts(
+                Ok(Self::Fp8(HostFp8Matrix::with_row_scales(
                     data.data,
-                    vec![scale],
-                    rows,
-                    cols,
+                    vec![scale; rows],
                     rows,
                     cols,
                 )?))
