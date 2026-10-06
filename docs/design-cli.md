@@ -36,6 +36,32 @@ clap derive. 인자는 파싱 단계에서 타입(`ModelRef { model: ModelId, mo
 
 저장소: `$FIREPIT_HOME/models/<model>/<mode>/`, 기본 `~/.cache/firepit`. 받는 중에는 임시 디렉터리에 쓰고 끝나면 원자적으로 이동한다. 이미 있으면 manifest를 대조하고 건너뛴다. 중단된 받기는 이어서 받는다.
 
+## JIT 캐시 (2026-10-07)
+
+`firepit run` 첫 실행은 커널 JIT 때문에 첫 토큰까지 GB10에서 약 25 s가 걸렸다(`research/measurements/nvfp4-gb10.md`).
+
+cuTile JIT는 세 단계다. stage1은 Rust 커널을 Tile IR bytecode로 만들고, stage2는 `tileiras`로 cubin을 만들고, stage3는 모듈을 로드한다. 프로세스 안의 메모리 캐시는 실행이 끝나면 사라진다. 디스크 캐시는 기본으로 꺼져 있다.
+
+- **디스크 캐시를 켠다.** `run`은 `$FIREPIT_HOME/jit`에 cuTile 디스크 캐시를 설치한다.
+  - 디스크 캐시는 stage2의 cubin을 저장한다. 키는 bytecode SHA-256, 대상 아키텍처, opt·flags, `tileiras` 지문이다. 소스·generics·툴체인이 바뀌면 자연히 miss다.
+  - 드라이버가 캐시된 cubin을 거부하면 cuTile이 지우고 다시 컴파일한다.
+  - 두 번째 실행부터 stage2가 빠지고 stage1·stage3는 프로세스마다 남는다.
+- **캐시 디렉터리는 비공개여야 한다.** 캐시 hit는 저장된 바이트를 장치 코드로 실행한다. 그래서 디렉터리를 0700으로 만든다.
+  - 이미 있는 디렉터리가 group·others에 열려 있으면 거부한다.
+  - 0700 재설정은 소유자만 성공하므로 소유자 검사를 겸한다.
+  - cuTile이 기본 위치(`~/.cache/cutile/kernels`)에 적용하는 정책과 같다. 위치를 `$FIREPIT_HOME` 아래에 둔 것은 두 가지 때문이다. 모델과 함께 지우고 옮길 수 있다. probe 예제들이 쓰는 기본 위치의 2 GiB 한도를 나눠 쓰지 않는다.
+- **KV cache 길이를 올림한다.** decode `cache_append`는 cache 길이를 컴파일 상수(`MAX_SEQ`)로 받지 않고 런타임 extent로 받는다.
+  - `run`은 `max_seq`(입력 길이 + 생성 길이)를 cuTile이 특수화하는 shape 나눔의 최댓값(`DivHint::default().max`)의 배수로 올린다.
+  - 그래서 프롬프트 길이가 달라도 attention 커널을 다시 컴파일하지 않는다.
+  - 메모리 증가는 최대 15 위치분이다.
+- **사후 보고.** `run` 끝에 "컴파일한 커널 수, 그중 `tileiras`가 만든 수, 디스크 캐시에서 온 수"를 한 줄로 쓴다(cuTile 공개 카운터).
+  - 진행 중 표시를 위한 hook은 없다.
+  - JIT 누적 시간을 주는 공개 카운터도 없다. 단계별 시간은 `CUTILE_JIT_TIMING=1`로 본다.
+- **pull 시점 미리 컴파일은 보류한다.**
+  - cuTile의 compile-only 경로(`api::meta` + launcher의 `.compile()`)는 launcher마다 따로 생성된 메서드라, firepit의 `Sink::run` 경로로 부를 수 없다. runner와 같은 key(generics, view·slice의 특수화)를 재현하는 별도 코드가 필요하다.
+  - 아니면 pull에서 모델을 올려 실제로 한 번 돌려야 한다. 그러면 GPU가 필요 없는 pull이 GPU를 요구하게 된다.
+  - 디스크 캐시로 두 번째 실행부터 같은 효과를 얻는다.
+
 ## 범위 밖
 
 serve(E5), 사용자 정의 조합(개발용 실험은 기존 `--override`), 인증이 필요한 repo.
