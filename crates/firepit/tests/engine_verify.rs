@@ -25,6 +25,17 @@ fn reference_path() -> PathBuf {
         })
 }
 
+fn open_reference(path: &Path) -> TestResult<SafetensorsFile> {
+    SafetensorsFile::open(path).map_err(|error| {
+        format!(
+            "engine reference {}: {error}; generate it with tools/reference/trace_qwen36.py \
+             --engine (docs/testing.md 3.7) or point FIREPIT_VERIFY_REF at it",
+            path.display()
+        )
+        .into()
+    })
+}
+
 fn layers() -> TestResult<Option<usize>> {
     Ok(std::env::var("FIREPIT_VERIFY_LAYERS")
         .ok()
@@ -41,7 +52,7 @@ fn tokens() -> TestResult<Vec<u32>> {
     } else {
         path
     };
-    let reference = SafetensorsFile::open(path)?;
+    let reference = open_reference(&path)?;
     let values: Vec<u32> = serde_json::from_str(
         reference
             .metadata("tokens")
@@ -311,7 +322,7 @@ fn routing_flip_append_vs_whole() -> TestResult<()> {
 #[test]
 #[ignore = "requires Qwen3.6 checkpoint and full-layer engine reference"]
 fn hf_prefill() -> TestResult<()> {
-    let reference = SafetensorsFile::open(reference_path())?;
+    let reference = open_reference(&reference_path())?;
     assert_eq!(reference.metadata("mode"), Some("engine"));
     let (model, device, tokens) = setup()?;
     assert_eq!(
@@ -376,7 +387,7 @@ fn append_vs_whole() -> TestResult<()> {
 #[test]
 #[ignore = "requires Qwen3.6 checkpoint and a --tokens-json engine reference"]
 fn hf_locate_divergence() -> TestResult<()> {
-    let reference = SafetensorsFile::open(reference_path())?;
+    let reference = open_reference(&reference_path())?;
     let tokens: Vec<u32> = serde_json::from_str(
         reference
             .metadata("tokens")
@@ -422,7 +433,7 @@ fn hf_locate_divergence() -> TestResult<()> {
 #[test]
 #[ignore = "requires Qwen3.6 checkpoint and --isolate-layers engine reference"]
 fn hf_isolated_layers() -> TestResult<()> {
-    let reference = SafetensorsFile::open(reference_path())?;
+    let reference = open_reference(&reference_path())?;
     let tokens: Vec<u32> = serde_json::from_str(
         reference
             .metadata("tokens")
