@@ -4,13 +4,16 @@ use common::{check, oracle, strategy};
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Stream;
 use cutile::api::{self, DeviceOpReshape};
-use cutile::tensor::{PartitionMut, ToHostVec};
-use firepit_kernels::gemm::{DEFAULT_GEMM_TILE, GemmTile, gemm};
+use cutile::tensor::{IntoPartition, PartitionMut, ToHostVec};
+use firepit_kernels::gemm::{
+    DEFAULT_GEMM_TILE, GemmTile, fp8_gemm_view, gemm, gemm_view, nvfp4_gemm_view,
+};
 use firepit_kernels::gemv::{DEFAULT_GEMV_TILE, gemv};
 use firepit_kernels::sink::Eager;
-use firepit_kernels::weights::{DenseMatrix, Weight};
+use firepit_kernels::weights::{DenseMatrix, HostFp8Matrix, HostNvfp4Matrix, NVFP4_GROUP, Weight};
 use half::bf16;
 use proptest::prelude::*;
+use std::ops::Range;
 use std::sync::Arc;
 
 const BF16_SPLIT_ERROR: f64 = (1.0 / 256.0) * (1.0 / 256.0);
@@ -180,6 +183,103 @@ fn configurable_tile_matches_default() -> Result<(), Box<dyn std::error::Error>>
     )?;
     for (&a, &b) in default.iter().zip(&other) {
         assert!((a - b).abs() <= 2e-4);
+    }
+    Ok(())
+}
+
+fn member_tile(rows: usize, cols: usize) -> GemmTile {
+    let mut tile = DEFAULT_GEMM_TILE;
+    while rows % tile.n != 0 {
+        tile.n /= 2;
+    }
+    while cols % tile.k != 0 {
+        tile.k /= 2;
+    }
+    tile
+}
+
+#[test]
+fn member_row_views_match_the_stacked_gemm() -> Result<(), Box<dyn std::error::Error>> {
+    let stream = common::stream();
+    let (m, cols, stacked) = (64, 128, 272);
+    let members = [0..256, 256..257];
+    let byte = |i: usize| ((i * 37 + 11) % 251) as u8;
+    let data: Vec<f32> = (0..m * cols)
+        .map(|i| (byte(i) as f32 - 125.0) / 64.0)
+        .collect();
+    let x = api::copy_host_vec_to_device(&Arc::new(data))
+        .reshape(&[m, cols])
+        .sync_on(&stream)?;
+    let x = x.view(&[m, cols])?;
+    let weights = [
+        Weight::Dense(DenseMatrix::upload(
+            (0..stacked * cols)
+                .map(|i| bf16::from_f32((byte(i) as f32 - 125.0) / 512.0))
+                .collect(),
+            stacked,
+            cols,
+            &stream,
+        )?),
+        Weight::Fp8(
+            HostFp8Matrix::with_row_scales(
+                (0..stacked * cols)
+                    .map(|i| cuda_core::f8e4m3fn(byte(i) & 0xbf))
+                    .collect(),
+                (0..stacked)
+                    .map(|row| 0.25 + (row % 7) as f32 / 16.0)
+                    .collect(),
+                stacked,
+                cols,
+            )?
+            .upload(&stream)?,
+        ),
+        Weight::Nvfp4(
+            HostNvfp4Matrix::from_parts(
+                (0..stacked * cols / 2)
+                    .map(|i| cuda_core::f4e2m1fnx2::from_bits(byte(i)))
+                    .collect(),
+                (0..stacked * cols / NVFP4_GROUP)
+                    .map(|i| cuda_core::f8e4m3fn(0x30 + byte(i) % 16))
+                    .collect(),
+                0.5,
+                stacked,
+                cols,
+            )?
+            .upload(&stream)?,
+        ),
+    ];
+    let launch = |weight: &Weight,
+                  y: &mut cutile::tensor::Tensor<f32>,
+                  rows: Range<usize>|
+     -> Result<(), Box<dyn std::error::Error>> {
+        let tile = member_tile(rows.len(), cols);
+        let out = y
+            .slice_mut(&[0..m, rows.clone()])?
+            .partition([tile.m, tile.n]);
+        match weight {
+            Weight::Dense(w) => gemm_view(w, rows, &x, out, tile).submit(&mut Eager(&stream))?,
+            Weight::Fp8(w) => fp8_gemm_view(w, rows, &x, out, tile).submit(&mut Eager(&stream))?,
+            Weight::Nvfp4(w) => {
+                nvfp4_gemm_view(w, rows, &x, out, tile).submit(&mut Eager(&stream))?
+            }
+            Weight::Q8(_) => unreachable!(),
+        }
+        Ok(())
+    };
+    for weight in &weights {
+        let mut whole = api::zeros::<f32>(&[m, stacked]).sync_on(&stream)?;
+        launch(weight, &mut whole, 0..stacked)?;
+        let mut sliced = api::zeros::<f32>(&[m, stacked]).sync_on(&stream)?;
+        for rows in &members {
+            launch(weight, &mut sliced, rows.clone())?;
+        }
+        let whole: Vec<f32> = whole.to_host_vec().sync_on(&stream)?;
+        let sliced: Vec<f32> = sliced.to_host_vec().sync_on(&stream)?;
+        for row in 0..m {
+            let used = row * stacked..row * stacked + members[1].end;
+            let bits = |values: &[f32]| values.iter().map(|v| v.to_bits()).collect::<Vec<_>>();
+            assert_eq!(bits(&sliced[used.clone()]), bits(&whole[used]));
+        }
     }
     Ok(())
 }

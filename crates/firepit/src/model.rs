@@ -61,6 +61,14 @@ impl ProjectionLayout {
             .map(|(_, columns)| columns.clone())
     }
 
+    pub fn gemm_rows(&self) -> Vec<Range<usize>> {
+        let members = self.members.iter().map(|(_, rows)| rows.clone());
+        match self.members.last() {
+            Some((_, last)) if last.end < self.rows => members.collect(),
+            _ => vec![0..self.rows],
+        }
+    }
+
     pub fn heads(&self, member: Projection, pitch: usize) -> Result<Range<usize>> {
         let columns = self
             .columns(member)
@@ -1042,6 +1050,8 @@ mod tests {
             rows: 12,
         };
         assert!(shifted.heads(Projection::AttnK, 4).is_err());
+        assert_eq!(layout.gemm_rows(), [0..32]);
+        assert_eq!(padded.gemm_rows(), [0..16, 16..24, 24..32]);
         Ok(())
     }
 

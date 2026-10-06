@@ -76,7 +76,7 @@ Final
 
 숫자는 Qwen3.6 값이고 모두 config에서 계산한다.
 
-같은 입력을 받는 투영은 로드할 때 형식별로 행 방향으로 이어 붙인다(design-e4 4.3의 4번). 묶음 하나가 GEMV(prefill은 GEMM) 1회이고, 출력 slot `Projection(i)`는 묶음 배치(layout)마다 하나다. 소비 op는 자기 열 범위를 slice view로 읽는다. q_gate는 head마다 [q|gate]가 번갈아 있으므로 q norm과 output gate는 `[행, head, 2·D]` view의 절반을 읽는다.
+같은 입력을 받는 투영은 로드할 때 형식별로 행 방향으로 이어 붙인다(design-e4 4.3의 4번). 묶음 하나가 GEMV(prefill은 GEMM) 1회다. 단 padding한 묶음은 prefill에서 멤버별로 가중치 행 slice와 출력 열 slice view에 GEMM한다(design-e4 4.3의 4번). 출력 slot `Projection(i)`는 묶음 배치(layout)마다 하나다. 소비 op는 자기 열 범위를 slice view로 읽는다. q_gate는 head마다 [q|gate]가 번갈아 있으므로 q norm과 output gate는 `[행, head, 2·D]` view의 절반을 읽는다.
 
 ## 5. 세션 state
 

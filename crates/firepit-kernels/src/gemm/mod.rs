@@ -3,9 +3,13 @@ use crate::sink::Sink;
 use crate::weights::{DenseMatrix, Fp8Matrix, Fp8Scaling};
 use cutile::tensor::{Partition, Tensor, TensorView, TensorViewMut};
 use half::bf16;
+use std::ops::Range;
 
 mod nvfp4;
-pub use nvfp4::{Nvfp4Gemm, Nvfp4GroupedGemmView, nvfp4_gemm, nvfp4_grouped_gemm_view};
+pub use nvfp4::{
+    Nvfp4Gemm, Nvfp4GemmView, Nvfp4GroupedGemmView, nvfp4_gemm, nvfp4_gemm_view,
+    nvfp4_grouped_gemm_view,
+};
 
 #[cutile::module]
 mod kernels {
@@ -461,6 +465,146 @@ impl Fp8Gemm<'_> {
                 kernels::fp8_rows_gemm_kernel(self.y, self.x, &w, &self.weight.scales)
                     .generics(generics),
             )?,
+        }
+        Ok(())
+    }
+}
+
+fn assert_rows_view(
+    x: &TensorView<'_, f32>,
+    y: &Partition<TensorViewMut<'_, f32>>,
+    weight: (usize, usize),
+    rows: &Range<usize>,
+    tile: GemmTile,
+) {
+    let m = x.shape()[0] as usize;
+    assert!(tile.m > 0 && tile.n > 0 && tile.k > 0);
+    assert!(m > 0 && m % tile.m == 0);
+    assert_eq!(x.shape(), &[m as i32, weight.1 as i32]);
+    assert!(rows.start < rows.end && rows.end <= weight.0);
+    assert!(rows.len() % tile.n == 0 && weight.1 % tile.k == 0);
+    assert_eq!(y.partition_shape, vec![tile.m, tile.n]);
+    assert_eq!(
+        y.grid().expect("valid output grid"),
+        ((m / tile.m) as u32, (rows.len() / tile.n) as u32, 1)
+    );
+}
+
+pub struct GemmView<'a> {
+    weight: &'a DenseMatrix<bf16>,
+    rows: Range<usize>,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<TensorViewMut<'a, f32>>,
+    tile: GemmTile,
+}
+
+pub fn gemm_view<'a>(
+    weight: &'a DenseMatrix<bf16>,
+    rows: Range<usize>,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<TensorViewMut<'a, f32>>,
+    tile: GemmTile,
+) -> GemmView<'a> {
+    assert_rows_view(x, &y, (weight.rows, weight.cols), &rows, tile);
+    GemmView {
+        weight,
+        rows,
+        x,
+        y,
+        tile,
+    }
+}
+
+impl GemmView<'_> {
+    pub fn submit<S: Sink>(self, sink: &mut S) -> Result<(), cuda_async::error::DeviceError> {
+        use cutile::tile_kernel::TileKernel;
+        let cols = self.weight.cols;
+        let matrix = self
+            .weight
+            .weights
+            .view(&[self.weight.rows, cols])
+            .expect("DenseMatrix storage has the declared shape");
+        let w = matrix.slice(&[self.rows, 0..cols]).expect("checked rows");
+        sink.run(kernels::gemm_kernel(self.y, self.x, &w).generics(vec![
+            self.tile.m.to_string(),
+            self.tile.n.to_string(),
+            self.tile.k.to_string(),
+            cols.to_string(),
+        ]))?;
+        Ok(())
+    }
+}
+
+pub struct Fp8GemmView<'a> {
+    weight: &'a Fp8Matrix,
+    rows: Range<usize>,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<TensorViewMut<'a, f32>>,
+    tile: GemmTile,
+}
+
+pub fn fp8_gemm_view<'a>(
+    weight: &'a Fp8Matrix,
+    rows: Range<usize>,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<TensorViewMut<'a, f32>>,
+    tile: GemmTile,
+) -> Fp8GemmView<'a> {
+    let shape = (weight.weights.rows, weight.weights.cols);
+    assert_rows_view(x, &y, shape, &rows, tile);
+    if let Fp8Scaling::Blocks { block_n, block_k } = weight.scaling {
+        assert!(rows.start % block_n == 0 && rows.end % block_n == 0);
+        assert!(block_n % tile.n == 0 && block_k % tile.k == 0);
+    }
+    Fp8GemmView {
+        weight,
+        rows,
+        x,
+        y,
+        tile,
+    }
+}
+
+impl Fp8GemmView<'_> {
+    pub fn submit<S: Sink>(self, sink: &mut S) -> Result<(), cuda_async::error::DeviceError> {
+        use cutile::tile_kernel::TileKernel;
+        let (rows, cols) = (self.weight.weights.rows, self.weight.weights.cols);
+        let matrix = self
+            .weight
+            .weights
+            .weights
+            .view(&[rows, cols])
+            .expect("FP8 matrix shape");
+        let w = matrix
+            .slice(&[self.rows.clone(), 0..cols])
+            .expect("checked rows");
+        let mut generics = vec![
+            self.tile.m.to_string(),
+            self.tile.n.to_string(),
+            self.tile.k.to_string(),
+            cols.to_string(),
+        ];
+        match self.weight.scaling {
+            Fp8Scaling::Blocks { block_n, block_k } => {
+                let blocks = self.rows.start / block_n..self.rows.end / block_n;
+                let scales = self
+                    .weight
+                    .scales
+                    .slice(&[blocks, 0..cols / block_k])
+                    .expect("checked scale blocks");
+                generics.extend([block_n.to_string(), block_k.to_string()]);
+                sink.run(kernels::fp8_gemm_kernel(self.y, self.x, &w, &scales).generics(generics))?;
+            }
+            Fp8Scaling::Rows => {
+                let scales = self
+                    .weight
+                    .scales
+                    .slice(&[0..1, self.rows])
+                    .expect("checked rows");
+                sink.run(
+                    kernels::fp8_rows_gemm_kernel(self.y, self.x, &w, &scales).generics(generics),
+                )?
+            }
         }
         Ok(())
     }

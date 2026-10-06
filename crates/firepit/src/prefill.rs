@@ -11,18 +11,19 @@ use crate::plan::{NormName, Op, Slot, StepPlan, WeightName};
 use crate::session::{GdnStateLayout, LayerState, Session};
 use cuda_async::device_operation::DeviceOp;
 use cutile::api::{self, DeviceOpReshape};
-use cutile::tensor::{IntoPartition, PartitionMut, Reshape, Tensor};
+use cutile::tensor::{IntoPartition, PartitionMut, Reshape, Tensor, TensorView};
 use cutile::tile_kernel::{TileKernel, ToHostVecOp};
 use firepit_kernels::attention::DEFAULT_PREFILL_TILE;
 use firepit_kernels::gemm::{
-    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, fp8_gemm, fp8_grouped_gemm_view, gemm,
-    grouped_gemm_view, nvfp4_gemm, nvfp4_grouped_gemm_view,
+    DEFAULT_GEMM_TILE, DEFAULT_GROUPED_GEMM_TILE, GemmTile, fp8_gemm_view, fp8_grouped_gemm_view,
+    gemm_view, grouped_gemm_view, nvfp4_gemm_view, nvfp4_grouped_gemm_view,
 };
 use firepit_kernels::gemv::gemv;
 use firepit_kernels::moe::{PrefillLayout as MoePrefillLayout, PrefillPlan as MoePrefillPlan};
 use firepit_kernels::sink::Sink;
 use firepit_kernels::weights::Weight;
 use firepit_kernels::{attention, elementwise, embedding, gdn, gdn_chunk, moe, rope, swiglu};
+use std::ops::Range;
 use std::sync::Arc;
 
 const CHUNK: usize = gdn_chunk::DEFAULT_CHUNK_SIZE;
@@ -392,6 +393,26 @@ fn gemm_tile(cols: usize, rows: usize, grouped: bool) -> GemmTile {
     tile
 }
 
+fn prefill_gemm(
+    weight: &Weight,
+    rows: Range<usize>,
+    x: &TensorView<'_, f32>,
+    target: &mut Tensor<f32>,
+    sink: &mut impl Sink,
+) -> Result<()> {
+    let tile = gemm_tile(x.shape()[1] as usize, rows.len(), false);
+    let y = target
+        .slice_mut(&[0..x.shape()[0] as usize, rows.clone()])?
+        .partition([tile.m, tile.n]);
+    match weight {
+        Weight::Dense(dense) => gemm_view(dense, rows, x, y, tile).submit(sink)?,
+        Weight::Fp8(fp8) => fp8_gemm_view(fp8, rows, x, y, tile).submit(sink)?,
+        Weight::Nvfp4(nvfp4) => nvfp4_gemm_view(nvfp4, rows, x, y, tile).submit(sink)?,
+        Weight::Q8(_) => return Err("Q8 prefill is unsupported".into()),
+    }
+    Ok(())
+}
+
 pub(crate) fn run(
     model: &Model,
     plan: &mut PrefillPlan,
@@ -680,46 +701,18 @@ fn run_inner(
                             gemv(w, &x, target.partition([1, tile.rows]), tile).submit(sink)?;
                         } else {
                             let selected = shaped.slice(&[plan.scored.outer(), 0..cols])?;
-                            let tile = gemm_tile(cols, output_rows, false);
-                            match w {
-                                Weight::Dense(dense) => {
-                                    gemm(dense, &selected, target.partition([tile.m, tile.n]), tile)
-                                        .submit(sink)?
-                                }
-                                Weight::Fp8(fp8) => fp8_gemm(
-                                    fp8,
-                                    &selected,
-                                    target.partition([tile.m, tile.n]),
-                                    tile,
-                                )
-                                .submit(sink)?,
-                                Weight::Nvfp4(nvfp4) => nvfp4_gemm(
-                                    nvfp4,
-                                    &selected,
-                                    target.partition([tile.m, tile.n]),
-                                    tile,
-                                )
-                                .submit(sink)?,
-                                Weight::Q8(_) => return Err("Q8 prefill is unsupported".into()),
-                            }
+                            prefill_gemm(w, 0..output_rows, &selected, target, sink)?;
                         }
                     } else {
                         let x = source.view(&[rows, cols])?;
-                        let tile = gemm_tile(cols, output_rows, false);
-                        match w {
-                            Weight::Dense(dense) => {
-                                gemm(dense, &x, target.partition([tile.m, tile.n]), tile)
-                                    .submit(sink)?
+                        let parts = match out {
+                            Slot::Projection(layout) => {
+                                model.projection_layouts[layout].gemm_rows()
                             }
-                            Weight::Fp8(fp8) => {
-                                fp8_gemm(fp8, &x, target.partition([tile.m, tile.n]), tile)
-                                    .submit(sink)?
-                            }
-                            Weight::Nvfp4(nvfp4) => {
-                                nvfp4_gemm(nvfp4, &x, target.partition([tile.m, tile.n]), tile)
-                                    .submit(sink)?
-                            }
-                            Weight::Q8(_) => return Err("Q8 prefill is unsupported".into()),
+                            _ => vec![0..output_rows],
+                        };
+                        for part in parts {
+                            prefill_gemm(w, part, &x, target, sink)?;
                         }
                     }
                 }

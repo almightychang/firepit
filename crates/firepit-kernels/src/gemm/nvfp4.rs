@@ -3,6 +3,7 @@ use crate::moe::PrefillPlan;
 use crate::sink::Sink;
 use crate::weights::{NVFP4_GROUP, Nvfp4Matrix, Q8_BLOCK};
 use cutile::tensor::{Partition, Tensor, TensorView, TensorViewMut};
+use std::ops::Range;
 
 #[cutile::module]
 mod kernels {
@@ -149,6 +150,57 @@ impl Nvfp4Gemm<'_> {
         sink.run(
             kernels::nvfp4_gemm_kernel(self.y, self.x, &w, &scales, &self.weight.row_scales)
                 .generics(tile_generics(self.tile, self.weight.cols)),
+        )?;
+        Ok(())
+    }
+}
+
+pub struct Nvfp4GemmView<'a> {
+    weight: &'a Nvfp4Matrix,
+    rows: Range<usize>,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<TensorViewMut<'a, f32>>,
+    tile: GemmTile,
+}
+
+pub fn nvfp4_gemm_view<'a>(
+    weight: &'a Nvfp4Matrix,
+    rows: Range<usize>,
+    x: &'a TensorView<'a, f32>,
+    y: Partition<TensorViewMut<'a, f32>>,
+    tile: GemmTile,
+) -> Nvfp4GemmView<'a> {
+    assert!(tile.k % Q8_BLOCK == 0);
+    super::assert_rows_view(x, &y, (weight.rows, weight.cols), &rows, tile);
+    Nvfp4GemmView {
+        weight,
+        rows,
+        x,
+        y,
+        tile,
+    }
+}
+
+impl Nvfp4GemmView<'_> {
+    pub fn submit<S: Sink>(self, sink: &mut S) -> Result<(), cuda_async::error::DeviceError> {
+        use cutile::tile_kernel::TileKernel;
+        let cols = self.weight.cols;
+        let packed = self.weight.packed_matrix();
+        let scale_matrix = self.weight.scale_matrix();
+        let w = packed
+            .slice(&[self.rows.clone(), 0..cols / 2])
+            .expect("checked rows");
+        let scales = scale_matrix
+            .slice(&[self.rows.clone(), 0..cols / NVFP4_GROUP])
+            .expect("checked rows");
+        let row_scales = self
+            .weight
+            .row_scales
+            .slice(&[0..1, self.rows])
+            .expect("checked rows");
+        sink.run(
+            kernels::nvfp4_gemm_kernel(self.y, self.x, &w, &scales, &row_scales)
+                .generics(tile_generics(self.tile, cols)),
         )?;
         Ok(())
     }
