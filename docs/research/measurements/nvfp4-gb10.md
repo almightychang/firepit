@@ -99,3 +99,10 @@ design-cli JIT 절. 테스트 통과, logits 비트 동일.
 
 - stage1(cuTile 앞단) 4.3~4.8 s는 디스크 캐시가 있어도 매번 남는다(cutile-rs 이슈 초안 015).
 - 출력 텐서의 동적 extent로 MAX_SEQ 재컴파일을 없애려던 시도는 launch 검사에서 거부돼 되돌렸다(이슈 초안 014, GB10 재현). KV 길이를 2의 거듭제곱 구간으로 올린다.
+
+## hot path: prefill 정렬 counting sort(A1)와 decode 업로드 정리(D1) (`0cddab6` → `706ce45`, GB10)
+
+측정 근거와 설계: scratchpad/hot-path-measure-report.md, hot-path-design.md. 테스트 전부 통과(engine_verify 8 포함), decode logits 비트 동일.
+- decode graph 밖 구간(nsys, 45 step 중앙값): 227 → 151 µs/step. sync 9 → 3, HtoD 4 → 2, DtoD 5 → 3. 남은 몫은 graph launch 33 µs, logits DtoH 31 µs, host 처리. decode bench 15.65 → 15.59 ms.
+- prefill 5000: host 정렬(로컬 CPU T=5000) 1010 → 166 µs. GPU 공백 59.5 → 32.3 ms, 그중 MoE 정렬·업로드 공백 44.9 → 18.4 ms. sync·복사 횟수는 그대로라 남은 공백은 왕복 자체다. wall 차이는 2회 측정 잡음 안(약 −11 ms).
+- graph 안 업로드·logits 복사(D2)는 safe API가 없어 보류(cutile-rs 이슈 초안 016, 017). GPU 쪽 정렬(B)은 남은 18 ms를 보고 판단.
