@@ -517,12 +517,12 @@ mod tests {
         Ok(())
     }
 
-    fn top5(values: &[f32]) -> Vec<usize> {
-        let mut indices: Vec<_> = (0..values.len()).collect();
-        indices.sort_unstable_by(|&a, &b| values[b].total_cmp(&values[a]).then(a.cmp(&b)));
-        indices.truncate(5);
-        indices.sort_unstable();
-        indices
+    fn logits_match(actual: &[f32], expected: &[f32]) -> bool {
+        assert_eq!(actual.len(), expected.len());
+        actual
+            .iter()
+            .zip(expected)
+            .all(|(a, b)| (a - b).abs() <= 3e-4 * (1.0 + b.abs()))
     }
 
     fn assert_trace(trace: &Trace, expected: impl IntoIterator<Item = &'static str>) {
@@ -774,11 +774,7 @@ mod tests {
                     .map(|(a, b)| (a - b).abs())
                     .fold(0.0f32, f32::max);
                 println!("scored row {index} vs step max_abs={max_abs}");
-                assert!(
-                    row.iter()
-                        .zip(&step)
-                        .all(|(a, b)| (a - b).abs() <= 3e-4 * (1.0 + b.abs()))
-                );
+                assert!(logits_match(row, &step));
             }
         }
         assert!(ScoredRows::parse(0..0, 4).is_err());
@@ -813,15 +809,9 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         println!("reset rope append logits max_abs={max}");
-        println!(
-            "reset rope top5={:?} expected={:?}",
-            top5(&actual),
-            top5(&expected)
-        );
-        assert_ne!(
-            top5(&actual),
-            top5(&expected),
-            "resetting RoPE must fail append top5"
+        assert!(
+            !logits_match(&actual, &expected),
+            "resetting RoPE must fail the append logits comparison"
         );
         Ok(())
     }
@@ -844,15 +834,9 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0f32, f32::max);
         println!("first row lm_head prefill/step logits max_abs={max}");
-        println!(
-            "first row lm_head top5={:?} expected={:?}",
-            top5(&actual),
-            top5(&expected)
-        );
-        assert_ne!(
-            top5(&actual),
-            top5(&expected),
-            "first-row lm_head must fail prefill/step top5"
+        assert!(
+            !logits_match(&actual, &expected),
+            "first-row lm_head must fail the prefill/step logits comparison"
         );
         Ok(())
     }
