@@ -1,12 +1,9 @@
+use crate::access::{Ctx, DecodeStore};
 use crate::checkpoint::Stream;
 use crate::model::{Model, Projection};
+use crate::session::Session;
 use crate::{LayerKind, Result};
 use cuda_async::cuda_graph::CudaGraph;
-use cuda_async::device_operation::DeviceOp;
-use cutile::api;
-use cutile::tensor::Tensor;
-use cutile::tile_kernel::ToHostVecOp;
-use firepit_kernels::moe::ExpertSelection;
 use std::ops::Range;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -153,6 +150,8 @@ pub enum WeightName {
     GdnOut,
     AttnOut,
     MoeProjection(usize),
+    ExpertGateUp,
+    ExpertDown,
     LmHead,
 }
 
@@ -240,18 +239,17 @@ impl Op {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct GdnTiles {
+    pub value: usize,
+    pub conv: usize,
+}
+
 pub struct StepPlan {
     pub ops: Vec<Op>,
-    pub batch: usize,
-    pub buffers: Vec<Tensor<f32>>,
-    pub tokens: Tensor<i32>,
-    pub positions: Vec<Tensor<i32>>,
-    pub cos: Tensor<f32>,
-    pub sin: Tensor<f32>,
-    pub selections: Vec<Vec<ExpertSelection>>,
+    pub(crate) store: DecodeStore,
     pub graph: Option<CudaGraph<()>>,
-    pub gdn_value_tile: usize,
-    pub gdn_conv_tile: usize,
+    pub tiles: GdnTiles,
 }
 
 impl StepPlan {
@@ -376,50 +374,24 @@ impl StepPlan {
         Ok(ops)
     }
 
-    pub fn new(
-        model: &Model,
-        batch: usize,
-        gdn_value_tile: usize,
-        gdn_conv_tile: usize,
-        stream: &Stream,
-    ) -> Result<Self> {
-        let ops = Self::ops(model)?;
-        let buffers = Slot::all(model)
-            .map(|slot| api::zeros::<f32>(&slot.shape(model, batch)).sync_on(stream))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let tokens = api::zeros::<i32>(&[batch]).sync_on(stream)?;
-        let positions = (0..batch)
-            .map(|_| api::zeros::<i32>(&[1]).sync_on(stream))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let d = model.dims.attention().head_dim();
-        let cos = api::zeros::<f32>(&[batch, d]).sync_on(stream)?;
-        let sin = api::zeros::<f32>(&[batch, d]).sync_on(stream)?;
-        let selections = (0..model.layers.len())
-            .map(|_| {
-                (0..batch)
-                    .map(|_| ExpertSelection::empty(&model.dims.moe().with_shared_expert(), stream))
-                    .collect::<Result<Vec<_>>>()
-            })
-            .collect::<Result<Vec<_>>>()?;
+    pub fn new(model: &Model, batch: usize, tiles: GdnTiles, stream: &Stream) -> Result<Self> {
         Ok(Self {
-            ops,
-            batch,
-            buffers,
-            tokens,
-            positions,
-            cos,
-            sin,
-            selections,
+            ops: Self::ops(model)?,
+            store: DecodeStore::new(model, batch, stream)?,
             graph: None,
-            gdn_value_tile,
-            gdn_conv_tile,
+            tiles,
         })
     }
 
-    pub fn logits(&self, stream: &Stream) -> Result<Vec<f32>> {
-        Ok(self.buffers[Slot::Logits.index()]
-            .dup()
-            .to_host_vec()
-            .sync_on(stream)?)
+    pub(crate) fn context<'a, 's, 'm>(
+        &'a mut self,
+        model: &'m Model,
+        sessions: &'a mut [&'s mut Session],
+    ) -> (&'a [Op], GdnTiles, Ctx<'a, 's, 'm>) {
+        (
+            &self.ops,
+            self.tiles,
+            Ctx::new(model, &mut self.store, sessions),
+        )
     }
 }

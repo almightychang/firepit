@@ -2,7 +2,7 @@ use crate::Result;
 use crate::checkpoint::Stream;
 use crate::execute::run;
 use crate::model::Model;
-use crate::plan::StepPlan;
+use crate::plan::{GdnTiles, StepPlan};
 #[cfg(feature = "testing")]
 pub use crate::prefill::IsolatedLayerTrace;
 use crate::prefill::{self, PrefillPlan, ScoredRows};
@@ -10,7 +10,7 @@ use crate::session::{Batch, Session, SessionId};
 use cuda_async::cuda_graph::CudaGraph;
 use cuda_async::device_operation::DeviceOp;
 use cuda_core::Device;
-use cutile::api::{self, DeviceOpReshape};
+
 #[cfg(feature = "testing")]
 use cutile::tile_kernel::ToHostVecOp;
 use firepit_kernels::rope;
@@ -129,7 +129,8 @@ impl Engine {
 
     pub fn step_eager(&mut self, batch: Batch<'_>) -> Result<Vec<f32>> {
         self.step_with(batch, |model, plan, sessions, stream| {
-            run(model, plan, sessions, &mut Eager(stream))
+            let (ops, tiles, mut ctx) = plan.context(model, sessions);
+            run(ops, tiles, &mut ctx, &mut Eager(stream))
         })
         .map(|(logits, ())| logits)
     }
@@ -137,7 +138,8 @@ impl Engine {
     pub fn step_eager_traced(&mut self, batch: Batch<'_>) -> Result<(Vec<f32>, Trace)> {
         self.step_with(batch, |model, plan, sessions, stream| {
             let mut sink = Traced::new(stream);
-            run(model, plan, sessions, &mut sink)?;
+            let (ops, tiles, mut ctx) = plan.context(model, sessions);
+            run(ops, tiles, &mut ctx, &mut sink)?;
             Ok(sink.into_trace())
         })
     }
@@ -252,7 +254,8 @@ impl Engine {
     ) -> Result<(Vec<f32>, Vec<RoutingLayerTrace>)> {
         let batch = self.batch([(session, token)])?;
         self.step_with(batch, |model, plan, sessions, stream| {
-            crate::execute::run_routing_observed(model, plan, sessions, stream)
+            let (ops, tiles, mut ctx) = plan.context(model, sessions);
+            crate::execute::run_routing_observed(ops, tiles, &mut ctx, stream)
         })
     }
 
@@ -314,7 +317,7 @@ impl Engine {
             for op in StepPlan::ops(&self.model)? {
                 if let crate::plan::Op::Gemv { layer, name, .. } = op {
                     if matches!(
-                        crate::execute::weight(&self.model, layer, name),
+                        crate::access::weight(&self.model, layer, name),
                         firepit_kernels::weights::Weight::Q8(_)
                     ) {
                         return Err("Q8 prefill is unsupported".into());
@@ -349,7 +352,8 @@ impl Engine {
         self.step_with(batch, |model, plan, sessions, stream| {
             if plan.graph.is_none() {
                 let graph = CudaGraph::scope(stream, |scope| {
-                    run(model, plan, sessions, &mut Graph(scope))
+                    let (ops, tiles, mut ctx) = plan.context(model, sessions);
+                    run(ops, tiles, &mut ctx, &mut Graph(scope))
                         .map_err(|e| cuda_async::error::DeviceError::Internal(e.to_string()))
                 })?;
                 plan.graph = Some(graph);
@@ -383,8 +387,10 @@ impl Engine {
                     plan: StepPlan::new(
                         &self.model,
                         size,
-                        self.gdn_value_tile,
-                        self.gdn_conv_tile,
+                        GdnTiles {
+                            value: self.gdn_value_tile,
+                            conv: self.gdn_conv_tile,
+                        },
                         &self.stream,
                     )?,
                 },
@@ -394,8 +400,6 @@ impl Engine {
         let result = (|| -> Result<(Vec<f32>, T)> {
             let mut tokens: Vec<i32> = batch.tokens.iter().map(|&x| x as i32).collect();
             tokens.resize(size, 0);
-            let source = api::copy_host_vec_to_device(&Arc::new(tokens)).sync_on(&self.stream)?;
-            api::memcpy(&mut plan.tokens, &source).sync_on(&self.stream)?;
             let positions: Vec<usize> = batch
                 .sessions
                 .iter()
@@ -403,26 +407,15 @@ impl Engine {
                 .chain(std::iter::repeat(0))
                 .take(size)
                 .collect();
-            for (position, &value) in plan.positions.iter_mut().zip(&positions) {
-                let source = api::copy_host_vec_to_device(&Arc::new(vec![value as i32]))
-                    .sync_on(&self.stream)?;
-                api::memcpy(position, &source).sync_on(&self.stream)?;
-            }
             let (cos, sin) = rope::frequencies(&positions, &self.model.dims.q_rope());
-            let cosine = api::copy_host_vec_to_device(&Arc::new(cos))
-                .reshape(&[size, self.model.dims.attention().head_dim()])
-                .sync_on(&self.stream)?;
-            let sine = api::copy_host_vec_to_device(&Arc::new(sin))
-                .reshape(&[size, self.model.dims.attention().head_dim()])
-                .sync_on(&self.stream)?;
-            api::memcpy(&mut plan.cos, &cosine).sync_on(&self.stream)?;
-            api::memcpy(&mut plan.sin, &sine).sync_on(&self.stream)?;
+            plan.store
+                .upload_step(tokens, &positions, cos, sin, &self.stream)?;
             let output = execute(&self.model, plan, &mut batch.sessions, &self.stream)?;
             #[cfg(test)]
             if self.fail_after_gpu_work {
                 return Err("injected failure after GPU work".into());
             }
-            Ok((plan.logits(&self.stream)?, output))
+            Ok((plan.store.logits(&self.stream)?, output))
         })();
         let (canonical, output) = match result {
             Ok(result) => result,

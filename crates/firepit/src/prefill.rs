@@ -1,11 +1,9 @@
 use crate::Result;
+use crate::access::weight;
 use crate::checkpoint::Stream;
 #[cfg(feature = "testing")]
 use crate::engine::RoutingLayerTrace;
-use crate::execute::{
-    gdn_gate, input_output, output_gate, rms_norm, row_width, two_inputs_output, weight,
-    weight_gemv_tile,
-};
+use crate::execute::{gdn_gate, output_gate, rms_norm, row_width, weight_gemv_tile};
 use crate::model::{MixerWeights, Model, Projection};
 use crate::plan::{NormName, Op, Slot, StepPlan, WeightName};
 use crate::session::{GdnStateLayout, LayerState, Session};
@@ -28,6 +26,36 @@ use std::sync::Arc;
 
 const CHUNK: usize = gdn_chunk::DEFAULT_CHUNK_SIZE;
 const BLOCK: usize = gdn_chunk::DEFAULT_BLOCK_SIZE;
+
+fn input_output(
+    buffers: &mut [Tensor<f32>],
+    input: Slot,
+    output: Slot,
+) -> (&Tensor<f32>, &mut Tensor<f32>) {
+    let i = input.index();
+    let o = output.index();
+    assert_ne!(i, o);
+    let (before, at) = buffers.split_at_mut(o);
+    let (out, after) = at.split_first_mut().unwrap();
+    (if i < o { &before[i] } else { &after[i - o - 1] }, out)
+}
+
+fn two_inputs_output(
+    buffers: &mut [Tensor<f32>],
+    a: Slot,
+    b: Slot,
+    output: Slot,
+) -> (&Tensor<f32>, &Tensor<f32>, &mut Tensor<f32>) {
+    let o = output.index();
+    let (before, at) = buffers.split_at_mut(o);
+    let (out, after) = at.split_first_mut().unwrap();
+    let get = |slot: Slot| {
+        let i = slot.index();
+        assert_ne!(i, o);
+        if i < o { &before[i] } else { &after[i - o - 1] }
+    };
+    (get(a), get(b), out)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ScoredRows {
@@ -717,7 +745,10 @@ fn run_inner(
                     }
                 }
                 PrefillOp::Kernel(Op::GdnGate { layer }) => {
-                    gdn_gate(model, layer, &mut plan.buffers, rows, sink)?
+                    let (z, columns) = Slot::projection(model, layer, Projection::GdnZ)?;
+                    let (source, gate, target) =
+                        two_inputs_output(&mut plan.buffers, Slot::MixerNorm, z, Slot::Gated);
+                    gdn_gate(model, source, gate, columns, target, rows, sink)?
                 }
                 PrefillOp::Kernel(Op::AttnRope { query }) => {
                     let (input, out, rdims) = if query {
@@ -738,7 +769,14 @@ fn run_inner(
                     )?;
                 }
                 PrefillOp::Kernel(Op::OutputGate { layer }) => {
-                    output_gate(model, layer, &mut plan.buffers, rows, sink)?
+                    let (q_gate, columns) = Slot::projection(model, layer, Projection::AttnQGate)?;
+                    let (source, q_gate, target) = two_inputs_output(
+                        &mut plan.buffers,
+                        Slot::AttnOut,
+                        q_gate,
+                        Slot::AttnGated,
+                    );
+                    output_gate(model, source, q_gate, columns, target, rows, sink)?
                 }
                 PrefillOp::Kernel(Op::ExpertSwiglu) => {
                     let count = plan
