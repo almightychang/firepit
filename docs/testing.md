@@ -86,7 +86,7 @@ scripts/dev.sh run --release -p firepit --example quality -- --model "$HOME/Mode
 
 ## GB10 실행
 
-GB10 측정과 신·구 커밋 비교는 `scripts/spark-bench.sh [--out DIR] REV [REV...] -- COMMAND...`로 한다. REV마다 소스를 따로 풀어 따로 빌드하고(`firepit` examples와 `firepit-cli`), 같은 pod에서 COMMAND를 REV 순서대로 실행한다. COMMAND는 pod의 bash에서 `REV`, `SRC`, `BIN`(release examples), `FIREPIT`(CLI)을 받는다. 예: `scripts/spark-bench.sh 7abcbd2 HEAD -- '$BIN/bench --model /work/qwen3.6-35b-a3b-fp8 --batches 1 --warmup 8 --steps 128 --max-seq 256'`. 결과는 `runs/spark/<UTC 시각>/`에 REV별 실행·빌드 로그, `status.txt`, `meta.txt`(전체 sha, vendor/cutile-rs HEAD, 노드, 명령)로 남는다. 클러스터 설정(kubectl 명령, 노드, pod 이름, 이미지, hostPath)은 gitignore된 `scripts/spark.env`에 둔다(`scripts/spark.env.example` 참고). 노드의 GPU 할당이 0이 아니거나 같은 이름의 pod가 있으면 띄우지 않고 GPU를 요청한 pod 목록(삭제 중 표시 포함)을 보여 주고 끝난다. 어떤 경로로 끝나든 pod를 `--wait=true`로 삭제한다.
+GB10 측정과 신·구 커밋 비교는 `scripts/spark-bench.sh [--out DIR] REV [REV...] -- COMMAND...`로 한다. REV마다 소스를 따로 풀고, 그 소스의 `rust-toolchain.toml` 툴체인을 pod rustup에 설치한 뒤(이미 있으면 그대로, 실패하면 그 REV에서 멈춘다) 따로 빌드하고(`firepit` examples와 `firepit-cli`), 같은 pod에서 COMMAND를 REV 순서대로 실행한다. COMMAND는 pod의 bash에서 `REV`, `SRC`, `BIN`(release examples), `FIREPIT`(CLI)을 받는다. 예: `scripts/spark-bench.sh 7abcbd2 HEAD -- '$BIN/bench --model /work/qwen3.6-35b-a3b-fp8 --batches 1 --warmup 8 --steps 128 --max-seq 256'`. 결과는 `runs/spark/<UTC 시각>/`에 REV별 실행·빌드·툴체인 로그, `status.txt`, `meta.txt`(전체 sha, vendor/cutile-rs HEAD, 노드, 명령)로 남는다. 클러스터 설정(kubectl 명령, 노드, pod 이름, 이미지, hostPath)은 gitignore된 `scripts/spark.env`에 둔다(`scripts/spark.env.example` 참고). 노드의 GPU 할당이 0이 아니거나 같은 이름의 pod가 있으면 띄우지 않고 GPU를 요청한 pod 목록(삭제 중 표시 포함)을 보여 주고 끝난다. 어떤 경로로 끝나든 pod를 `--wait=true`로 삭제한다.
 
 ## 판정 기준 현황
 

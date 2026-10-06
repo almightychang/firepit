@@ -111,6 +111,16 @@ for sha in "${shas[@]}"; do
   say "$sha: uploading source"
   pod bash -c "rm -rf $src && mkdir -p $src/vendor && ln -s $vendor $src/vendor/cutile-rs"
   git -C "$root" archive "$sha" | pod_stdin tar -xf - -C "$src"
+  # rustup >= 1.28 installs the source's rust-toolchain.toml (or keeps the default when
+  # there is none) with no arguments; older rustup installs it on `show active-toolchain`.
+  say "$sha: installing toolchain"
+  if ! pod env PATH="$env_path" bash -c \
+    "cd $src && { rustup toolchain install --no-self-update || rustup show active-toolchain; } && rustc --version" \
+    >|"$out/toolchain-$sha.log" 2>&1; then
+    echo "$sha toolchain exit=1" | tee -a "$out/status.txt"
+    say "$sha: toolchain install failed, see $out/toolchain-$sha.log"
+    exit 1
+  fi
   say "$sha: building"
   if ! pod env PATH="$env_path" CARGO_TARGET_DIR="$target" bash -c \
     "cd $src && cargo build --release -p firepit --examples && cargo build --release -p firepit-cli" \
