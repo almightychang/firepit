@@ -51,7 +51,15 @@ GEMV는 oracle 비교와 선형성·배치 독립·가중치 행 치환을 검�
 
 ### 3.7 엔진 전체 모델 검증
 
-`tools/reference/trace_qwen36.py --engine`는 기존 prefill과 같은 150개 token ID로 HF 전체 층의 마지막 토큰 logits와 각 층 출력 residual의 마지막 행을 기록한다. GB10에서 `scripts/dev.sh test -p firepit --test engine_verify -- --ignored --nocapture`로 검증한다. 모델과 정답지 경로는 각각 `FIREPIT_VERIFY_MODEL`, `FIREPIT_VERIFY_REF`로 바꾸고, 작은 접두부 확인에는 `FIREPIT_VERIFY_LAYERS=2`를 사용한다.
+`tools/reference/trace_qwen36.py --engine`는 HF 전체 층의 마지막 토큰 logits, 층별 출력 residual의 마지막 행, MoE 선택을 기록한다. GB10에서 `scripts/dev.sh test -p firepit --test engine_verify -- --ignored --nocapture`로 검증한다. 모델 경로는 `FIREPIT_VERIFY_MODEL`로 바꾸고, 작은 접두부 확인에는 `FIREPIT_VERIFY_LAYERS=2`를 쓴다.
+
+엔진 경로끼리의 비교(`prefill_vs_step`, `append_vs_whole`, `routing_flip_*`)는 HF 정답지가 필요 없다. 150개 token ID는 `crates/firepit/tests/fixtures/qwen36-prompt-tokens.json`에서 읽는다(출처는 파일의 `source`). HF 비교 세 테스트는 정답지 종류가 각각 다르다. 테스트는 metadata(`mode`, `tokens_source`, `isolate_layers`)로 종류를 확인하고, 맞지 않거나 파일이 없으면 생성 명령과 변수 이름을 담아 실패한다.
+
+| 테스트 | 생성 플래그 | 변수 | 기본 파일(`refs/`) |
+|---|---|---|---|
+| `hf_prefill` | `--engine`(위 150 토큰) | `FIREPIT_VERIFY_PREFILL_REF` | `qwen36-engine-prefill.safetensors` |
+| `hf_locate_divergence` | `--engine --tokens-json TOKENS.json` | `FIREPIT_VERIFY_TOKENS_REF` | `qwen36-engine-tokens.safetensors` |
+| `hf_isolated_layers` | `--engine --isolate-layers L0,L1,...` | `FIREPIT_VERIFY_ISOLATED_REF` | `qwen36-engine-isolated.safetensors` |
 
 - HF 비교: 마지막 토큰 logits의 top-1과 top-5 집합이 같아야 한다. logits의 최대 절대·상대 오차와 상대 L2, 층별 마지막 residual 행의 같은 세 수치는 기록한다.
 - 경로 동치: `prefill(T)`와 `step_eager` T회, `prefill(A)` 뒤 `prefill(B)`와 `prefill(A+B)`의 마지막 logits top-1·top-5 집합이 같아야 한다. 두 경로의 logits 및 모든 층의 GDN conv·recurrent 또는 attention K·V state 차이를 기록한다. 현재 고정 입력은 T=150, A=100, B=50이다.
@@ -87,6 +95,29 @@ scripts/dev.sh run --release -p firepit --example quality -- --model "$HOME/Mode
 ## GB10 실행
 
 GB10 측정과 신·구 커밋 비교는 `scripts/spark-bench.sh [--out DIR] REV [REV...] -- COMMAND...`로 한다. REV마다 소스를 따로 풀고, 그 소스의 `rust-toolchain.toml` 툴체인을 pod rustup에 설치한 뒤(이미 있으면 그대로, 실패하면 그 REV에서 멈춘다) 따로 빌드하고(`firepit` examples와 `firepit-cli`), 같은 pod에서 COMMAND를 REV 순서대로 실행한다. COMMAND는 pod의 bash에서 `REV`, `SRC`, `BIN`(release examples), `FIREPIT`(CLI)을 받는다. 예: `scripts/spark-bench.sh 7abcbd2 HEAD -- '$BIN/bench --model /work/qwen3.6-35b-a3b-fp8 --batches 1 --warmup 8 --steps 128 --max-seq 256'`. 결과는 `runs/spark/<UTC 시각>/`에 REV별 실행·빌드·툴체인 로그, `status.txt`, `meta.txt`(전체 sha, vendor/cutile-rs HEAD, 노드, 명령)로 남는다. 클러스터 설정(kubectl 명령, 노드, pod 이름, 이미지, hostPath)은 gitignore된 `scripts/spark.env`에 둔다(`scripts/spark.env.example` 참고). 노드의 GPU 할당이 0이 아니거나 같은 이름의 pod가 있으면 띄우지 않고 GPU를 요청한 pod 목록(삭제 중 표시 포함)을 보여 주고 끝난다. 어떤 경로로 끝나든 pod를 `--wait=true`로 삭제한다.
+
+### GB10 엔진 정답지
+
+`refs/`는 저장소에 없으므로 엔진 정답지는 GB10 hostPath의 `/work/refs/`에 만들어 둔다. 만드는 곳은 Rust 빌드 pod(`spark-bench.sh`)가 아니라 HF pod다. 같은 hostPath를 `/work`에 붙이고 GPU 1개를 쓰며, PyTorch CUDA 빌드와 transformers가 있어야 한다(2026-10-04 기록은 transformers 5.17.0, torch 2.14.1+cu130). 모델은 bf16 원본 `/work/qwen3.6-35b-a3b`이고, 저장소는 정답지를 만들 커밋의 소스를 쓴다.
+
+```sh
+cd /work/src-<rev>/tools/reference   # spark-bench가 푼 소스 또는 같은 커밋의 checkout
+uv run python trace_qwen36.py --model /work/qwen3.6-35b-a3b --engine --out /work/refs/qwen36-engine-prefill.safetensors
+uv run python trace_qwen36.py --model /work/qwen3.6-35b-a3b --engine --tokens-json TOKENS.json --out /work/refs/qwen36-engine-tokens.safetensors
+uv run python trace_qwen36.py --model /work/qwen3.6-35b-a3b --engine --isolate-layers L0,L1 --tokens-json TOKENS.json --out /work/refs/qwen36-engine-isolated.safetensors
+```
+
+`TOKENS.json`은 조사할 token ID 배열이고, `--isolate-layers`는 입력·mixer 출력을 저장할 층이다. 세 파일은 서로 바꿔 쓸 수 없다. `tokens_source` metadata는 이 절의 도구 버전부터 기록되므로, 그 전에 만든 파일은 다시 만들어야 한다.
+
+`spark-bench.sh`로 검증할 때는 COMMAND 안에서 변수를 넘긴다.
+
+```sh
+scripts/spark-bench.sh REV -- 'cd $SRC && FIREPIT_VERIFY_MODEL=/work/qwen3.6-35b-a3b \
+  FIREPIT_VERIFY_PREFILL_REF=/work/refs/qwen36-engine-prefill.safetensors \
+  FIREPIT_VERIFY_TOKENS_REF=/work/refs/qwen36-engine-tokens.safetensors \
+  FIREPIT_VERIFY_ISOLATED_REF=/work/refs/qwen36-engine-isolated.safetensors \
+  cargo test --release -p firepit --test engine_verify -- --ignored --nocapture'
+```
 
 ## 판정 기준 현황
 

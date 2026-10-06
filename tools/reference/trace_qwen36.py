@@ -560,6 +560,7 @@ def main():
     metadata = {"model": MODEL_ID, "layers": str(layers), "prompt": args.prompt, "tokens": json.dumps(tokens)}
     if args.engine:
         metadata["mode"] = "engine"
+        metadata["tokens_source"] = "tokens-json" if args.tokens_json is not None else "prompt"
         if isolate_layers is not None:
             metadata["isolate_layers"] = json.dumps(isolate_layers)
     if args.prefill:

@@ -16,24 +16,92 @@ fn model_path() -> PathBuf {
         })
 }
 
-fn reference_path() -> PathBuf {
-    std::env::var_os("FIREPIT_VERIFY_REF")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../refs/qwen36-engine-prefill.safetensors")
-        })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reference {
+    Prefill,
+    Tokens,
+    Isolated,
 }
 
-fn open_reference(path: &Path) -> TestResult<SafetensorsFile> {
-    SafetensorsFile::open(path).map_err(|error| {
-        format!(
-            "engine reference {}: {error}; generate it with tools/reference/trace_qwen36.py \
-             --engine (docs/testing.md 3.7) or point FIREPIT_VERIFY_REF at it",
-            path.display()
-        )
-        .into()
-    })
+impl Reference {
+    fn variable(self) -> &'static str {
+        match self {
+            Self::Prefill => "FIREPIT_VERIFY_PREFILL_REF",
+            Self::Tokens => "FIREPIT_VERIFY_TOKENS_REF",
+            Self::Isolated => "FIREPIT_VERIFY_ISOLATED_REF",
+        }
+    }
+
+    fn file(self) -> &'static str {
+        match self {
+            Self::Prefill => "qwen36-engine-prefill.safetensors",
+            Self::Tokens => "qwen36-engine-tokens.safetensors",
+            Self::Isolated => "qwen36-engine-isolated.safetensors",
+        }
+    }
+
+    fn flags(self) -> &'static str {
+        match self {
+            Self::Prefill => "--engine",
+            Self::Tokens => "--engine --tokens-json TOKENS.json",
+            Self::Isolated => "--engine --isolate-layers L0,L1,...",
+        }
+    }
+
+    fn path(self) -> PathBuf {
+        std::env::var_os(self.variable())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../refs")
+                    .join(self.file())
+            })
+    }
+
+    fn open(self) -> TestResult<SafetensorsFile> {
+        self.open_at(&self.path())
+    }
+
+    fn open_at(self, path: &Path) -> TestResult<SafetensorsFile> {
+        let reference = SafetensorsFile::open(path).map_err(|error| {
+            format!(
+                "{self:?} engine reference {}: {error}; generate it with tools/reference/trace_qwen36.py \
+                 {} (docs/testing.md 3.7) or set {}",
+                path.display(),
+                self.flags(),
+                self.variable()
+            )
+        })?;
+        let (mode, source) = (
+            reference.metadata("mode"),
+            reference.metadata("tokens_source"),
+        );
+        let isolated = reference.metadata("isolate_layers").is_some();
+        let found = match (mode, source, isolated) {
+            (Some("engine"), _, true) => Some(Self::Isolated),
+            (Some("engine"), Some("prompt"), false) => Some(Self::Prefill),
+            (Some("engine"), Some("tokens-json"), false) => Some(Self::Tokens),
+            _ => None,
+        };
+        if found != Some(self) {
+            return Err(format!(
+                "{} is not a {self:?} engine reference (trace_qwen36.py {}): mode={mode:?} \
+                 tokens_source={source:?} isolate_layers={isolated}",
+                path.display(),
+                self.flags()
+            )
+            .into());
+        }
+        Ok(reference)
+    }
+}
+
+fn reference_tokens(reference: &SafetensorsFile) -> TestResult<Vec<u32>> {
+    Ok(serde_json::from_str(
+        reference
+            .metadata("tokens")
+            .ok_or("reference has no tokens")?,
+    )?)
 }
 
 fn layers() -> TestResult<Option<usize>> {
@@ -43,29 +111,14 @@ fn layers() -> TestResult<Option<usize>> {
         .transpose()?)
 }
 
-fn tokens() -> TestResult<Vec<u32>> {
-    let path = reference_path();
-    let path = if path.exists() {
-        path
-    } else if layers()?.is_some() {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../refs/qwen36-prefix4-prefill.safetensors")
-    } else {
-        path
-    };
-    let reference = open_reference(&path)?;
-    let values: Vec<u32> = serde_json::from_str(
-        reference
-            .metadata("tokens")
-            .ok_or("reference has no tokens")?,
-    )?;
-    if values.len() != 150 {
-        return Err(format!("expected 150 tokens, got {}", values.len()).into());
-    }
-    Ok(values)
+fn prompt_tokens() -> TestResult<Vec<u32>> {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/qwen36-prompt-tokens.json"))?;
+    Ok(serde_json::from_value(fixture["tokens"].clone())?)
 }
 
 fn setup() -> TestResult<(Arc<Model>, Arc<Device>, Vec<u32>)> {
-    let tokens = tokens()?;
+    let tokens = prompt_tokens()?;
     let device = Device::new(0)?;
     let model = Arc::new(Model::from_checkpoint(
         model_path(),
@@ -322,9 +375,13 @@ fn routing_flip_append_vs_whole() -> TestResult<()> {
 #[test]
 #[ignore = "requires Qwen3.6 checkpoint and full-layer engine reference"]
 fn hf_prefill() -> TestResult<()> {
-    let reference = open_reference(&reference_path())?;
-    assert_eq!(reference.metadata("mode"), Some("engine"));
+    let reference = Reference::Prefill.open()?;
     let (model, device, tokens) = setup()?;
+    if reference_tokens(&reference)? != tokens {
+        return Err(
+            "prefill reference tokens differ from tests/fixtures/qwen36-prompt-tokens.json".into(),
+        );
+    }
     assert_eq!(
         reference.metadata("layers").unwrap().parse::<usize>()?,
         model.dims().layers().len()
@@ -387,12 +444,8 @@ fn append_vs_whole() -> TestResult<()> {
 #[test]
 #[ignore = "requires Qwen3.6 checkpoint and a --tokens-json engine reference"]
 fn hf_locate_divergence() -> TestResult<()> {
-    let reference = open_reference(&reference_path())?;
-    let tokens: Vec<u32> = serde_json::from_str(
-        reference
-            .metadata("tokens")
-            .ok_or("reference has no tokens")?,
-    )?;
+    let reference = Reference::Tokens.open()?;
+    let tokens = reference_tokens(&reference)?;
     let device = Device::new(0)?;
     let model = Arc::new(Model::from_checkpoint(
         model_path(),
@@ -433,12 +486,8 @@ fn hf_locate_divergence() -> TestResult<()> {
 #[test]
 #[ignore = "requires Qwen3.6 checkpoint and --isolate-layers engine reference"]
 fn hf_isolated_layers() -> TestResult<()> {
-    let reference = open_reference(&reference_path())?;
-    let tokens: Vec<u32> = serde_json::from_str(
-        reference
-            .metadata("tokens")
-            .ok_or("reference has no tokens")?,
-    )?;
+    let reference = Reference::Isolated.open()?;
+    let tokens = reference_tokens(&reference)?;
     let indices: Vec<usize> = serde_json::from_str(
         reference
             .metadata("isolate_layers")
@@ -492,5 +541,71 @@ fn hf_isolated_layers() -> TestResult<()> {
             relative_l2(actual.hidden.iter().zip(&expected_hidden.data)),
         );
     }
+    Ok(())
+}
+
+#[test]
+fn references_are_told_apart_by_metadata() -> TestResult<()> {
+    use safetensors::{Dtype, tensor::TensorView};
+    let dir = std::env::temp_dir().join(format!("firepit-engine-refs-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)?;
+    let bytes = 1.0f32.to_le_bytes();
+    let write = |name: &str, metadata: &[(&str, &str)]| -> TestResult<PathBuf> {
+        let path = dir.join(name);
+        let metadata = metadata
+            .iter()
+            .map(|&(key, value)| (key.to_owned(), value.to_owned()))
+            .collect();
+        safetensors::serialize_to_file(
+            [("logits", TensorView::new(Dtype::F32, vec![1], &bytes)?)],
+            Some(metadata),
+            &path,
+        )?;
+        Ok(path)
+    };
+    let files = [
+        (
+            Reference::Prefill,
+            write(
+                "prefill",
+                &[("mode", "engine"), ("tokens_source", "prompt")],
+            )?,
+        ),
+        (
+            Reference::Tokens,
+            write(
+                "tokens",
+                &[("mode", "engine"), ("tokens_source", "tokens-json")],
+            )?,
+        ),
+        (
+            Reference::Isolated,
+            write(
+                "isolated",
+                &[
+                    ("mode", "engine"),
+                    ("tokens_source", "prompt"),
+                    ("isolate_layers", "[0]"),
+                ],
+            )?,
+        ),
+        (
+            Reference::Prefill,
+            write("unmarked", &[("mode", "engine")])?,
+        ),
+    ];
+    for kind in [Reference::Prefill, Reference::Tokens, Reference::Isolated] {
+        for (index, (written, path)) in files.iter().enumerate() {
+            let accepted = kind.open_at(path).is_ok();
+            assert_eq!(
+                accepted,
+                index < 3 && *written == kind,
+                "{kind:?} {}",
+                path.display()
+            );
+        }
+    }
+    std::fs::remove_dir_all(&dir)?;
+    assert_eq!(prompt_tokens()?.len(), 150);
     Ok(())
 }
