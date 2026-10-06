@@ -78,3 +78,24 @@
 원소별·세션 op: delta 0.39(30회), rms_norm 0.26(131), combine 0.17(40), top_k 0.14(40), conv1d_silu 0.11(30), add 0.10(80), attention 0.07(10), swiglu 0.05(40), 나머지 0.1 미만.
 
 하한(가중치 3.0 GB / 220 GB/s ≈ 13.6 ms) 대비 약 3.1 ms 중 GEMV 초과 약 1.6 ms(FP8 +0.81, NVFP4 expert +0.78), 원소별·세션 op 1.4 ms, 커널 사이 공백 약 0.2 ms(추정).
+
+## residual add + rms_norm fusion (`fdd5b5d` → `f399905`, GB10 같은 pod)
+
+design-e4 4.3의 5번. 테스트 전부 통과, decode logits(nvfp4·FP8 33 step)와 품질 로그가 이전과 비트 동일(f32 연산 순서를 같게 유지).
+- nsys(nvfp4): combine 166.8 + add 95.5 + norm 164.1 µs/step → combine_add_norm 235.8 + add_norm 87.1 µs/step, 원소별 커널 −104 µs/step. norm launch 131 → 51회(prefill).
+- decode 3회 교대 중앙값: nvfp4 15.70 → 15.64 ms, FP8 −0.04, bf16 −0.08 ms(범위 겹침). 같은 실행에서 코드가 그대로인 lm_head가 3893 → 4040 µs로 느려져 커널 절감을 상쇄했다. 버퍼 배치에 따른 대역폭 차이로 추정(미확인). 사전 할당 여부로 lm_head가 236~259 GB/s로 달라진 관찰(gemv-probe-gb10.md)과 같은 종류다.
+- prefill 5000: 차이 없음.
+
+## firepit run JIT 캐시 (`f399905` → `318c2cf`, GB10, 같은 새 FIREPIT_HOME)
+
+design-cli JIT 절. 테스트 통과, logits 비트 동일.
+
+| 회차 | 프롬프트 / KV 구간 | 기준: tileiras, wall | 수정 후: tileiras / disk, wall |
+|---|---|---|---|
+| 1 | 8토큰 / 64 | 64~66, 45~48 s | 64 / 0, 45.2 s |
+| 2 | 8토큰 / 64 | 64~66, 45~48 s | 0 / 64, **24.5 s** |
+| 3 | 20토큰 / 64 | | 11 / 55, 28.3 s (prefill 커널만) |
+| 4 | 37토큰 / 128 | | 9, 27.4 s (decode는 cache_append 하나) |
+
+- stage1(cuTile 앞단) 4.3~4.8 s는 디스크 캐시가 있어도 매번 남는다(cutile-rs 이슈 초안 015).
+- 출력 텐서의 동적 extent로 MAX_SEQ 재컴파일을 없애려던 시도는 launch 검사에서 거부돼 되돌렸다(이슈 초안 014, GB10 재현). KV 길이를 2의 거듭제곱 구간으로 올린다.
