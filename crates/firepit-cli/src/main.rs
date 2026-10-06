@@ -1,4 +1,5 @@
 mod catalog;
+mod jit;
 mod remote;
 mod store;
 
@@ -106,9 +107,10 @@ fn run(dir: &Path, prompt: &str, max_new_tokens: usize, eager: bool) -> Result<(
     if input.is_empty() {
         return Err("prompt is empty".into());
     }
-    let max_seq = input.len() + max_new_tokens;
+    let max_seq = jit::cache_capacity(input.len() + max_new_tokens);
     let eos = eos_ids(dir, &tokenizer)?;
     let device = Device::new(0)?;
+    let compiles = jit::Counts::now();
     let loading = Instant::now();
     let model = Arc::new(Model::from_checkpoint(
         dir,
@@ -157,6 +159,7 @@ fn run(dir: &Path, prompt: &str, max_new_tokens: usize, eager: bool) -> Result<(
         prefill.as_secs_f64(),
         generated as f64 / decode
     );
+    eprintln!("{}", jit::Counts::now().since(compiles));
     Ok(())
 }
 
@@ -202,6 +205,7 @@ fn main() -> Result<()> {
                 }
             };
             let dir = store.pull(model.recipe(), &HuggingFace::new())?;
+            jit::enable_disk_cache(&store.jit_dir())?;
             run(&dir, &prompt, max_new_tokens, eager)
         }
         Command::Flow {

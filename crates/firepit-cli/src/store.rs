@@ -140,6 +140,10 @@ impl Store {
             .join(recipe.mode)
     }
 
+    pub fn jit_dir(&self) -> PathBuf {
+        self.root.join("jit")
+    }
+
     fn staging_dir(&self, recipe: &Recipe) -> PathBuf {
         self.root
             .join("partial")
