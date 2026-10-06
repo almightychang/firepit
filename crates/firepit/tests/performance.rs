@@ -21,6 +21,7 @@ fn step_times() -> Result<(), Box<dyn std::error::Error>> {
         7,
         &stream,
     )?);
+    let vocab = model.dims().vocab();
     let sm = cuda_core::simt::CudaContext::new(device.ordinal())?.multiprocessor_count()?;
     println!("device={} sm_count={sm}", device.name()?);
     for batch in [1usize, 2, 4] {
@@ -32,7 +33,7 @@ fn step_times() -> Result<(), Box<dyn std::error::Error>> {
             let mut samples = Vec::new();
             for step in 0..25 {
                 let tokens: Vec<u32> = (0..batch)
-                    .map(|i| ((step * 7 + i * 19 + 3) % 256) as u32)
+                    .map(|i| ((step * 7 + i * 19 + 3) % vocab) as u32)
                     .collect();
                 let started = Instant::now();
                 let batch = engine.batch(sessions.iter_mut().zip(tokens))?;
@@ -47,10 +48,10 @@ fn step_times() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             let label = if eager { "eager" } else { "graph" };
+            let count = samples.len();
             println!(
-                "B={batch} {label} median_step_ms={:.4} samples={}",
-                median(samples),
-                20
+                "B={batch} {label} median_step_ms={:.4} samples={count}",
+                median(samples)
             );
         }
     }
