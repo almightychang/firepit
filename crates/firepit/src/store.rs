@@ -4,9 +4,10 @@ use crate::execute::row_width;
 use crate::model::{MixerWeights, Model, Projection};
 use crate::plan::{Slot, WeightName};
 use crate::session::{LayerState, Session};
-use cuda_async::device_operation::DeviceOp;
-use cutile::api::{self, DeviceOpReshape};
-use cutile::tensor::Tensor;
+use cuda_async::device_operation::{DeviceOp, Zippable};
+use cuda_async::zip;
+use cutile::api;
+use cutile::tensor::{Tensor, TensorView};
 use cutile::tile_kernel::ToHostVecOp;
 use firepit_kernels::moe::ExpertSelection;
 use firepit_kernels::weights::Weight;
@@ -15,11 +16,10 @@ use std::ops::Range;
 use std::sync::Arc;
 
 pub(crate) struct DecodeStore {
+    batch: usize,
     buffers: Vec<Tensor<f32>>,
-    tokens: Tensor<i32>,
-    positions: Vec<Tensor<i32>>,
-    cos: Tensor<f32>,
-    sin: Tensor<f32>,
+    tokens_positions: Tensor<i32>,
+    cos_sin: Tensor<f32>,
     selections: Vec<Vec<ExpertSelection>>,
 }
 
@@ -27,9 +27,6 @@ impl DecodeStore {
     pub(crate) fn new(model: &Model, batch: usize, stream: &Stream) -> Result<Self> {
         let buffers = Slot::all(model)
             .map(|slot| api::zeros::<f32>(&slot.shape(model, batch)).sync_on(stream))
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        let positions = (0..batch)
-            .map(|_| api::zeros::<i32>(&[1]).sync_on(stream))
             .collect::<std::result::Result<Vec<_>, _>>()?;
         let head_dim = model.dims.attention().head_dim();
         let selections = (0..model.layers.len())
@@ -40,17 +37,16 @@ impl DecodeStore {
             })
             .collect::<Result<Vec<_>>>()?;
         Ok(Self {
+            batch,
             buffers,
-            tokens: api::zeros::<i32>(&[batch]).sync_on(stream)?,
-            positions,
-            cos: api::zeros::<f32>(&[batch, head_dim]).sync_on(stream)?,
-            sin: api::zeros::<f32>(&[batch, head_dim]).sync_on(stream)?,
+            tokens_positions: api::zeros::<i32>(&[2 * batch]).sync_on(stream)?,
+            cos_sin: api::zeros::<f32>(&[2 * batch, head_dim]).sync_on(stream)?,
             selections,
         })
     }
 
     pub(crate) fn batch(&self) -> usize {
-        self.positions.len()
+        self.batch
     }
 
     pub(crate) fn upload_step(
@@ -61,25 +57,21 @@ impl DecodeStore {
         sin: Vec<f32>,
         stream: &Stream,
     ) -> Result<()> {
-        let source = api::copy_host_vec_to_device(&Arc::new(tokens)).sync_on(stream)?;
-        api::memcpy(&mut self.tokens, &source).sync_on(stream)?;
-        for (position, &value) in self.positions.iter_mut().zip(positions) {
-            let source =
-                api::copy_host_vec_to_device(&Arc::new(vec![value as i32])).sync_on(stream)?;
-            api::memcpy(position, &source).sync_on(stream)?;
-        }
-        let shape = self
-            .cos
-            .shape()
-            .iter()
-            .map(|&x| x as usize)
-            .collect::<Vec<_>>();
-        for (target, values) in [(&mut self.cos, cos), (&mut self.sin, sin)] {
-            let source = api::copy_host_vec_to_device(&Arc::new(values))
-                .reshape(&shape)
-                .sync_on(stream)?;
-            api::memcpy(target, &source).sync_on(stream)?;
-        }
+        let ids: Vec<i32> = tokens
+            .into_iter()
+            .chain(positions.iter().map(|&position| position as i32))
+            .collect();
+        let rope: Vec<f32> = cos.into_iter().chain(sin).collect();
+        let (ids, rope) = zip!(
+            api::copy_host_vec_to_device(&Arc::new(ids)),
+            api::copy_host_vec_to_device(&Arc::new(rope))
+        )
+        .sync_on(stream)?;
+        zip!(
+            api::memcpy(&mut self.tokens_positions, &ids),
+            api::memcpy(&mut self.cos_sin, &rope)
+        )
+        .sync_on(stream)?;
         Ok(())
     }
 
@@ -228,15 +220,14 @@ impl<'a, 's, 'm> Ctx<'a, 's, 'm> {
         Parts {
             buffers: Buffers {
                 model: self.model,
-                rows: store.positions.len(),
+                rows: store.batch,
                 buffers: &mut store.buffers,
                 recorder,
             },
             inputs: Inputs {
-                tokens: &store.tokens,
-                positions: &store.positions,
-                cos: &store.cos,
-                sin: &store.sin,
+                batch: store.batch,
+                tokens_positions: &store.tokens_positions,
+                cos_sin: &store.cos_sin,
                 recorder,
             },
             selections: Selections {
@@ -390,32 +381,39 @@ impl Buffers<'_, '_> {
 }
 
 pub(crate) struct Inputs<'c> {
-    tokens: &'c Tensor<i32>,
-    positions: &'c [Tensor<i32>],
-    cos: &'c Tensor<f32>,
-    sin: &'c Tensor<f32>,
+    batch: usize,
+    tokens_positions: &'c Tensor<i32>,
+    cos_sin: &'c Tensor<f32>,
     recorder: Recorder<'c>,
 }
 
 impl<'c> Inputs<'c> {
-    pub(crate) fn tokens(&self) -> &'c Tensor<i32> {
+    pub(crate) fn tokens(&self) -> Result<TensorView<'c, i32>> {
         self.recorder.read(Buffer::Token);
-        self.tokens
+        Ok(self.tokens_positions.slice(&[0..self.batch])?)
     }
 
-    pub(crate) fn position(&self, session: usize) -> &'c Tensor<i32> {
+    pub(crate) fn position(&self, session: usize) -> Result<TensorView<'c, i32>> {
         self.recorder.read(Buffer::Position(index(session)));
-        &self.positions[session]
+        let at = self.batch + session;
+        Ok(self.tokens_positions.slice(&[at..at + 1])?)
     }
 
-    pub(crate) fn cos(&self) -> &'c Tensor<f32> {
+    pub(crate) fn cos(&self) -> Result<TensorView<'c, f32>> {
         self.recorder.read(Buffer::Cos);
-        self.cos
+        self.rope_rows(0)
     }
 
-    pub(crate) fn sin(&self) -> &'c Tensor<f32> {
+    pub(crate) fn sin(&self) -> Result<TensorView<'c, f32>> {
         self.recorder.read(Buffer::Sin);
-        self.sin
+        self.rope_rows(self.batch)
+    }
+
+    fn rope_rows(&self, start: usize) -> Result<TensorView<'c, f32>> {
+        let head_dim = self.cos_sin.shape()[1] as usize;
+        Ok(self
+            .cos_sin
+            .slice(&[start..start + self.batch, 0..head_dim])?)
     }
 }
 

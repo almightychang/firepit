@@ -363,7 +363,7 @@ fn run_inner(
                         embedding::embedding(
                             target.partition([1, d.hidden()]),
                             &model.embedding,
-                            inputs.tokens(),
+                            &inputs.tokens()?,
                         )
                         .generics(vec![d.hidden().to_string()]),
                     )?
@@ -504,8 +504,8 @@ fn run_inner(
                         rope::rope(
                             target.partition([1, rdims.rotary_dim()]),
                             &x,
-                            inputs.cos(),
-                            inputs.sin(),
+                            &inputs.cos()?,
+                            &inputs.sin()?,
                         )
                         .generics(rope::generics(&rdims)),
                     )?;
@@ -531,7 +531,7 @@ fn run_inner(
                                 v.partition([a.max_seq(), 1, a.head_dim()]),
                                 &key,
                                 &value,
-                                inputs.position(b),
+                                &inputs.position(b)?,
                             )
                             .generics(a.cache_generics()),
                         )?;
@@ -556,7 +556,7 @@ fn run_inner(
                                 &q,
                                 k,
                                 v,
-                                inputs.position(b),
+                                &inputs.position(b)?,
                                 a.scale(),
                             )
                             .generics(a.attention_generics()),

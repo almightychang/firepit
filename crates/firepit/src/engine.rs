@@ -448,6 +448,16 @@ impl Engine {
             session.position += 1;
         }
         let vocab = self.model.dims.vocab();
+        let in_order = batch
+            .original_rows
+            .iter()
+            .enumerate()
+            .all(|(canonical_row, &original_row)| canonical_row == original_row);
+        if in_order {
+            let mut logits = canonical;
+            logits.truncate(actual * vocab);
+            return Ok((logits, output));
+        }
         let mut logits = vec![0.0; actual * vocab];
         for (canonical_row, original_row) in batch.original_rows.into_iter().enumerate() {
             logits[original_row * vocab..(original_row + 1) * vocab]
