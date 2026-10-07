@@ -1,6 +1,6 @@
 # 로드맵
 
-갱신: 2026-10-03. ✔ 완료, ◐ 진행 중, ○ 미착수.
+갱신: 2026-10-07. ✔ 완료, ◐ 진행 중, ○ 미착수.
 
 firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이해하며 구현하는 공부 과정이기도 하다. 그래서 E2부터는 개념 하나를 한 덩이로 자른다.
 
@@ -26,14 +26,20 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
  E3. prefill                                                      ✔
     아래 "E3 공부 단위" 참고. 동기: 5071토큰 prompt를 decode 경로로 215초 → GB10 5000토큰 4.97초
 
- E4. 성능 (GB10)                                                  ◐
+ E4. 성능 (GB10)                                                  ✔
     ✔ Spark 측정 → GDN conv 타일화로 decode 12 → 30.6 tok/s (대역폭 하한의 92%)
     ✔ 양자화 포맷 결정: NVIDIA ModelOpt 방향(2026-10-05). 3.6 기본 = NVIDIA NVFP4 혼합(expert NVFP4, 투영 FP8) + lm_head bf16
       → decode 43.7 tok/s, PPL +1.1% ([측정](research/measurements/nvfp4-gb10.md)). FP8 전체 41.2 tok/s +0.33%, NVFP4 그대로 48.1 tok/s +2.0%
     ✔ firepit CLI(models/pull/run) — 카탈로그 qwen3.6:nvfp4(기본)·fp8·bf16, pull이 lm_head bf16 조립까지 ([설계](design-cli.md))
-    ○ run 첫 실행의 JIT 지연(prefill 5토큰 24.7 s) — 미리 컴파일하거나 진행 표시
-    ○ FP8·NVFP4 GEMV 효율(대역폭 하한의 약 71%), NVFP4 prefill의 mmaf_scaled 경로
-    ○ GEMV 합치기 · quantize/RMSNorm fusion · hot path 할당 제거
+    ✔ decode GEMV 효율 ([분석](research/measurements/gemv-probe-gb10.md), [설계](design-e4.md) 4.3)
+      양자화 GEMV를 [행, K] view로 → 54.5 tok/s, shared expert를 항상 선택되는 expert로 → 59.8,
+      FP8 행 scale 평탄 루프 + 같은 입력 GEMV 이어 붙이기 → 63.3 tok/s(15.8 ms), residual add + rms_norm fusion
+    ✔ decode 실행 기록 `firepit flow` (접근자 하나로 우회 금지, [설계](design-flow.md))
+    ✔ run JIT: 디스크 캐시, KV 길이 2의 거듭제곱 구간 → 두 번째 실행 45 → 24.5 s (cuTile stage1 약 4.5 s는 남음)
+    ✔ hot path: decode graph 밖 227 → 151 µs, prefill MoE 정렬 1.0 → 0.17 ms/층
+    ✔ 툴체인 1.98.0 고정, engine_verify 정답지 3종(GB10 /work/refs)
+    ○ 보류: prefill 활성값 FP8 + mmaf_scaled(약 −25% 추정, ΔNLL +4.9e-3) → E5에서 재판단
+    ○ 남은 GEMV 초과는 tileiras lowering(이슈 011·012)과 graph 병렬 분기(이슈 010) 몫
 
  E5. 서비스                                                       ○
     ○ Server (대화 id → Session) · Scheduler (prefill/decode 섞기) · API
@@ -45,6 +51,10 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 
  E7. 하드웨어 aware 값 자동화                                       ○
     ○ GDN conv1d 채널 타일: 고정 타일 크기를 장치와 채널 수에 맞춰 선택
+    ○ 작은 FP8 GEMV 타일(행 32 이하)의 tileiras 반복당 동기화 회피 타일 선택(약 0.3 ms/step)
+    ○ NVFP4 down GEMV pipeline hint, 행 scale GEMM의 형상별 차이(prefill +1.8%)
+    ○ 메모리 배치에 따른 대역폭 4~8% 차이(lm_head 236~259 GB/s) 원인 조사
+    ○ prefill MoE 정렬을 GPU로(safe cuTile scan + gather, 남은 공백 18 ms)
     ○ GDN delta rule value 열 타일: 현재 32열을 장치와 head 차원에 맞춰 선택
     ○ GEMV 행 타일(BN): DEFAULT_GEMV_TILE 고정값 → row_tile 같은 SM 채우기 규칙
     ○ 행이 적은 행렬(MoE expert 등)이 SM을 못 채우면 split-K
@@ -58,7 +68,7 @@ FP8 GEMV의 임시 5080 타일 규칙은 batch 1에서 스케일 블록 안의 K
 
  기여 트랙 (병행)
     ✔ cutile-rs #184 재현 · slice_mut 구현 (로컬 브랜치)
-    ○ 이슈 001 게시 → PR (서명 커밋 설정 필요)
+    ○ 이슈 초안 001~012, 014~017 게시 (게시처 결정 필요: 008·011·012는 tileiras 쪽) → PR (서명 커밋 설정 필요)
 ```
 
 ## E2 공부 단위
