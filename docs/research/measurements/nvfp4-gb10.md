@@ -106,3 +106,16 @@ design-cli JIT 절. 테스트 통과, logits 비트 동일.
 - decode graph 밖 구간(nsys, 45 step 중앙값): 227 → 151 µs/step. sync 9 → 3, HtoD 4 → 2, DtoD 5 → 3. 남은 몫은 graph launch 33 µs, logits DtoH 31 µs, host 처리. decode bench 15.65 → 15.59 ms.
 - prefill 5000: host 정렬(로컬 CPU T=5000) 1010 → 166 µs. GPU 공백 59.5 → 32.3 ms, 그중 MoE 정렬·업로드 공백 44.9 → 18.4 ms. sync·복사 횟수는 그대로라 남은 공백은 왕복 자체다. wall 차이는 2회 측정 잡음 안(약 −11 ms).
 - graph 안 업로드·logits 복사(D2)는 safe API가 없어 보류(cutile-rs 이슈 초안 016, 017). GPU 쪽 정렬(B)은 남은 18 ms를 보고 판단.
+
+## prefill 활성값 저정밀 실험 (`mmaf_scaled`, 실험 브랜치 `scana-exp-actq` 692ce89, 제품 미반영)
+
+`mmaf_scaled`는 두 피연산자가 같은 저정밀 형식이어야 해서 활성값도 양자화해야 한다. prefill GEMM 입력만 MXFP8(OCP MX v1.0) 또는 NVFP4(ModelOpt 규칙)로 흉내 양자화해 품질을 쟀다(prefill 72묶음, nvfp4 조립본).
+
+| prefill 활성값 | ΔNLL | KL | top-1 | GEMM (T=5000, 호출당) |
+|---|---:|---:|---:|---|
+| 지금(가중치만) | 1.0925e-2 | 2.535e-2 | 93.35% | 기준 |
+| FP8 투영 GEMM만 MXFP8 | 1.5775e-2 | 2.992e-2 | 92.84% | `[qkv|z]` 18.38 → 2.54~3.20 ms, 양자화 상한 0.59 ms 포함 −14.7 ms |
+| NVFP4 expert GEMM만 NVFP4 | 2.3508e-2 | 4.365e-2 | 90.95% | gate_up 15.92 → 5.90 ms, 양자화 상한 7.44 ms라 −2.6 ms. BK 128은 131.6 ms(tileiras 이상 후보) |
+| 둘 다 | 2.6575e-2 | 4.730e-2 | 90.72% | |
+
+결정(Sam, 2026-10-07): 채택하지 않는다. E4는 가중치만 양자화를 유지하고, FP8 activations(prefill 약 −25% 추정, ΔNLL +4.9e-3)는 E5에서 긴 prompt의 prefill 지연이 문제가 될 때 다시 판단한다.
