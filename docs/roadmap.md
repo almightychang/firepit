@@ -47,7 +47,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 
  E6. Qwen3.8-Flash-Next                                           ◐
     아래 "E6 공부 단위" 참고. 착수 전 확인: [e6-prerequisites](research/e6-prerequisites.md)
-    ◐ 6.0 정답 기준 (HF prefix-4 shard GB10 다운로드 중)
+    ◐ 6.0 정답 기준 (HF prefix-4 shard 14개 32.95 GB GB10 받음)
     ○ HC · QSA · n-gram PLE (decode) → 전부 쌓기 → prefill → 성능
 
  E7. 하드웨어 aware 값 자동화                                       ○
