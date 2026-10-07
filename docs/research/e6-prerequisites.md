@@ -5,7 +5,7 @@
 ## 결론
 
 1. **MTP head**: 두 모델 다 "full attention 1층 + MoE + 공유 embedding·lm_head"이고 GDN이 없다. Flash-Next MTP에는 HC와 QSA indexer가 들어가고 PLE는 없다. speculative 제어 흐름(초안 → T=2/3 검증 → 거부 시 recurrent state 복원, KV는 pos만 되감기)은 공유할 수 있다. 입력 결합(fc), layer 몸통(HC vs RMSNorm residual), 출력(HC mixer vs norm), 복원할 state 목록(Flash-Next는 PLE conv history와 n-gram token history 추가)은 모델마다 다르다. ds4는 CUDA에서 MTP를 구현한다. 거부되면 커널이 검증 중에 떠 둔 snapshot과 live buffer를 포인터 swap하고, KV는 되돌리지 않는다.
-2. **GB10 메모리**: 공식 BF16(`Qwen/Qwen3.8-Flash-Next`), 공식 FP8(Qwen), NVIDIA ModelOpt NVFP4가 모두 있다. NVIDIA NVFP4에서 vision과 n-gram을 빼면 상주 75.0 GiB, 투영을 FP8로 직접 바꾸면 72.5 GiB다. MemTotal 119.67 GiB 안에 들어가고, KV·활성값·OS를 빼고 약 30 GiB가 남는다. n-gram table(BF16 95.37 GiB, 공식 FP8 47.68 GiB)은 FP8로도 메모리에 다 못 올린다. SSD에서 토큰당 16행을 읽으면 되고 대역폭은 문제가 아니다. 문제는 지연이다.
+2. **GB10 메모리**: 공식 BF16(`Qwen/Qwen3.8-Flash-Next`), 공식 FP8(Qwen), NVIDIA ModelOpt NVFP4가 모두 있다. NVIDIA NVFP4에서 vision과 n-gram을 빼면 상주 75.0 GiB, projection을 FP8로 직접 바꾸면 72.5 GiB다. MemTotal 119.67 GiB 안에 들어가고, KV·활성값·OS를 빼고 약 30 GiB가 남는다. n-gram table(BF16 95.37 GiB, 공식 FP8 47.68 GiB)은 FP8로도 메모리에 다 못 올린다. SSD에서 토큰당 16행을 읽으면 되고 대역폭은 문제가 아니다. 문제는 지연이다.
 3. **정답지**: 더 이상 ds4 하나에 의존하지 않는다. HF transformers(v5.16.0~), vLLM, SGLang, llama.cpp가 `qwen4_exp`를 지원한다. 다만 HF는 두 모델 모두 `mtp.*`를 무시한다. trunk의 정답은 3.6처럼 HF op 단위 비교로 하고(prefix-4 shard 32.9 GB + n-gram 행은 range 요청), MTP는 vLLM/SGLang 코드나 ds4 CPU reference(`--first-token-test`)로 확인한다. ds4 양자화 GGUF는 firepit과 가중치가 달라서 원소 단위 허용 오차를 둘 수 없다. 분포 지표(KL, top-1, ΔNLL)로만 비교해야 한다.
 
 ---
@@ -79,7 +79,7 @@
 |---|---:|---:|---|
 | routed experts (trunk) | 32.21 B | 120.80 B | BF16 |
 | n-gram table | — | 51.20 B | BF16 (`layers.1.ple…shard_0..127`, 각 [2,500,012, 160]) |
-| GDN 투영 (qkv, z, out) | 1.007 B | 2.076 B | BF16 |
+| GDN projection (qkv, z, out) | 1.007 B | 2.076 B | BF16 |
 | HC (trunk 층별 + final mixer) | — | 0.641 B | BF16 |
 | embedding | 0.509 B | 0.636 B | BF16 |
 | lm_head | 0.509 B | 0.636 B | BF16 |
@@ -100,14 +100,14 @@ NVIDIA README의 "125B total + 51B n-gram + 4B MTP"와 대략 맞는다. MTP는 
 | repo | 크기 | 내용 |
 |---|---:|---|
 | `Qwen/Qwen3.8-Flash-Next` (`de4b8e4`) | 360.0 GB | 공식 BF16. 공개(gated 아님) |
-| `Qwen/Qwen3.8-Flash-Next-FP8` (`236dfdf`) | 172.76 GiB | routed expert(trunk·MTP)만 FP8 128×128 block, n-gram FP8. **GDN·attention 투영, shared, HC, lm_head는 BF16** |
+| `Qwen/Qwen3.8-Flash-Next-FP8` (`236dfdf`) | 172.76 GiB | routed expert(trunk·MTP)만 FP8 128×128 block, n-gram FP8. **GDN·attention projection, shared, HC, lm_head는 BF16** |
 | `nvidia/Qwen3.8-Flash-Next-NVFP4` (`fc694b5`) | 123.53 GiB | trunk routed expert NVFP4 W4A4(group 16, MSE scale). MTP expert와 n-gram은 Qwen FP8과 byte 동일. 나머지 BF16. vLLM 전용, B200/B300 대상 |
 | `antirez/qwen3.8-flash-next-gguf` (`d600fe1`) | Q2 137.10 / Q4 165.11 GiB | 상주 41.72 / 69.73 GiB + BF16 n-gram 95.37 GiB |
 | `ggml-org`, `unsloth` 등 GGUF | 다수 | llama.cpp용. MTP는 별도 GGUF |
 
-**3.6과 다른 점**: 3.6의 NVIDIA NVFP4는 투영을 FP8로 줬지만 Flash-Next판은 투영이 BF16이다. firepit의 "투영 FP8" 방식을 쓰려면 BF16에서 FP8로 직접 양자화해야 한다. 공식 FP8도 투영은 BF16이라 가져다 쓸 곳이 없다. [확인: header]
+**3.6과 다른 점**: 3.6의 NVIDIA NVFP4는 projection을 FP8로 줬지만 Flash-Next판은 projection이 BF16이다. firepit의 "projection FP8" 방식을 쓰려면 BF16에서 FP8로 직접 양자화해야 한다. 공식 FP8도 projection은 BF16이라 가져다 쓸 곳이 없다. [확인: header]
 
-### firepit 3.6 방식의 상주 크기 [확인: header 합산 / 추정: 투영 FP8 크기는 scale 무시]
+### firepit 3.6 방식의 상주 크기 [확인: header 합산 / 추정: projection FP8 크기는 scale 무시]
 
 NVIDIA NVFP4 checkpoint 기준, vision 제외, n-gram은 SSD:
 
@@ -115,14 +115,14 @@ NVIDIA NVFP4 checkpoint 기준, vision 제외, n-gram은 SSD:
 |---|---:|
 | routed experts NVFP4 (scale 포함) | 63.28 |
 | MTP routed experts FP8 block | 2.34 |
-| 투영 (GDN + attention, trunk + MTP) BF16 | 5.07 |
+| projection (GDN + attention, trunk + MTP) BF16 | 5.07 |
 | HC BF16 | 1.23 |
 | lm_head BF16 | 1.18 |
 | embedding BF16 | 1.18 |
 | shared expert BF16 | 0.45 |
 | 나머지 (router, norm, PLE key_proj 등) | 0.26 |
 | **합계 (그대로)** | **75.0** |
-| 투영을 FP8로 직접 양자화 | **72.5** |
+| projection을 FP8로 직접 양자화 | **72.5** |
 
 ds4 Q4(69.73 GiB)와 비슷한 크기다.
 

@@ -11,4 +11,4 @@
 
 `Qwen/Qwen3.6-35B-A3B-FP8` (HF API로 존재 확인, config.json 직접 확인):
 - `quant_method: fp8`, `fmt: e4m3`, `weight_block_size: [128, 128]`(2차원 블록 스케일, `weight_scale_inv`), `activation_scheme: dynamic`.
-- 변환하지 않은 모듈(`modules_to_not_convert`, 언어 모델 부분): `lm_head`, `embed_tokens`, 모든 norm, router(`mlp.gate`), `shared_expert_gate`, GDN `conv1d`·`in_proj_a`·`in_proj_b`·`A_log`·`dt_bias`. routed expert, shared expert, attention 투영, GDN `in_proj_qkv`·`in_proj_z`·`out_proj`는 FP8.
+- 변환하지 않은 모듈(`modules_to_not_convert`, 언어 모델 부분): `lm_head`, `embed_tokens`, 모든 norm, router(`mlp.gate`), `shared_expert_gate`, GDN `conv1d`·`in_proj_a`·`in_proj_b`·`A_log`·`dt_bias`. routed expert, shared expert, attention projection, GDN `in_proj_qkv`·`in_proj_z`·`out_proj`는 FP8.

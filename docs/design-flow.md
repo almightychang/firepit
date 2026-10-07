@@ -11,7 +11,7 @@ op마다 무엇을 읽고 쓰는지 데이터로 얻어, 같은 입력을 읽는
 ## 범위
 
 - decode runner(`execute.rs`)만. prefill(`prefill.rs`, `PrefillPlan`)은 자기 저장소를 그대로 쓴다.
-- 기록 대상: decode 버퍼 slot(묶음 투영은 멤버 단위), 입력(tokens, positions, cos, sin), expert 선택, 세션 state, 가중치 행렬(`weight()`가 돌려주는 것).
+- 기록 대상: decode 버퍼 slot(묶음 projection은 멤버 단위), 입력(tokens, positions, cos, sin), expert 선택, 세션 state, 가중치 행렬(`weight()`가 돌려주는 것).
 - 가중치 벡터(norm gamma, conv, a_log, dt_bias, embedding)는 기록하지 않는다.
 - 분석: ① 수평 합치기, ② 생산→소비·소비자 수·앞선 쓰기 없는 읽기. 바이트 대 시간은 나중이다.
 
@@ -212,8 +212,8 @@ Residual 2 · [qkv|z].qkv → gdn_conv 1 · [qkv|z].z → gdn_gate 1 · [q_gate|
 |---|---|---|
 | Dry 기록 = 실행+기록 기록 | `tests/engine.rs`, 작은 무작위 모델 | 같은 `Vec<OpNode>` |
 | 세션별 접근 | 같음, B = 2 | 세션 op마다 `State` 접근이 세션 수만큼 |
-| 정상 plan | 같음 | 앞선 쓰기 없는 읽기 0. 작은 모델은 투영이 모두 bf16이라 기존 묶음 `[qkv|z|b|a]`, `[q_gate|k|v]`, `[router|shared_gate]` |
-| 순서 뒤집기 검출 | `flow.rs` 단위 테스트. `StepPlan::ops`에서 layer 0의 MoE 투영 gemv와 `TopK`를 바꾼다 | `TopK`의 `Member{router}`, `Member{shared_gate}`가 앞선 쓰기 없는 읽기 |
+| 정상 plan | 같음 | 앞선 쓰기 없는 읽기 0. 작은 모델은 projection이 모두 bf16이라 기존 묶음 `[qkv|z|b|a]`, `[q_gate|k|v]`, `[router|shared_gate]` |
+| 순서 뒤집기 검출 | `flow.rs` 단위 테스트. `StepPlan::ops`에서 layer 0의 MoE projection gemv와 `TopK`를 바꾼다 | `TopK`의 `Member{router}`, `Member{shared_gate}`가 앞선 쓰기 없는 읽기 |
 | 재사용 slot 한계 | 같음, layer 1에서 바꾼다 | 앞선 쓰기 없는 읽기 0, layer 0 값으로 가는 간선. 한계를 테스트로 고정 |
 | 기존 묶음 4개 (ignored) | `tests/nvfp4_prefix.rs` 옆, NVFP4 앞 4층, Dry | `[qkv|z]` fp8, `[b|a]` bf16, `[q_gate|k|v]` fp8, `[router|shared_gate]` bf16 padding 15. 남은 후보 0 |
 

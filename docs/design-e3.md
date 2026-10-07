@@ -23,7 +23,7 @@ batch decode와 prefill을 같은 호출에 섞는 스케줄러는 E5에서 다�
 ## 3.7 조립 (Sam 승인 2026-10-04)
 
 - 경로: `Engine::prefill`은 `StepPlan`과 별도인 `PrefillPlan`을 만든다. decode 설계(flat op 목록, 커널 하나 = op 하나, 이름 붙은 slot)를 따르되 op와 slot은 `PrefillOp`/`PrefillSlot`으로 분리한다. slot의 행 축은 T다.
-- op 대응: 투영은 GEMM, conv는 `conv1d_silu_prefill`, GDN 상태는 chunk ①②, attention은 `cache_append_prefill`과 `causal_attention_prefill`, MoE는 3.6 경로. norm, add, gated SiLU, output gate, embedding은 decode 커널을 그대로 쓴다. final norm과 lm_head는 마지막 행만 계산한다.
+- op 대응: projection은 GEMM, conv는 `conv1d_silu_prefill`, GDN 상태는 chunk ①②, attention은 `cache_append_prefill`과 `causal_attention_prefill`, MoE는 3.6 경로. norm, add, gated SiLU, output gate, embedding은 decode 커널을 그대로 쓴다. final norm과 lm_head는 마지막 행만 계산한다.
 - 실행: eager. MoE host 정렬 때문에 CUDA graph를 쓰지 않는다. slot은 호출마다 T 크기로 할당하고 캐시하지 않는다.
 - 범위: prompt 전체를 한 번에 넣는다(`position + T ≤ max_seq`). position > 0 이어 붙이기를 지원한다. 조각 나눠 넣기는 E5. GEMM은 dense bf16만 받으므로 Q8 가중치면 에러를 낸다.
 - 중복 정리: 같은 알고리즘의 decode/prefill 복사본(top-k, combine)은 decode가 prefill 커널을 행 1개로 부르게 바꾸고 decode 복사본을 지운다. decode 성능이 유지되는지 측정으로 확인한다. 정리할 수 없는 경우(예: graph 재생 중 device 위치를 읽는 cache append)는 이유를 기록한다.

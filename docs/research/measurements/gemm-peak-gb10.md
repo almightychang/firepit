@@ -139,7 +139,7 @@ GB10, 전체 모델, JIT 준비 뒤 두 번째 호출. wall 8.72 s, launch별 GP
 | op 종류 | 횟수 | GPU s | wall s | 비중 |
 |---|---:|---:|---:|---:|
 | moe_grouped_gemm | 80 | 4.855 | 4.865 | 57.5% |
-| gemm (투영) | 350 | 1.731 | 1.741 | 20.5% |
+| gemm (projection) | 350 | 1.731 | 1.741 | 20.5% |
 | causal_attention | 10 | 0.635 | 0.635 | 7.5% |
 | gdn_chunk_second | 30 | 0.442 | 0.442 | 5.2% |
 | moe_host_sort | 40 | 0 | 0.219 | host |

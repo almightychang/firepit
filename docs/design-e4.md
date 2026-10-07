@@ -24,7 +24,7 @@
 ## 결정: NVIDIA 방향 (Sam 2026-10-05)
 
 - 형식 기준은 NVIDIA ModelOpt 체크포인트다. E6 모델에도 `nvidia/Qwen3.8-Flash-Next-NVFP4`가 있고(expert만 NVFP4/FP8 블록, lm_head 등은 bf16), Blackwell의 NVFP4/FP8 경로와 맞고, 로더가 이미 이 형식을 읽는다.
-- 3.6 기본 구성: NVIDIA NVFP4 혼합 + lm_head bf16. 근거는 [분해 측정](research/measurements/nvfp4-gb10.md): lm_head 4비트가 손실의 약 절반, FP8 투영은 측정 가능한 손실 없음. 다른 체크포인트(RedHat·AWQ·Qwen FP8·unsloth)도 lm_head를 8비트 이상으로 둔다.
+- 3.6 기본 구성: NVIDIA NVFP4 혼합 + lm_head bf16. 근거는 [분해 측정](research/measurements/nvfp4-gb10.md): lm_head 4비트가 손실의 약 절반, FP8 projection은 측정 가능한 손실 없음. 다른 체크포인트(RedHat·AWQ·Qwen FP8·unsloth)도 lm_head를 8비트 이상으로 둔다.
 - ds4는 E6에서 같은 GB10의 성능·품질 비교 상대로 쓴다. unsloth의 뒤쪽 layer expert FP8 유지는 필요하면 실험 옵션으로 둔다.
 
 ## 4.3 decode GEMV 효율 (Sam 승인 2026-10-05)
@@ -37,4 +37,4 @@
 
 ## 결정: prefill 활성값 저정밀 보류 (Sam 2026-10-07)
 
-prefill에 `mmaf_scaled`를 쓰려면 활성값도 FP8·FP4로 양자화해야 한다. 실험 결과(research/measurements/nvfp4-gb10.md 끝 절) NVFP4 활성값은 품질 손실이 크고 이득이 작으며, FP8 활성값은 투영 GEMM이 약 6배 빨라지지만 ΔNLL +4.9e-3이고 prefill과 decode의 수치가 달라진다. E4는 가중치만 양자화를 유지하고 E5에서 다시 판단한다.
+prefill에 `mmaf_scaled`를 쓰려면 활성값도 FP8·FP4로 양자화해야 한다. 실험 결과(research/measurements/nvfp4-gb10.md 끝 절) NVFP4 활성값은 품질 손실이 크고 이득이 작으며, FP8 활성값은 projection GEMM이 약 6배 빨라지지만 ΔNLL +4.9e-3이고 prefill과 decode의 수치가 달라진다. E4는 가중치만 양자화를 유지하고 E5에서 다시 판단한다.

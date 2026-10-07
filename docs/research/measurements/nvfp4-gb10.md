@@ -1,6 +1,6 @@
 # E4.2 NVIDIA NVFP4 혼합 체크포인트 GB10 측정 (`88c3465`, 2026-10-05)
 
-`nvidia/Qwen3.6-35B-A3B-NVFP4`: routed·shared expert와 lm_head는 NVFP4(가중치 전용), GDN·attention 투영은 FP8(텐서 전체 스케일), 나머지 bf16. activation f32, KV cache f32.
+`nvidia/Qwen3.6-35B-A3B-NVFP4`: routed·shared expert와 lm_head는 NVFP4(가중치 전용), GDN·attention projection은 FP8(텐서 전체 스케일), 나머지 bf16. activation f32, KV cache f32.
 
 | 지표 | bf16 | FP8 (Qwen) | NVFP4 (NVIDIA 혼합) |
 |---|---:|---:|---:|
@@ -21,13 +21,13 @@
 
 | 변형 | 4비트 | FP8 | bf16 | KL 평균 | top-1 | ΔNLL (95% CI) | decode |
 |---|---|---|---|---:|---:|---|---:|
-| V1 NVIDIA 그대로 | expert·shared·lm_head | 투영(텐서 전체 스케일) | 나머지 | 3.61e-2 | 91.05% | +2.04e-2 ± 2.3e-3 | 20.8 ms (48.1 tok/s) |
-| V2 lm_head bf16 | expert·shared | 투영(텐서 전체) | lm_head 포함 | 2.53e-2 | 93.33% | +1.08e-2 ± 2.2e-3 | 22.9 ms (43.7 tok/s) |
-| V3 lm_head·투영 bf16 | expert·shared | 없음 | 나머지 전부 | 2.35e-2 | 93.62% | +1.14e-2 ± 2.3e-3 | — |
-| V4 lm_head bf16, 투영 Qwen FP8 | expert·shared | 투영(128 블록) | lm_head 포함 | 2.55e-2 | 93.34% | +1.30e-2 ± 2.4e-3 | — |
+| V1 NVIDIA 그대로 | expert·shared·lm_head | projection(텐서 전체 스케일) | 나머지 | 3.61e-2 | 91.05% | +2.04e-2 ± 2.3e-3 | 20.8 ms (48.1 tok/s) |
+| V2 lm_head bf16 | expert·shared | projection(텐서 전체) | lm_head 포함 | 2.53e-2 | 93.33% | +1.08e-2 ± 2.2e-3 | 22.9 ms (43.7 tok/s) |
+| V3 lm_head·projection bf16 | expert·shared | 없음 | 나머지 전부 | 2.35e-2 | 93.62% | +1.14e-2 ± 2.3e-3 | — |
+| V4 lm_head bf16, projection Qwen FP8 | expert·shared | projection(128 블록) | lm_head 포함 | 2.55e-2 | 93.34% | +1.30e-2 ± 2.4e-3 | — |
 
 - lm_head 4비트가 ΔNLL의 약 절반(+2.04e-2 → +1.08e-2)이다. decode에서는 lm_head가 약 2.1 ms를 아낀다.
-- FP8 투영은 측정 가능한 손실을 더하지 않는다(V2 ≈ V3, CI 겹침). 텐서 전체 스케일과 128 블록 스케일의 차이도 CI 안이다(V2 vs V4).
+- FP8 projection은 측정 가능한 손실을 더하지 않는다(V2 ≈ V3, CI 겹침). 텐서 전체 스케일과 128 블록 스케일의 차이도 CI 안이다(V2 vs V4).
 - 남는 약 +1.1e-2(PPL +1.1%)는 expert·shared NVFP4에서 온다. Qwen FP8 전체(+3.3e-3)의 약 3배다.
 
 ## `firepit pull qwen3.6` 조립본 확인 (`a95dd0a`, GB10)
@@ -43,13 +43,13 @@
 
 | 커널 | step당 ms | step당 호출 | 읽는 가중치 (계산) | 유효 GB/s |
 |---|---:|---:|---:|---:|
-| dense_fp8 (GDN·attention 투영) | 9.65 | 130 | 1.29 GB | 134 |
+| dense_fp8 (GDN·attention projection) | 9.65 | 130 | 1.29 GB | 134 |
 | expert_nvfp4 (routed gate+up, down) | 5.08 | 80 | 0.57 GB | 111 |
 | dense_gemv bf16 (lm_head, router, in_proj_a/b, shared gate) | 4.84 | 141 | 1.07 GB | 221 |
 | dense_nvfp4 (shared expert) | 1.96 | 80 | 0.07 GB | 36 |
 | 나머지 (delta, norm, combine, top-k, conv 등) | 1.40 | | | |
 
-토큰당 가중치 약 3.0 GB, bf16 GEMV가 내는 약 213~221 GB/s 기준 하한은 약 14 ms. 차이 약 8.8 ms 중 FP8 투영 약 3.6 ms, routed NVFP4 약 2.4 ms, shared NVFP4 약 1.6 ms(작은 행렬이라 대역폭이 아니라 지연에 묶인 것으로 추정).
+토큰당 가중치 약 3.0 GB, bf16 GEMV가 내는 약 213~221 GB/s 기준 하한은 약 14 ms. 차이 약 8.8 ms 중 FP8 projection 약 3.6 ms, routed NVFP4 약 2.4 ms, shared NVFP4 약 1.6 ms(작은 행렬이라 대역폭이 아니라 지연에 묶인 것으로 추정).
 
 ## shared expert를 항상 선택되는 expert로 (`a045314` → `41bf08d`, GB10 같은 pod, design-e4 4.3)
 
@@ -70,7 +70,7 @@
 
 | 커널 | step당 ms | step당 호출 | 읽는 가중치 (계산) | 유효 GB/s |
 |---|---:|---:|---:|---:|
-| dense_fp8 (GDN·attention 투영) | 6.67 | 130 | 1.29 GB | 193 |
+| dense_fp8 (GDN·attention projection) | 6.67 | 130 | 1.29 GB | 193 |
 | dense_gemv bf16 (lm_head, router, in_proj_a/b, shared gate) | 4.87 | 141 | 1.07 GB | 220 |
 | expert_nvfp4 (routed 8 + shared 1) | 3.69 | 80 | 0.64 GB | 174 |
 | 원소별·세션 op 합 | 1.39 | | | |
@@ -114,7 +114,7 @@ design-cli JIT 절. 테스트 통과, logits 비트 동일.
 | prefill 활성값 | ΔNLL | KL | top-1 | GEMM (T=5000, 호출당) |
 |---|---:|---:|---:|---|
 | 지금(가중치만) | 1.0925e-2 | 2.535e-2 | 93.35% | 기준 |
-| FP8 투영 GEMM만 MXFP8 | 1.5775e-2 | 2.992e-2 | 92.84% | `[qkv|z]` 18.38 → 2.54~3.20 ms, 양자화 상한 0.59 ms 포함 −14.7 ms |
+| FP8 projection GEMM만 MXFP8 | 1.5775e-2 | 2.992e-2 | 92.84% | `[qkv|z]` 18.38 → 2.54~3.20 ms, 양자화 상한 0.59 ms 포함 −14.7 ms |
 | NVFP4 expert GEMM만 NVFP4 | 2.3508e-2 | 4.365e-2 | 90.95% | gate_up 15.92 → 5.90 ms, 양자화 상한 7.44 ms라 −2.6 ms. BK 128은 131.6 ms(tileiras 이상 후보) |
 | 둘 다 | 2.6575e-2 | 4.730e-2 | 90.72% | |
 

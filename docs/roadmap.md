@@ -28,7 +28,7 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
 
  E4. 성능 (GB10)                                                  ✔
     ✔ Spark 측정 → GDN conv 타일화로 decode 12 → 30.6 tok/s (대역폭 하한의 92%)
-    ✔ 양자화 포맷 결정: NVIDIA ModelOpt 방향(2026-10-05). 3.6 기본 = NVIDIA NVFP4 혼합(expert NVFP4, 투영 FP8) + lm_head bf16
+    ✔ 양자화 포맷 결정: NVIDIA ModelOpt 방향(2026-10-05). 3.6 기본 = NVIDIA NVFP4 혼합(expert NVFP4, projection FP8) + lm_head bf16
       → decode 43.7 tok/s, PPL +1.1% ([측정](research/measurements/nvfp4-gb10.md)). FP8 전체 41.2 tok/s +0.33%, NVFP4 그대로 48.1 tok/s +2.0%
     ✔ firepit CLI(models/pull/run) — 카탈로그 qwen3.6:nvfp4(기본)·fp8·bf16, pull이 lm_head bf16 조립까지 ([설계](design-cli.md))
     ✔ decode GEMV 효율 ([분석](research/measurements/gemv-probe-gb10.md), [설계](design-e4.md) 4.3)
