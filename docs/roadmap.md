@@ -123,6 +123,7 @@ E3.6의 행별 조립 커널은 RTX 5080 T=5000에서 255 registers/thread, 2240
 3.6과 같은 원리로 진행한다. 덩이마다 ① 개념 설명(TUI 다이어그램) → ② 작은 구현 → ③ HF transformers 중간값 비교 순서를 지키고, decode를 먼저 끝낸 뒤 prefill을 E3처럼 얹는다. 구현도 3.6의 틀을 그대로 쓴다: `LayerDef` 목록 → 가중치·state·plan, 한 op 목록으로 eager·CUDA Graph, 세션 소유 state, `store.rs` 접근자와 `firepit flow`, engine_verify 정답지. 새 부품은 이 틀에 op와 state를 더하는 것으로 들어간다.
 
 정한 것(2026-10-07):
+- 두 모델을 함께 지원한다. config의 `model_type`(`qwen3_5_moe`, `qwen4_exp`)으로 layer 정의를 고르고 공통 부품(GDN, MoE, GEMV, 엔진, 세션 state, graph, flow)은 한 벌만 둔다. E6 커밋마다 3.6 회귀(engine_verify 정답지 3종, decode 속도, PPL)를 GB10에서 확인한다.
 - 가중치: NVIDIA NVFP4(`nvidia/Qwen3.8-Flash-Next-NVFP4`) 그대로. routed expert NVFP4, projection·shared·HC·lm_head BF16, MTP expert FP8. 상주 약 75 GiB. projection FP8 직접 양자화는 성능 단계에서 측정 후 판단.
 - n-gram table: SSD에 두고 step 직전에 host가 16행을 병렬로 읽어 올린다(safe `read_at`). graph 분할·row cache는 GB10 지연 실측 뒤 필요할 때만.
 - 정답: trunk는 HF transformers op 단위(prefix-4 shard 32.95 GB, rev `de4b8e4`, GB10 `/work/qwen3.8-flash-next-prefix4`). n-gram 행은 range 요청으로 실행할 토큰 것만. ds4는 가중치가 달라 분포 지표(KL, top-1, ΔNLL)로만.
