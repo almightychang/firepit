@@ -31,7 +31,7 @@
 
 | 항목 | 기준 |
 |---|---|
-| 정확성 | Qwen3.6-35B-A3B는 HF transformers와, Qwen3.8-Flash-Next는 ds4와 logit이 허용 오차 안에서 일치 |
+| 정확성 | Qwen3.6-35B-A3B는 HF transformers와, Qwen3.8-Flash-Next는 HF transformers와 op 단위로 허용 오차 안에서 일치하고 ds4와 분포 지표가 기준선 안에 든다 |
 | 단일 세션 decode 속도 | 같은 모델과 양자화에서 ds4와 동급 |
 | 다중 세션 처리량 | 세션 2개일 때 전체 처리량이 단일 세션보다 뚜렷하게 높음 |
 | 안전성 | 세션 state에 접근하는 경로에 unsafe가 없음 |

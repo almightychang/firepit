@@ -27,7 +27,7 @@ HF `config.json`에서 확인한 값이다(2026-09-29). [확인]
 
 1단계는 Qwen3.6-35B-A3B, 2단계는 Qwen3.8-Flash-Next다. 이유는 이렇다.
 - Qwen3.6은 Flash-Next의 뼈대(GDN, MoE, gated attention, MTP)를 갖고 있고, 특이한 부품(HC, PLE, QSA)만 빠져 있다.
-- HF transformers, vLLM, llama.cpp가 모두 지원해서 정답 기준이 많다. Flash-Next는 사실상 ds4 하나에 의존해야 한다.
+- HF transformers, vLLM, llama.cpp가 모두 지원해서 정답 기준이 많다. Flash-Next는 결정 당시(2026-09-29) 사실상 ds4 하나에 의존해야 했다. 2026-10-07 현재는 HF transformers(v5.16.0~), vLLM, SGLang, llama.cpp가 `qwen4_exp`를 지원한다.
 - 버그를 격리할 수 있다. 뼈대를 먼저 검증하면, Flash-Next에서 틀렸을 때 원인이 새로 추가한 부품으로 좁혀진다.
 
 두 트랙을 병렬로 진행할 수도 있다. 공통 부품은 Qwen3.6으로, Flash-Next 전용 부품은 ds4의 layer 출력으로 따로 검증한다. 이 경우 부품 인터페이스를 먼저 고정해야 한다.

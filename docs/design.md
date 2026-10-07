@@ -66,11 +66,11 @@ Grout의 `StepGraph`는 fork하지 않고 참고한다. Grout decode는 `StepGra
 | MoE expert GEMV | router top-k로 expert를 골라 읽는다(읽기 간접이라 safe로 가능할 것으로 봄) | CPU reference |
 | GDN decode step, chunked prefill | mistral.rs의 cuTile GDN prefill이 있으나 raw pointer로 짜여 있다 | HF transformers |
 | gated attention, RoPE, RMSNorm | Grout 커널을 가져오거나 고친다 | HF transformers |
-| MTP | speculative decoding | HF transformers |
+| MTP | speculative decoding | vLLM·SGLang MTP 코드, ds4 CPU reference(HF transformers는 두 모델 모두 `mtp.*` 가중치를 무시한다) |
 
 ### 2단계: Qwen3.8-Flash-Next 추가분
 
-HC mixer(F16), QSA(indexer와 block-sparse attention), n-gram PLE(SSD에서 행 읽기). 정답 기준은 ds4의 layer 단위 출력이다.
+HC mixer(F16), QSA(indexer와 block-sparse attention), n-gram PLE(SSD에서 행 읽기). trunk 정답 기준은 HF transformers(v5.16.0부터 `qwen4_exp` 지원)의 op 단위 출력이다. ds4는 가중치 양자화가 달라 분포 지표(KL, top-1, ΔNLL)로만 비교한다.
 
 ### 양자화 포맷 [열림]
 

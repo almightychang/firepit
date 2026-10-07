@@ -12,6 +12,7 @@
 | [grout.md](grout.md) | Grout 구조와 firepit 출발점으로서의 평가 |
 | [candle.md](candle.md) | candle의 양자화 dispatch, cuTile 통합 현황, 메인테이너 구조 |
 | [models.md](models.md) | Qwen3.6 / 3.8-27B / 3.8-Flash-Next 구조 비교 |
+| [e6-prerequisites.md](e6-prerequisites.md) | Flash-Next 착수 전 확인: MTP 구조, GB10 메모리·n-gram SSD, 정답지 기준 (2026-10-07) |
 
 ## 측정 보고서 (DGX Spark 실측)
 
