@@ -45,9 +45,10 @@ firepit은 엔진을 만드는 프로젝트이면서, LLM을 한 개념씩 이�
     ○ Server (대화 id → Session) · Scheduler (prefill/decode 섞기) · API
     ○ MTP (speculative)
 
- E6. Qwen3.8-Flash-Next                                           ○
-    ○ HC mixer · QSA (indexer + sparse attention) · n-gram PLE (SSD)
-    ○ ds4 layer 출력과 비교
+ E6. Qwen3.8-Flash-Next                                           ◐
+    아래 "E6 공부 단위" 참고. 착수 전 확인: [e6-prerequisites](research/e6-prerequisites.md)
+    ◐ 6.0 정답 기준 (HF prefix-4 shard GB10 다운로드 중)
+    ○ HC · QSA · n-gram PLE (decode) → 전부 쌓기 → prefill → 성능
 
  E7. 하드웨어 aware 값 자동화                                       ○
     ○ GDN conv1d 채널 타일: 고정 타일 크기를 장치와 채널 수에 맞춰 선택
@@ -116,6 +117,32 @@ E3.2 attention의 현재 기본 BM×BN은 16×32이다. RTX 5080의 head_dim 256
 E3.3 conv prefill은 채널 타일별 block이 시간축을 순차 처리한다. f64 oracle, decode 반복, HF 150토큰 비교에서 출력과 마지막 state가 일치했다. 같은 GPU에서 다른 실험을 병행해 성능은 측정하지 않았다.
 E3.5는 value head와 state 열 타일별 block이 chunk를 순서대로 처리한다. 현재 열 타일은 `row_tile`을 이용해 SM 수와 head 수에서 선택한다. RTX 5080 모델 형상에서 32열이며 release cubin은 255 registers/thread, 2368-byte stack/thread와 `STL` spill이 있다. 타일·spill 개선은 E7에서 한다.
 E3.6의 행별 조립 커널은 RTX 5080 T=5000에서 255 registers/thread, 2240-byte stack/thread와 `STL`/`LDL` spill이 있었다. 분리형 실험에서 gather와 BM=32·BN=128·BK=32를 적용하자 같은 5080에서 gate/up 총시간이 36.38→6.27 ms, down이 13.56→2.72 ms로 줄었다. GB10의 [엔진 prefill 측정](research/measurements/gemm-peak-gb10.md)에서도 기존 grouped GEMM이 T=5000 시간의 57%를 차지했다. BM=32를 기본값으로 쓰되 GB10에서 패딩과 점유율을 재확인하고, 장치별 타일 선택은 E7에서 다룬다.
+
+## E6 공부 단위
+
+3.6과 같은 원리로 진행한다. 덩이마다 ① 개념 설명(TUI 다이어그램) → ② 작은 구현 → ③ HF transformers 중간값 비교 순서를 지키고, decode를 먼저 끝낸 뒤 prefill을 E3처럼 얹는다. 구현도 3.6의 틀을 그대로 쓴다: `LayerDef` 목록 → 가중치·state·plan, 한 op 목록으로 eager·CUDA Graph, 세션 소유 state, `store.rs` 접근자와 `firepit flow`, engine_verify 정답지. 새 부품은 이 틀에 op와 state를 더하는 것으로 들어간다.
+
+정한 것(2026-10-07):
+- 가중치: NVIDIA NVFP4(`nvidia/Qwen3.8-Flash-Next-NVFP4`) 그대로. routed expert NVFP4, projection·shared·HC·lm_head BF16, MTP expert FP8. 상주 약 75 GiB. projection FP8 직접 양자화는 성능 단계에서 측정 후 판단.
+- n-gram table: SSD에 두고 step 직전에 host가 16행을 병렬로 읽어 올린다(safe `read_at`). graph 분할·row cache는 GB10 지연 실측 뒤 필요할 때만.
+- 정답: trunk는 HF transformers op 단위(prefix-4 shard 32.95 GB, rev `de4b8e4`, GB10 `/work/qwen3.8-flash-next-prefix4`). n-gram 행은 range 요청으로 실행할 토큰 것만. ds4는 가중치가 달라 분포 지표(KL, top-1, ΔNLL)로만.
+- MTP는 E6 뒤 두 모델 공통으로 한다. 정답 기준은 그때 정한다(HF는 MTP를 구현하지 않는다).
+
+| 덩이 | 배우는 것 | 끝났다는 기준 | 상태 |
+|---|---|---|---|
+| 6.0 정답 기준 | `qwen4_exp` config, 가중치 이름과 모양, 4-stream residual이 흐르는 forward | HF로 layer별 중간값 덤프(n-gram 행 lookup 포함), Rust가 prefix 가중치 로드 | ◐ |
+| 6.1 입구와 출구 | embedding → 4 stream, final HC mixer → lm_head | layer 0개 모델의 logits가 HF와 일치 | ○ |
+| 6.2 HC | hyper-connection: block 앞 stream 섞기, block 뒤 주입(`hc_norm`, down, up, `block_inject`) | 3.6 MoE를 HC로 감싼 layer가 일치 | ○ |
+| 6.3 GDN·MoE 형상 | 3.6 GDN·MoE를 Flash-Next 형상(512 expert 중 10개)에 맞추기 | GDN layer와 MoE 블록이 여러 step에서 일치 | ○ |
+| 6.4 QSA ① | indexer: `index_qk_proj`, q/k norm, block 점수와 선택, indexer K cache | 선택된 block 번호와 점수 일치 | ○ |
+| 6.5 QSA ② | 선택된 block만 보는 sparse attention | attention layer가 여러 step에서 일치 | ○ |
+| 6.6 n-gram ① | 토큰 hash → 행 번호, SSD 행 읽기 | 행 번호와 읽은 embedding 일치 | ○ |
+| 6.7 n-gram ② PLE | `key_proj`, conv, norm, 세션 history state | PLE layer가 여러 step에서 일치 | ○ |
+| 6.8 전부 쌓기 | 48층, tokenizer, NVFP4 로드, greedy decode | GB10 전체 모델 문장 생성, ds4와 분포 지표 비교 | ○ |
+| 6.9 prefill | HC·QSA·PLE의 prefill 경로, 조립 | prefill(T) = decode T번 (logits, state), HF prefill 일치 | ○ |
+| 6.10 성능 | GB10 decode 분해, n-gram 지연, projection FP8 판단 | 대역폭 하한 대비 % (3.6 E4와 같은 측정 기준) | ○ |
+
+순서는 3.6처럼 모든 layer가 거치는 것(입출구, HC)부터 쌓고, 층 종류별 부품(QSA, PLE)을 그 위에 얹는다. HC가 먼저인 이유는 3.6의 residual 한 줄을 4-stream으로 바꿔 모든 layer의 골격이 달라지기 때문이다.
 
 ## 정답지 만들기 (2.0)
 
